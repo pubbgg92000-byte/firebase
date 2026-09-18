@@ -1022,8 +1022,10 @@
         <span class="tbstat to">{onlineCount} online</span>
         <span class="tbstat tf">{offlineCount} offline</span>
         <button class="ico-btn {bgRefreshing?'ico-active':''}" onclick={() => fetchAll(false)} title="Refresh All now" aria-label="Refresh All">
-          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style={bgRefreshing?"animation:spin 1s linear infinite":""}>
-            <path d="M1 4v6h6M23 20v-6h-6"/><path d="M20.49 9A9 9 0 0 0 5.64 5.64L1 10m22 4-4.64 4.36A9 9 0 0 1 3.51 15"/>
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style={bgRefreshing?"animation:spin 1s linear infinite":""}>
+            <polyline points="23 4 23 10 17 10"/>
+            <polyline points="1 20 1 14 7 14"/>
+            <path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/>
           </svg>
         </button>
         <!-- Bell icon with badge — opens floating notification panel -->
