@@ -147,11 +147,31 @@
 
   function setBottomTab(tab) {
     activeBottomTab = tab;
-    if (tab === 'dashboard') { activeTab = 'overview'; sideOpen = false; showBellPanel = false; }
-    else if (tab === 'devices') { sideOpen = true; sideTab = 'devices'; showBellPanel = false; }
-    else if (tab === 'notifs') { showBellPanel = !showBellPanel; sideOpen = false; }
-    else if (tab === 'send') { if (selectedKey) { activeTab = 'send'; } sideOpen = false; showBellPanel = false; }
-    else if (tab === 'settings') { addOpen = !addOpen; sideOpen = false; showBellPanel = false; }
+    if (tab === 'dashboard') {
+      activeTab = 'overview';
+      sideOpen = false;
+      showBellPanel = false;
+    } else if (tab === 'devices') {
+      sideOpen = !sideOpen;
+      if (sideOpen) sideTab = 'devices';
+      showBellPanel = false;
+    } else if (tab === 'notifs') {
+      showBellPanel = !showBellPanel;
+      sideOpen = false;
+    } else if (tab === 'send') {
+      if (selectedKey) {
+        activeTab = 'send';
+      } else {
+        toast('Select a device first to send SMS', 'info');
+        sideOpen = true;
+        sideTab = 'devices';
+      }
+      showBellPanel = false;
+    } else if (tab === 'settings') {
+      addOpen = !addOpen;
+      sideOpen = false;
+      showBellPanel = false;
+    }
   }
 
   // ── Dashboard pagination ───────────────────────────────────────────────────
@@ -927,7 +947,10 @@
             {@const on  = d.info ? isOnline(d.info) : null}
             {@const bat = d.info ? getBattery(d.info) : null}
             {@const fp  = getDisplayPhone(d.connId, d.key, d.info)}
-            <button class="sdv-item {selectedKey===d.key&&selectedConnId===d.connId?'sdv-sel':''}"
+            <div class="sdv-item {selectedKey===d.key&&selectedConnId===d.connId?'sdv-sel':''}"
+              role="button"
+              tabindex="0"
+              onkeydown={e => { if (e.key === 'Enter' || e.key === ' ') { selectDevice(d.connId, d.key); sideOpen = false; } }}
               onclick={() => { selectDevice(d.connId, d.key); sideOpen = false; }}
               aria-label="Select device {d.key}">
               <span class="sdv-bar" style="background:{d.conn.color}"></span>
@@ -949,7 +972,7 @@
                   <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
                 </button>
               {/if}
-            </button>
+            </div>
           {/each}
           {#if filteredSide.length === 0}
             <div class="sdv-empty">No devices found</div>
@@ -1036,6 +1059,9 @@
       <div class="bell-panel" style="transform:translate({notifPanelPos.x}px,{notifPanelPos.y}px)">
         <!-- Draggable panel header -->
         <div class="bp-hdr bp-drag-handle"
+          role="toolbar"
+          tabindex="0"
+          aria-label="Notification panel header drag handle"
           onpointerdown={notifPanelDragStart}
           onpointermove={notifPanelDragMove}
           onpointerup={notifPanelDragEnd}
@@ -1115,7 +1141,7 @@
                   <div class="bp-card-bot">
                     <span class="bp-verif-chip">VERIF</span>
                     <span class="bp-verif-text">{msgFull.slice(0,40)}{msgFull.length>40?'…':''}</span>
-                    <button class="bp-nav-btn" onclick={() => { navigateToDevice(n.connId, n.devKey); showBellPanel=false; }}>
+                    <button class="bp-nav-btn" onclick={() => { navigateToDevice(n.connId, n.devKey); showBellPanel=false; }} aria-label="View device" title="View device">
                       <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M7 17L17 7M7 7h10v10"/></svg>
                     </button>
                   </div>
@@ -1779,8 +1805,7 @@
   .di-right { display:flex; align-items:center; gap:5px; flex-shrink:0; }
   .dev-check { width:13px; height:13px; accent-color:#f97316; cursor:pointer; flex-shrink:0; }
   .dev-used { opacity:0.45; }
-  .dev-used .di-id { text-decoration:line-through; }
-  .dot { width:7px; height:7px; border-radius:50%; flex-shrink:0; }
+    .dot { width:7px; height:7px; border-radius:50%; flex-shrink:0; }
   .dot-on  { background:#22c55e; box-shadow:0 0 5px rgba(34,197,94,.6); }
   .dot-off { background:#2d3748; }
   .dot-unk { background:#1e2a3a; border:1px solid #334155; }
@@ -2006,14 +2031,11 @@
   .dt-scroll::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.12); border-radius: 4px; }
   .dt-scroll::-webkit-scrollbar-thumb:hover { background: rgba(255,255,255,0.22); }
   .dt-table { width:100%; border-collapse:collapse; font-size:12.5px; }
-  .dt-table thead { background:#141b2d; position:sticky; top:0; z-index:1; }
-  .dt-table th { padding:8px 12px; text-align:left; font-size:10px; font-weight:700; text-transform:uppercase; letter-spacing:0.08em; color:#64748b; border-bottom:1px solid rgba(255,255,255,0.07); white-space:nowrap; }
-  .dt-row { cursor:pointer; transition:background 80ms; border-bottom:1px solid rgba(255,255,255,0.03); }
+      .dt-row { cursor:pointer; transition:background 80ms; border-bottom:1px solid rgba(255,255,255,0.03); }
   .dt-row:last-child { border-bottom:none; }
   .dt-row:hover { background:rgba(255,255,255,0.03); }
   .dt-row.dt-sel { background:rgba(249,115,22,0.07); }
-  .dt-table td { padding:8px 12px; vertical-align:middle; }
-  .td-st { display:flex; align-items:center; gap:7px; }
+    .td-st { display:flex; align-items:center; gap:7px; }
   .td-dot { width:7px; height:7px; border-radius:50%; flex-shrink:0; }
   .ton { background:#22c55e; box-shadow:0 0 5px rgba(34,197,94,.5); }
   .toff { background:#2d3748; }
@@ -2026,8 +2048,7 @@
   .td-del { background:none; border:none; color:#475569; font-size:16px; cursor:pointer; width:22px; height:22px; border-radius:4px; display:flex; align-items:center; justify-content:center; transition:all 120ms; padding:0; font-family:inherit; line-height:1; }
   .td-del:hover { color:#ef4444; background:rgba(239,68,68,0.12); }
   .dt-used { opacity:0.45; }
-  .dt-used .td-key { text-decoration:line-through; }
-  .td-fb-dot { display:inline-block; width:6px; height:6px; border-radius:50%; flex-shrink:0; }
+    .td-fb-dot { display:inline-block; width:6px; height:6px; border-radius:50%; flex-shrink:0; }
   .td-new { font-size:9px; font-weight:800; text-transform:uppercase; letter-spacing:0.07em; padding:1px 5px; border-radius:4px; background:rgba(251,191,36,0.15); color:#fbbf24; border:1px solid rgba(251,191,36,0.3); flex-shrink:0; }
 
   /* ── Dashboard filter bar ──────────────────────────────────────────────── */
@@ -2431,8 +2452,7 @@
     opacity: 0.8;
   }
   /* All card children above sheen */
-  .notif > * { position: relative; z-index: 1; }
-
+  
   @media (hover: hover) {
     .notif:hover {
       border-color: rgba(255,255,255,0.24);
@@ -2511,8 +2531,7 @@
     letter-spacing:0.12em; flex:1;
   }
   .n-otp-copy-ico { color:rgba(74,222,128,0.45); flex-shrink:0; transition:color 130ms; }
-  .n-otp-row:hover .n-otp-copy-ico { color:rgba(74,222,128,0.9); }
-
+  
   /* Verification-only row (no OTP extracted) */
   .n-verif-row {
     display:flex; align-items:center; gap:6px; flex-shrink:0;
