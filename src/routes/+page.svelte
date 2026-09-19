@@ -119,8 +119,7 @@
       path: "messages",
       infoPath: "clients",
       color: "#f97316",
-      enabled: false,
-      locked: true,
+      enabled: true,
     },
     {
       id: "c1",
@@ -130,8 +129,7 @@
       path: "messages",
       infoPath: "clients",
       color: "#38bdf8",
-      enabled: false,
-      locked: true,
+      enabled: true,
     },
     {
       id: "c2",
@@ -141,8 +139,7 @@
       path: "messages",
       infoPath: "clients",
       color: "#a78bfa",
-      enabled: false,
-      locked: true,
+      enabled: true,
     },
     {
       id: "c3",
@@ -152,8 +149,7 @@
       path: "messages",
       infoPath: "clients",
       color: "#34d399",
-      enabled: false,
-      locked: true,
+      enabled: true,
     },
     {
       id: "c4",
@@ -163,8 +159,7 @@
       path: "messages",
       infoPath: "clients",
       color: "#fb7185",
-      enabled: false,
-      locked: true,
+      enabled: true,
     },
     {
       id: "c5",
@@ -174,8 +169,7 @@
       path: "messages",
       infoPath: "clients",
       color: "#fbbf24",
-      enabled: false,
-      locked: true,
+      enabled: true,
     },
     {
       id: "c6",
@@ -185,8 +179,7 @@
       path: "messages",
       infoPath: "clients",
       color: "#06b6d4",
-      enabled: false,
-      locked: true,
+      enabled: true,
     },
     {
       id: "c7",
@@ -196,8 +189,7 @@
       path: "messages",
       infoPath: "clients",
       color: "#ec4899",
-      enabled: false,
-      locked: true,
+      enabled: true,
     },
     {
       id: "c8",
@@ -207,8 +199,7 @@
       path: "messages",
       infoPath: "clients",
       color: "#84cc16",
-      enabled: false,
-      locked: true,
+      enabled: true,
     },
     {
       id: "c9",
@@ -218,8 +209,7 @@
       path: "messages",
       infoPath: "clients",
       color: "#c084fc",
-      enabled: false,
-      locked: true,
+      enabled: true,
     },
   ]);
   let refreshInterval = $state(null);
@@ -233,76 +223,10 @@
     path: "messages",
     infoPath: "clients",
   });
-  let bulkMode = $state(false);
+  let addPanelMode = $state('single'); // 'single' | 'bulk' | 'extract'
   let bulkText = $state('');
   let bulkParsed = $derived(parseBulkFirebase(bulkText));
 
-  // ── Password gate (for locked/hardcoded connections) ───────────────────────
-  const LOCK_SESSION_KEY = 'pd_sess_unlocked';
-  const LOCK_DEVICE_KEY = 'pd_device_unlocked';
-  const LOCK_PASSWORD = 'qweasd123';
-  let sessionUnlocked = $state(false);   // true = password was entered for this device
-  let showLockModal = $state(false);     // show the password prompt overlay
-  let showPasswordText = $state(false);  // toggle show/hide password text
-  let lockPasswordInput = $state('');
-  let lockPasswordError = $state('');
-  let lockPasswordLoading = $state(false);
-
-  function hasLockedConns() {
-    return connections.some(c => c.locked);
-  }
-
-  function applySessionUnlock() {
-    // Enable all locked connections in memory
-    connections = connections.map(c => c.locked ? { ...c, enabled: true } : c);
-    saveConnections(connections);
-    connections.filter(c => c.locked).forEach(c => fetchConn(c));
-  }
-
-  function unlockWithPassword() {
-    lockPasswordError = '';
-    const entered = lockPasswordInput.trim();
-    if (!entered) {
-      lockPasswordError = 'Please enter the password.';
-      return;
-    }
-    lockPasswordLoading = true;
-    setTimeout(() => {
-      if (entered === LOCK_PASSWORD) {
-        try {
-          sessionStorage.setItem(LOCK_SESSION_KEY, '1');
-          localStorage.setItem(LOCK_DEVICE_KEY, '1');
-        } catch {}
-        sessionUnlocked = true;
-        showLockModal = false;
-        lockPasswordInput = '';
-        lockPasswordLoading = false;
-        applySessionUnlock();
-        toast('Code Firebase connections unlocked & enabled!', 'success');
-      } else {
-        lockPasswordError = 'Incorrect password. Try again.';
-        lockPasswordInput = '';
-        lockPasswordLoading = false;
-      }
-    }, 250);
-  }
-
-  function lockConnections() {
-    try {
-      sessionStorage.removeItem(LOCK_SESSION_KEY);
-      localStorage.removeItem(LOCK_DEVICE_KEY);
-    } catch {}
-    sessionUnlocked = false;
-    connections = connections.map(c => c.locked ? { ...c, enabled: false } : c);
-    saveConnections(connections);
-    toast('Code connections locked and disabled.', 'info');
-  }
-
-  function dismissLockModal() {
-    showLockModal = false;
-    lockPasswordError = '';
-    lockPasswordInput = '';
-  }
   const ACCENT = [
     "#f97316",
     "#38bdf8",
@@ -882,11 +806,6 @@
       );
     } catch {}
     // Restore persisted connections (merge over defaults — user additions win)
-    const isDeviceUnlocked =
-      localStorage.getItem(LOCK_DEVICE_KEY) === '1' ||
-      sessionStorage.getItem(LOCK_SESSION_KEY) === '1';
-    sessionUnlocked = isDeviceUnlocked;
-
     try {
       const saved = JSON.parse(
         localStorage.getItem("pd_connections") || "null",
@@ -896,25 +815,16 @@
         const defaultIds = new Set(connections.map((c) => c.id));
         const extras = saved.filter((c) => !defaultIds.has(c.id));
         // Restore enabled state from saved for existing connections
-        // If not unlocked on this device, locked connections always start disabled
         connections = connections
           .map((c) => {
             const s = saved.find((x) => x.id === c.id);
-            if (c.locked && !sessionUnlocked) return { ...c, enabled: false };
             return s ? { ...c, enabled: s.enabled } : c;
           })
-          .concat(extras.map(e => ({ ...e, locked: e.locked ?? false })));
+          .concat(extras);
       }
     } catch {}
 
     fetchAll(false); // first load: show loading state
-
-    // ── Password gate check on device load ────────────────────────────────
-    if (sessionUnlocked) {
-      applySessionUnlock();
-    } else if (hasLockedConns()) {
-      showLockModal = true; // prompt for password on new device
-    }
     refreshInterval = setInterval(() => fetchAll(true), 10_000); // bg silent auto-refresh every 10s
     const ticker = setInterval(() => {
       nextRefreshSecs = nextRefreshSecs > 0 ? nextRefreshSecs - 1 : 0;
@@ -934,105 +844,494 @@
     return [...new Set(matches.map(u => u.replace(/\/+$/, '')))];
   }
 
-  // ── Extract Firebase URLs from a shared panel link or raw Base64 ──────────
-  function extractFirebaseUrlsFromLink(input) {
-    const raw = (input || '').trim();
-    if (!raw) return { urls: [], error: 'Input is empty.' };
+  // ── Universal Firebase Extraction Engine ────────────────────────────────────
+  // Safety limits
+  const UX_MAX_INPUT_BYTES = 5 * 1024 * 1024; // 5 MB
+  const UX_MAX_DEPTH = 5;                      // recursion depth
+  const UX_MAX_URLS = 500;                     // max extracted URLs
+  const UX_TIMEOUT_MS = 3000;                  // hard timeout
 
-    let base64Val = raw;
+  const FB_URL_RE = /https?:\/\/[a-zA-Z0-9_-]+-default-rtdb(?:\.[a-zA-Z0-9-]+)*\.(?:firebasedatabase\.app|firebaseio\.com)/gi;
 
-    // If it looks like a URL, pull out the `s` query param
-    if (/^https?:\/\//i.test(raw)) {
-      try {
-        const u = new URL(raw);
-        const s = u.searchParams.get('s');
-        if (s) {
-          base64Val = s;
-        } else {
-          // No `s` param — try parsing URLs directly from the URL text
-          const direct = parseBulkFirebase(raw);
-          if (direct.length) return { urls: direct, error: '' };
-          return { urls: [], error: 'No `s` parameter found in URL and no Firebase URLs detected.' };
-        }
-      } catch {
-        return { urls: [], error: 'Invalid URL format.' };
-      }
-    }
-
-    // Attempt Base64 decode
-    let decoded = '';
-    try {
-      // Fix padding if needed
-      const padded = base64Val.replace(/-/g, '+').replace(/_/g, '/') + '=='.slice((base64Val.length % 4 || 4) % 4 === 0 ? 4 : (base64Val.length % 4 || 4));
-      decoded = atob(padded.replace(/[^A-Za-z0-9+/=]/g, ''));
-    } catch {
-      // Not valid Base64 — try treating as plain text
-      const plain = parseBulkFirebase(raw);
-      if (plain.length) return { urls: plain, error: '' };
-      return { urls: [], error: 'Could not decode as Base64 and no Firebase URLs found in plain text.' };
-    }
-
-    const urls = parseBulkFirebase(decoded);
-    if (!urls.length) {
-      return { urls: [], error: 'Decoded successfully but no Firebase RTDB URLs were found in the content.' };
-    }
-    return { urls, error: '' };
+  /** Scan text for Firebase RTDB URLs, return unique list */
+  function scanFirebaseUrls(text) {
+    if (!text || typeof text !== 'string') return [];
+    const m = text.match(FB_URL_RE) || [];
+    return [...new Set(m.map(u => u.replace(/\/+$/, '')))];
   }
 
-  // ── Extractor UI state ────────────────────────────────────────────────────
-  let extractInput = $state('');
-  let extractError = $state('');
-  let extractSuccess = $state('');
-  let extracting = $state(false);
-  let showExtractor = $state(false);
+  /** Try to extract a project name from a Firebase URL hostname */
+  function nameFromFbUrl(url) {
+    try { return new URL(url).hostname.split('-')[0]; } catch { return ''; }
+  }
 
-  function handleExtract() {
-    extractError = '';
-    extractSuccess = '';
-    extracting = true;
+  /** Check if a string looks like Base64 (min length, valid chars) */
+  function looksLikeBase64(s) {
+    if (!s || s.length < 20) return false;
+    // Allow URL-safe or standard Base64, with optional padding
+    return /^[A-Za-z0-9+/=_-]{20,}$/.test(s.replace(/\s/g, ''));
+  }
+
+  /** Try to decode a Base64 string (handles URL-safe variant) */
+  function tryBase64Decode(s) {
+    try {
+      let b = s.replace(/-/g, '+').replace(/_/g, '/');
+      // Fix padding
+      const pad = (4 - (b.length % 4)) % 4;
+      b += '='.repeat(pad);
+      b = b.replace(/[^A-Za-z0-9+/=]/g, '');
+      const decoded = atob(b);
+      // Sanity check: must produce mostly printable chars
+      let printable = 0;
+      for (let i = 0; i < Math.min(decoded.length, 200); i++) {
+        const c = decoded.charCodeAt(i);
+        if ((c >= 32 && c < 127) || c === 10 || c === 13 || c === 9) printable++;
+      }
+      if (printable / Math.min(decoded.length, 200) < 0.7) return null;
+      return decoded;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Recursively extract Firebase connections from arbitrary input.
+   * @param {string} input — raw text/JSON/Base64/URL/etc
+   * @param {string} source — label for where this input came from
+   * @param {number} depth — current recursion depth
+   * @param {number} startTime — Date.now() at start of extraction
+   * @returns {{url: string, name: string, source: string}[]}
+   */
+  function deepExtract(input, source, depth, startTime) {
+    if (depth > UX_MAX_DEPTH) return [];
+    if (Date.now() - startTime > UX_TIMEOUT_MS) return [];
+    if (!input || typeof input !== 'string' || input.length > UX_MAX_INPUT_BYTES) return [];
+
+    const results = [];
+    const seenUrls = new Set();
+
+    function addResult(url, name, src) {
+      const clean = url.replace(/\/+$/, '');
+      if (seenUrls.has(clean) || results.length >= UX_MAX_URLS) return;
+      seenUrls.add(clean);
+      results.push({ url: clean, name: name || nameFromFbUrl(clean), source: src });
+    }
+
+    function addAll(urls, src) {
+      for (const u of urls) addResult(u, '', src);
+    }
+
+    // 1. Direct Firebase URL scan on raw text
+    const directUrls = scanFirebaseUrls(input);
+    addAll(directUrls, source || 'plain text');
+
+    // 2. Try as URL — inspect query params and fragment
+    if (/^https?:\/\//i.test(input.trim())) {
+      try {
+        const parsed = new URL(input.trim());
+        // Check every query parameter value
+        for (const [key, val] of parsed.searchParams) {
+          if (!val) continue;
+          // Direct Firebase URLs in param value
+          const paramUrls = scanFirebaseUrls(val);
+          addAll(paramUrls, `param "${key}"`);
+          // Try Base64 decode
+          if (looksLikeBase64(val)) {
+            const decoded = tryBase64Decode(val);
+            if (decoded) {
+              const sub = deepExtract(decoded, `param "${key}" (Base64)`, depth + 1, startTime);
+              for (const r of sub) addResult(r.url, r.name, r.source);
+            }
+          }
+          // Try JSON parse
+          try {
+            const j = JSON.parse(val);
+            const sub = extractFromJson(j, `param "${key}" (JSON)`, depth + 1, startTime);
+            for (const r of sub) addResult(r.url, r.name, r.source);
+          } catch { /* not JSON */ }
+        }
+        // Check fragment
+        if (parsed.hash && parsed.hash.length > 1) {
+          const frag = decodeURIComponent(parsed.hash.slice(1));
+          const fragUrls = scanFirebaseUrls(frag);
+          addAll(fragUrls, 'URL fragment');
+          if (looksLikeBase64(frag)) {
+            const decoded = tryBase64Decode(frag);
+            if (decoded) {
+              const sub = deepExtract(decoded, 'fragment (Base64)', depth + 1, startTime);
+              for (const r of sub) addResult(r.url, r.name, r.source);
+            }
+          }
+        }
+      } catch { /* invalid URL, that's fine */ }
+    }
+
+    // 3. Try as JSON
+    const trimmed = input.trim();
+    if ((trimmed.startsWith('{') || trimmed.startsWith('[') || trimmed.startsWith('"')) && trimmed.length < UX_MAX_INPUT_BYTES) {
+      try {
+        const parsed = JSON.parse(trimmed);
+        const sub = extractFromJson(parsed, source || 'JSON', depth + 1, startTime);
+        for (const r of sub) addResult(r.url, r.name, r.source);
+      } catch { /* not valid JSON */ }
+    }
+
+    // 4. Try as Base64
+    if (looksLikeBase64(trimmed)) {
+      const decoded = tryBase64Decode(trimmed);
+      if (decoded) {
+        const sub = deepExtract(decoded, source ? `${source} → Base64` : 'Base64 decode', depth + 1, startTime);
+        for (const r of sub) addResult(r.url, r.name, r.source);
+      }
+    }
+
+    // 5. Try URL-decoding
+    try {
+      const urlDecoded = decodeURIComponent(trimmed);
+      if (urlDecoded !== trimmed) {
+        const decodedUrls = scanFirebaseUrls(urlDecoded);
+        addAll(decodedUrls, source ? `${source} (URL-decoded)` : 'URL-decoded');
+      }
+    } catch { /* not URL-encoded */ }
+
+    return results;
+  }
+
+  /**
+   * Recursively extract Firebase URLs from parsed JSON values.
+   */
+  function extractFromJson(val, source, depth, startTime) {
+    if (depth > UX_MAX_DEPTH || Date.now() - startTime > UX_TIMEOUT_MS) return [];
+    const results = [];
+
+    if (typeof val === 'string') {
+      // Scan the string for Firebase URLs
+      const urls = scanFirebaseUrls(val);
+      for (const u of urls) results.push({ url: u.replace(/\/+$/, ''), name: nameFromFbUrl(u), source });
+      // Try Base64 decode on the string
+      if (looksLikeBase64(val)) {
+        const decoded = tryBase64Decode(val);
+        if (decoded) {
+          const sub = deepExtract(decoded, `${source} → Base64 value`, depth + 1, startTime);
+          results.push(...sub);
+        }
+      }
+      // Try nested JSON
+      const t = val.trim();
+      if ((t.startsWith('{') || t.startsWith('[')) && t.length > 2) {
+        try {
+          const nested = JSON.parse(t);
+          const sub = extractFromJson(nested, `${source} → nested JSON`, depth + 1, startTime);
+          results.push(...sub);
+        } catch { /* not JSON */ }
+      }
+    } else if (Array.isArray(val)) {
+      for (let i = 0; i < val.length && results.length < UX_MAX_URLS; i++) {
+        const sub = extractFromJson(val[i], source, depth + 1, startTime);
+        results.push(...sub);
+      }
+    } else if (val && typeof val === 'object') {
+      for (const [k, v] of Object.entries(val)) {
+        if (results.length >= UX_MAX_URLS) break;
+        const sub = extractFromJson(v, source, depth + 1, startTime);
+        // If the key looks like a name and we found URLs, attach the key as name
+        for (const r of sub) {
+          if (!r.name && k && typeof k === 'string' && k.length < 50 && !/^https?:\/\//.test(k)) {
+            r.name = k;
+          }
+          results.push(r);
+        }
+      }
+    }
+
+    return results;
+  }
+
+  /**
+   * Extract Firebase URLs from HTML/XML content
+   */
+  function extractFromHtml(text, source) {
+    const results = [];
+    const startTime = Date.now();
+    // Extract attribute values (href, src, data-*, value, content)
+    const attrRe = /(?:href|src|data-[a-z-]+|value|content)\s*=\s*["']([^"']{10,})["']/gi;
+    let m;
+    while ((m = attrRe.exec(text)) !== null && results.length < UX_MAX_URLS) {
+      const sub = deepExtract(m[1], `${source} (attribute)`, 1, startTime);
+      results.push(...sub);
+    }
+    // Also do a full text scan
+    const textUrls = scanFirebaseUrls(text);
+    for (const u of textUrls) {
+      if (!results.find(r => r.url === u.replace(/\/+$/, ''))) {
+        results.push({ url: u.replace(/\/+$/, ''), name: nameFromFbUrl(u), source });
+      }
+    }
+    return results;
+  }
+
+  /**
+   * Extract Firebase URLs from CSV content
+   */
+  function extractFromCsv(text, source) {
+    const results = [];
+    const startTime = Date.now();
+    const lines = text.split(/\r?\n/);
+    for (let i = 0; i < lines.length && results.length < UX_MAX_URLS; i++) {
+      const cells = lines[i].split(/[,;\t]/);
+      for (const cell of cells) {
+        const sub = deepExtract(cell.trim().replace(/^["']|["']$/g, ''), `${source} row ${i + 1}`, 1, startTime);
+        results.push(...sub);
+      }
+    }
+    return results;
+  }
+
+  /**
+   * Main entry point: run universal extraction on text input or file content.
+   * @returns {{ results: {url,name,source}[], errors: string[], stats: {totalFound,duplicates,sources} }}
+   */
+  function universalExtract(input, filename) {
+    const startTime = Date.now();
+    const errors = [];
+
+    if (!input || typeof input !== 'string') {
+      return { results: [], errors: ['Input is empty.'], stats: { totalFound: 0, duplicates: 0, sources: 0 } };
+    }
+
+    if (input.length > UX_MAX_INPUT_BYTES) {
+      return { results: [], errors: [`Input too large (${(input.length / 1024 / 1024).toFixed(1)} MB). Max is 5 MB.`], stats: { totalFound: 0, duplicates: 0, sources: 0 } };
+    }
+
+    let allResults = [];
+    const src = filename || 'pasted input';
+
+    // Determine handler by file extension
+    const ext = (filename || '').split('.').pop()?.toLowerCase();
+
+    if (ext === 'html' || ext === 'htm' || ext === 'xml') {
+      allResults = extractFromHtml(input, src);
+    } else if (ext === 'csv' || ext === 'tsv') {
+      allResults = extractFromCsv(input, src);
+    } else {
+      // For everything else (json, txt, or pasted text): split by lines and process each
+      const lines = input.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
+
+      if (lines.length <= 1) {
+        // Single input — process as one unit
+        allResults = deepExtract(input, src, 0, startTime);
+      } else {
+        // Multi-line: process each line independently, then whole block
+        for (const line of lines) {
+          if (allResults.length >= UX_MAX_URLS) break;
+          if (Date.now() - startTime > UX_TIMEOUT_MS) {
+            errors.push('Processing timed out. Some lines may not have been analyzed.');
+            break;
+          }
+          const sub = deepExtract(line, src, 0, startTime);
+          allResults.push(...sub);
+        }
+        // Also try parsing the whole block as JSON (e.g. multi-line JSON)
+        const whole = input.trim();
+        if ((whole.startsWith('{') || whole.startsWith('[')) && allResults.length < UX_MAX_URLS) {
+          try {
+            const parsed = JSON.parse(whole);
+            const sub = extractFromJson(parsed, src, 0, startTime);
+            allResults.push(...sub);
+          } catch { /* not valid JSON as a whole */ }
+        }
+      }
+    }
+
+    // Deduplicate by URL
+    const seen = new Set();
+    const unique = [];
+    const sourcesSet = new Set();
+    let dupes = 0;
+    for (const r of allResults) {
+      const clean = r.url.replace(/\/+$/, '');
+      if (seen.has(clean)) { dupes++; continue; }
+      seen.add(clean);
+      sourcesSet.add(r.source);
+      unique.push({ ...r, url: clean });
+    }
+
+    if (!unique.length && !errors.length) {
+      errors.push('No Firebase Realtime Database URLs found in the input.');
+    }
+
+    return {
+      results: unique.slice(0, UX_MAX_URLS),
+      errors,
+      stats: {
+        totalFound: allResults.length,
+        duplicates: dupes,
+        sources: sourcesSet.size
+      }
+    };
+  }
+
+  // ── Universal Extractor UI state ──────────────────────────────────────────
+  let uxInput = $state('');
+  let uxResults = $state([]);      // { url, name, source, selected }[]
+  let uxErrors = $state([]);
+  let uxStats = $state(null);      // { totalFound, duplicates, sources }
+  let uxProcessing = $state(false);
+  let uxDragActive = $state(false);
+  let uxUploadedFiles = $state([]); // { name, size, resultCount }[]
+
+  function uxRunExtract() {
+    uxErrors = [];
+    uxProcessing = true;
+    // Use setTimeout to unblock UI
     setTimeout(() => {
       try {
-        // Split input by newlines so the user can paste multiple links at once
-        const lines = extractInput.split(/\n/).map(l => l.trim()).filter(Boolean);
-        if (!lines.length) { extractError = 'Input is empty.'; extracting = false; return; }
-
-        const allFound = [];
-        const lineErrors = [];
-
-        for (const line of lines) {
-          const { urls, error } = extractFirebaseUrlsFromLink(line);
-          if (urls.length) {
-            allFound.push(...urls);
-          } else if (error && lines.length === 1) {
-            // Only surface the error when there's a single line
-            extractError = error;
-          } else if (error) {
-            lineErrors.push(error);
-          }
-        }
-
-        const uniqueFound = [...new Set(allFound)];
-
-        if (!uniqueFound.length) {
-          if (lines.length > 1) {
-            extractError = `No Firebase RTDB URLs found across ${lines.length} inputs.${lineErrors.length ? ' Errors: ' + lineErrors.slice(0, 2).join(' / ') : ''}`;
-          }
-          // single-line error already set above
-        } else {
-          // Merge with existing bulk text (deduplicate)
-          const existing = parseBulkFirebase(bulkText);
-          const combined = [...new Set([...existing, ...uniqueFound])];
-          bulkText = combined.join('\n');
-          const newCount = combined.length - existing.length;
-          extractSuccess = `Extracted ${uniqueFound.length} URL${uniqueFound.length !== 1 ? 's' : ''} from ${lines.length} input${lines.length !== 1 ? 's' : ''}${newCount < uniqueFound.length ? ` · ${newCount} new` : ''}.`;
-          extractInput = '';
-        }
+        const { results, errors, stats } = universalExtract(uxInput);
+        uxResults = results.map(r => ({ ...r, selected: true }));
+        uxErrors = errors;
+        uxStats = stats;
       } catch (e) {
-        extractError = 'Unexpected error: ' + e.message;
+        uxErrors = ['Unexpected error: ' + (e?.message || String(e))];
+        uxResults = [];
+        uxStats = null;
       } finally {
-        extracting = false;
+        uxProcessing = false;
       }
-    }, 50);
+    }, 30);
+  }
+
+  function uxRunExtractFile(text, filename) {
+    uxProcessing = true;
+    setTimeout(() => {
+      try {
+        const { results, errors, stats } = universalExtract(text, filename);
+        // Merge with existing results (dedup by URL)
+        const existingUrls = new Set(uxResults.map(r => r.url));
+        const newResults = results.filter(r => !existingUrls.has(r.url)).map(r => ({ ...r, selected: true }));
+        uxResults = [...uxResults, ...newResults];
+        if (errors.length) uxErrors = [...uxErrors, ...errors.map(e => `[${filename}] ${e}`)];
+        uxUploadedFiles = [...uxUploadedFiles, { name: filename, size: text.length, resultCount: newResults.length }];
+        // Update stats
+        const totalFound = (uxStats?.totalFound || 0) + stats.totalFound;
+        const duplicates = (uxStats?.duplicates || 0) + stats.duplicates + results.filter(r => existingUrls.has(r.url)).length;
+        uxStats = { totalFound, duplicates, sources: (uxStats?.sources || 0) + stats.sources };
+      } catch (e) {
+        uxErrors = [...uxErrors, `[${filename}] Error: ${e?.message || String(e)}`];
+      } finally {
+        uxProcessing = false;
+      }
+    }, 30);
+  }
+
+  function uxHandleDrop(e) {
+    e.preventDefault();
+    uxDragActive = false;
+    const files = e.dataTransfer?.files;
+    if (files) uxProcessFiles(files);
+  }
+
+  function uxHandleDragOver(e) {
+    e.preventDefault();
+    uxDragActive = true;
+  }
+
+  function uxHandleDragLeave() {
+    uxDragActive = false;
+  }
+
+  function uxHandleFileSelect(e) {
+    const files = e.currentTarget?.files;
+    if (files) uxProcessFiles(files);
+    // Reset input so same file can be re-selected
+    e.currentTarget.value = '';
+  }
+
+  function uxProcessFiles(fileList) {
+    const textTypes = ['application/json', 'text/plain', 'text/csv', 'text/html', 'text/xml',
+      'application/xml', 'text/tab-separated-values', 'application/x-ndjson'];
+    const textExts = ['json', 'txt', 'csv', 'html', 'htm', 'xml', 'tsv', 'log', 'md', 'yaml', 'yml', 'ini', 'cfg', 'conf', 'toml', 'ndjson'];
+
+    for (const file of fileList) {
+      const ext = file.name.split('.').pop()?.toLowerCase() || '';
+      const isText = textTypes.some(t => file.type.startsWith(t)) || textExts.includes(ext) || file.type === '';
+
+      if (!isText) {
+        uxErrors = [...uxErrors, `"${file.name}" appears to be a binary file and cannot be processed.`];
+        continue;
+      }
+      if (file.size > UX_MAX_INPUT_BYTES) {
+        uxErrors = [...uxErrors, `"${file.name}" is too large (${(file.size / 1024 / 1024).toFixed(1)} MB). Max is 5 MB.`];
+        continue;
+      }
+
+      const reader = new FileReader();
+      reader.onload = () => {
+        if (typeof reader.result === 'string') {
+          uxRunExtractFile(reader.result, file.name);
+        }
+      };
+      reader.onerror = () => {
+        uxErrors = [...uxErrors, `Failed to read "${file.name}".`];
+      };
+      reader.readAsText(file);
+    }
+  }
+
+  function uxRemoveResult(url) {
+    uxResults = uxResults.filter(r => r.url !== url);
+  }
+
+  function uxToggleResult(url) {
+    uxResults = uxResults.map(r => r.url === url ? { ...r, selected: !r.selected } : r);
+  }
+
+  function uxToggleAll() {
+    const allSelected = uxResults.every(r => r.selected);
+    uxResults = uxResults.map(r => ({ ...r, selected: !allSelected }));
+  }
+
+  function uxCopyUrl(url) {
+    copyText(url);
+    toast('URL copied!', 'success');
+  }
+
+  function uxCopyAllUrls() {
+    const urls = uxResults.filter(r => r.selected).map(r => r.url).join('\n');
+    if (!urls) return;
+    copyText(urls);
+    toast(`${uxResults.filter(r => r.selected).length} URLs copied!`, 'success');
+  }
+
+  function uxCopyAllDetails() {
+    const lines = uxResults.filter(r => r.selected).map(r => `${r.name || 'Firebase'}|${r.url}|${r.source}`).join('\n');
+    if (!lines) return;
+    copyText(lines);
+    toast('All details copied!', 'success');
+  }
+
+  function uxAddToBulk() {
+    const selected = uxResults.filter(r => r.selected);
+    if (!selected.length) { toast('No connections selected.', 'error'); return; }
+    const existing = parseBulkFirebase(bulkText);
+    const newUrls = selected.map(r => r.url).filter(u => !existing.includes(u));
+    if (newUrls.length) {
+      bulkText = [...existing, ...newUrls].join('\n');
+      toast(`Added ${newUrls.length} URL${newUrls.length !== 1 ? 's' : ''} to Bulk list.`, 'success');
+    } else {
+      toast('All selected URLs are already in the Bulk list.', 'info');
+    }
+  }
+
+  function uxClear() {
+    uxInput = '';
+    uxResults = [];
+    uxErrors = [];
+    uxStats = null;
+    uxUploadedFiles = [];
+  }
+
+  function uxUpdateName(url, newName) {
+    uxResults = uxResults.map(r => r.url === url ? { ...r, name: newName } : r);
   }
 
   // ── Editable bulk URL list (driven by bulkText) ───────────────────────────
@@ -1074,7 +1373,7 @@
     if (found.length > 1) {
       e.preventDefault();
       bulkText = pasted;
-      bulkMode = true;
+      addPanelMode = 'bulk';
       toast(`Detected ${found.length} URLs — switched to Bulk mode`, 'info');
     }
   }
@@ -1092,7 +1391,7 @@
       const color = ACCENT[(connections.length + newConns.length) % ACCENT.length];
       let name = '';
       try { name = new URL(rawUrl).hostname.split('-')[0]; } catch {}
-      newConns.push({ id, name: name || 'Firebase', url: rawUrl, token:'', path:'messages', infoPath:'clients', color, enabled:true, locked:false });
+      newConns.push({ id, name: name || 'Firebase', url: rawUrl, token:'', path:'messages', infoPath:'clients', color, enabled:true });
       added++;
     }
     if (newConns.length) {
@@ -1100,7 +1399,7 @@
       saveConnections(connections);
       for (const conn of newConns) fetchConn(conn);
     }
-    bulkText = ''; bulkMode = false; addOpen = false;
+    bulkText = ''; addPanelMode = 'single'; addOpen = false;
     if (added && skipped) toast(`Added ${added} connection${added>1?'s':''}, skipped ${skipped} duplicate${skipped>1?'s':''}`, 'success');
     else if (added) toast(`Added ${added} connection${added>1?'s':''}`, 'success');
     else toast(`All ${skipped} URL${skipped>1?'s':''} already connected`, 'info');
@@ -1132,7 +1431,6 @@
       color,
       name: name || "Firebase",
       enabled: true,
-      locked: false,
     };
     connections = [...connections, conn];
     saveConnections(connections); // persist immediately
@@ -1143,12 +1441,6 @@
     toast(`Connected: ${conn.name}`, "success");
   }
   function toggleConn(id) {
-    const target = connections.find(c => c.id === id);
-    if (target?.locked && !sessionUnlocked && !target.enabled) {
-      showLockModal = true;
-      toast('Enter password to unlock code Firebase connections.', 'info');
-      return;
-    }
     connections = connections.map((c) =>
       c.id === id ? { ...c, enabled: !c.enabled } : c,
     );
@@ -1286,12 +1578,6 @@
   let masterEnabled = $derived(connections.length > 0 && connections.every(c => c.enabled));
 
   function toggleAllConns() {
-    // If not unlocked on this device and code connections exist, turning all ON requires the password!
-    if (!sessionUnlocked && hasLockedConns() && !masterEnabled) {
-      showLockModal = true;
-      toast('Enter password (qweasd123) to enable code Firebase connections.', 'info');
-      return;
-    }
     const newState = !masterEnabled;
     connections = connections.map(c => ({ ...c, enabled: newState }));
     saveConnections(connections);
@@ -2095,32 +2381,6 @@
             >
           {/if}
         </div>
-        {#if hasLockedConns()}
-          <button
-            class="ico-btn {sessionUnlocked ? 'ico-unlocked' : 'ico-locked'}"
-            onclick={() => {
-              if (sessionUnlocked) {
-                if (confirm("Lock code Firebase connections? This will disable them until the password is entered again.")) {
-                  lockConnections();
-                }
-              } else {
-                showLockModal = true;
-              }
-            }}
-            title={sessionUnlocked ? "Code connections unlocked (click to lock)" : "Code connections locked (click to enter password: qweasd123)"}
-            aria-label="Code Firebase lock status"
-          >
-            {#if sessionUnlocked}
-              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#22c55e" stroke-width="2">
-                <rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 9.9-1"/>
-              </svg>
-            {:else}
-              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#f97316" stroke-width="2">
-                <rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/>
-              </svg>
-            {/if}
-          </button>
-        {/if}
         <button
           class="ico-btn {addOpen ? 'ico-active' : ''}"
           onclick={() => (addOpen = !addOpen)}
@@ -2441,16 +2701,20 @@
       <div class="add-panel">
         <div class="ap-hdr">
           <span>Add Firebase Connection</span>
-          <div class="ap-mode-toggle">
-            <button class="ap-mode-btn {!bulkMode ? 'ap-mode-active' : ''}" onclick={() => bulkMode=false}>Single</button>
-            <button class="ap-mode-btn {bulkMode ? 'ap-mode-active' : ''}" onclick={() => bulkMode=true}>Bulk</button>
+        <div class="ap-mode-toggle">
+            <button class="ap-mode-btn {addPanelMode === 'single' ? 'ap-mode-active' : ''}" onclick={() => addPanelMode='single'}>Single</button>
+            <button class="ap-mode-btn {addPanelMode === 'bulk' ? 'ap-mode-active' : ''}" onclick={() => addPanelMode='bulk'}>Bulk</button>
+            <button class="ap-mode-btn {addPanelMode === 'extract' ? 'ap-mode-active' : ''}" onclick={() => addPanelMode='extract'}>
+              <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></svg>
+              Extract
+            </button>
           </div>
           <button class="ico-btn" onclick={() => (addOpen = false)} aria-label="Close">
             <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 6 6 18M6 6l12 12" /></svg>
           </button>
         </div>
 
-        {#if !bulkMode}
+        {#if addPanelMode === 'single'}
           <div class="ap-grid">
             <div class="field"><label for="fn">Name</label><input id="fn" bind:value={form.name} placeholder="project-name" /></div>
             <div class="field"><label for="fu">Firebase URL</label><input id="fu" bind:value={form.url} onpaste={handleUrlPaste} placeholder="https://xxx-default-rtdb.firebaseio.com" /></div>
@@ -2462,7 +2726,7 @@
             <button class="btn btn-ghost" onclick={() => (addOpen = false)}>Cancel</button>
             <button class="btn btn-primary" onclick={addConn}>Connect</button>
           </div>
-        {:else}
+        {:else if addPanelMode === 'bulk'}
           <div class="bulk-area">
             <div class="bulk-hint">
               <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4M12 8h.01"/></svg>
@@ -2504,43 +2768,8 @@
               </div>
             {/if}
 
-            <!-- Extract from Link sub-section -->
-            <div class="extractor-section">
-              <button class="extractor-toggle" onclick={() => { showExtractor = !showExtractor; extractError = ''; extractSuccess = ''; }}>
-                <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></svg>
-                Extract from Link
-                <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" style="transform:rotate({showExtractor ? 180 : 0}deg);transition:transform 150ms"><path d="M6 9l6 6 6-6"/></svg>
-              </button>
-              {#if showExtractor}
-                <div class="extractor-body">
-                  <div class="extractor-hint">Paste one or more shared panel URLs or raw Base64 strings — one per line. All Firebase URLs will be extracted from every input.</div>
-                  <div class="extractor-row extractor-row-col">
-                    <textarea
-                      class="extractor-input extractor-textarea"
-                      bind:value={extractInput}
-                      placeholder={`https://panel.vercel.app/?s=aHR0cHM6Ly8…
-https://other.vercel.app/?s=aHR0cHM6Ly8…
-aHR0cHM6Ly8… (raw Base64)`}
-                      aria-label="Extract from link input"
-                      rows="3"
-                      onkeydown={(e) => e.key === 'Enter' && e.ctrlKey && !extracting && extractInput.trim() && handleExtract()}
-                    ></textarea>
-                    <div style="display:flex;gap:6px;justify-content:flex-end">
-                      {#if extractInput}<button class="bulk-rm-btn" onclick={() => { extractInput = ''; extractError = ''; extractSuccess = ''; }} title="Clear">×</button>{/if}
-                      <button class="btn btn-primary btn-sm extractor-btn" onclick={handleExtract} disabled={extracting || !extractInput.trim()}>
-                        {#if extracting}<span class="spin-ring" style="width:11px;height:11px;border-width:2px"></span>{:else}<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M7 17L17 7M7 7h10v10"/></svg>{/if}
-                        Extract All
-                      </button>
-                    </div>
-                  </div>
-                  {#if extractError}<div class="extractor-error"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M15 9l-6 6M9 9l6 6"/></svg> {extractError}</div>{/if}
-                  {#if extractSuccess}<div class="extractor-success"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M9 12l2 2 4-4"/></svg> {extractSuccess}</div>{/if}
-                </div>
-              {/if}
-            </div>
-
             <div class="ap-foot">
-              <button class="btn btn-ghost" onclick={() => { bulkText=''; bulkMode=false; showExtractor=false; extractInput=''; extractError=''; extractSuccess=''; }}>Cancel</button>
+              <button class="btn btn-ghost" onclick={() => { bulkText=''; addPanelMode='single'; }}>Cancel</button>
               <button class="btn btn-primary" onclick={addBulkConns} disabled={!bulkParsed.length}>
                 {#if bulkParsed.filter(u => !connections.find(c => c.url.replace(/\/+$/,'') === u)).length > 0}
                   Add {bulkParsed.filter(u => !connections.find(c => c.url.replace(/\/+$/,'') === u)).length} Connection{bulkParsed.filter(u => !connections.find(c => c.url.replace(/\/+$/,'') === u)).length !== 1 ? 's' : ''}
@@ -2549,6 +2778,165 @@ aHR0cHM6Ly8… (raw Base64)`}
                 {/if}
               </button>
             </div>
+          </div>
+        {:else if addPanelMode === 'extract'}
+          <!-- ═══════════════ Universal Extractor ═══════════════ -->
+          <div class="ux-container">
+            <!-- Input area + file drop zone -->
+            <div
+              class="ux-drop-zone {uxDragActive ? 'ux-drop-active' : ''}"
+              ondragover={uxHandleDragOver}
+              ondragleave={uxHandleDragLeave}
+              ondrop={uxHandleDrop}
+              role="region"
+              aria-label="Universal extractor input"
+            >
+              <div class="ux-input-header">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></svg>
+                <span>Paste anything — URLs, Base64, JSON, or mixed text</span>
+              </div>
+              <textarea
+                class="ux-textarea"
+                bind:value={uxInput}
+                placeholder={"https://panel.vercel.app/?s=aHR0cHM6Ly8…\nhttps://project-default-rtdb.firebaseio.com\n{\"db\":\"https://…firebaseio.com\"}\naHR0cHM6Ly8… (raw Base64)"}
+                aria-label="Universal extraction input"
+                rows="4"
+                onkeydown={(e) => e.key === 'Enter' && e.ctrlKey && !uxProcessing && uxInput.trim() && uxRunExtract()}
+              ></textarea>
+              <div class="ux-input-actions">
+                <label class="ux-file-btn" title="Upload files">
+                  <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
+                  Upload
+                  <input type="file" multiple accept=".json,.txt,.csv,.html,.htm,.xml,.tsv,.log,.md,.yaml,.yml,.ini,.cfg,.conf,.toml,.ndjson" onchange={uxHandleFileSelect} style="display:none" />
+                </label>
+                {#if uxInput || uxResults.length}
+                  <button class="ux-clear-input-btn" onclick={uxClear} title="Clear all">
+                    <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14H6L5 6"/></svg>
+                    Clear
+                  </button>
+                {/if}
+                <button class="btn btn-primary btn-sm ux-extract-btn" onclick={uxRunExtract} disabled={uxProcessing || !uxInput.trim()}>
+                  {#if uxProcessing}
+                    <span class="spin-ring" style="width:11px;height:11px;border-width:2px"></span>
+                    Extracting…
+                  {:else}
+                    <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M7 17L17 7M7 7h10v10"/></svg>
+                    Extract
+                  {/if}
+                </button>
+              </div>
+              {#if uxDragActive}
+                <div class="ux-drop-overlay">
+                  <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
+                  <span>Drop files here</span>
+                </div>
+              {/if}
+            </div>
+
+            <!-- Uploaded files tags -->
+            {#if uxUploadedFiles.length}
+              <div class="ux-uploaded-files">
+                {#each uxUploadedFiles as f}
+                  <span class="ux-file-tag">
+                    <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>
+                    {f.name}
+                    <span class="ux-file-tag-count">{f.resultCount}</span>
+                  </span>
+                {/each}
+              </div>
+            {/if}
+
+            <!-- Errors -->
+            {#if uxErrors.length}
+              <div class="ux-errors">
+                {#each uxErrors as err}
+                  <div class="ux-error-item">
+                    <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M15 9l-6 6M9 9l6 6"/></svg>
+                    {err}
+                  </div>
+                {/each}
+              </div>
+            {/if}
+
+            <!-- Results -->
+            {#if uxResults.length}
+              <div class="ux-results">
+                <div class="ux-results-header">
+                  <div class="ux-results-title">
+                    <button class="ux-select-all-btn" onclick={uxToggleAll} title="Toggle all">
+                      {#if uxResults.every(r => r.selected)}
+                        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="#f97316" stroke-width="2.5"><rect x="3" y="3" width="18" height="18" rx="3"/><path d="M9 12l2 2 4-4"/></svg>
+                      {:else if uxResults.some(r => r.selected)}
+                        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="#f97316" stroke-width="2.5"><rect x="3" y="3" width="18" height="18" rx="3"/><line x1="8" y1="12" x2="16" y2="12"/></svg>
+                      {:else}
+                        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="#475569" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="3"/></svg>
+                      {/if}
+                    </button>
+                    <span>{uxResults.length} connection{uxResults.length !== 1 ? 's' : ''} found</span>
+                    {#if uxStats && uxStats.duplicates > 0}
+                      <span class="ux-stat-dim">· {uxStats.duplicates} dup{uxStats.duplicates !== 1 ? 's' : ''} filtered</span>
+                    {/if}
+                  </div>
+                  <div class="ux-results-actions">
+                    <button class="bulk-action-btn" onclick={uxCopyAllUrls} title="Copy selected URLs">
+                      <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
+                      Copy
+                    </button>
+                  </div>
+                </div>
+                <div class="ux-results-list">
+                  {#each uxResults as item (item.url)}
+                    <div class="ux-result-row {item.selected ? '' : 'ux-result-deselected'}">
+                      <button class="ux-result-check" onclick={() => uxToggleResult(item.url)}>
+                        {#if item.selected}
+                          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="#f97316" stroke-width="2.5"><rect x="3" y="3" width="18" height="18" rx="3"/><path d="M9 12l2 2 4-4"/></svg>
+                        {:else}
+                          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="#334155" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="3"/></svg>
+                        {/if}
+                      </button>
+                      <div class="ux-result-info">
+                        <input
+                          class="ux-result-name"
+                          value={item.name}
+                          onchange={(e) => uxUpdateName(item.url, e.currentTarget.value)}
+                          placeholder="project-name"
+                          aria-label="Connection name"
+                        />
+                        <div class="ux-result-url" title={item.url}>{item.url}</div>
+                        <span class="ux-source-tag">{item.source}</span>
+                      </div>
+                      <div class="ux-result-btns">
+                        <button class="ux-action-mini" onclick={() => uxCopyUrl(item.url)} title="Copy URL">
+                          <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
+                        </button>
+                        <button class="ux-action-mini ux-action-remove" onclick={() => uxRemoveResult(item.url)} title="Remove">×</button>
+                      </div>
+                    </div>
+                  {/each}
+                </div>
+              </div>
+
+              <!-- Footer: Add selected to connections -->
+              <div class="ap-foot">
+                <button class="btn btn-ghost" onclick={() => { uxClear(); addPanelMode='single'; }}>Cancel</button>
+                <button class="btn btn-ghost" onclick={uxAddToBulk}>
+                  <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M17 3a2.828 2.828 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5z"/></svg>
+                  Send to Bulk
+                </button>
+                <button class="btn btn-primary" onclick={() => { uxAddToBulk(); addPanelMode = 'bulk'; }}>
+                  <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M12 5v14M5 12h14"/></svg>
+                  Add {uxResults.filter(r => r.selected).length} Connection{uxResults.filter(r => r.selected).length !== 1 ? 's' : ''}
+                </button>
+              </div>
+            {:else if !uxProcessing && !uxInput.trim() && !uxErrors.length}
+              <div class="ux-empty-hint">
+                <div class="ux-empty-icon">
+                  <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.2"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></svg>
+                </div>
+                <p>Paste any URL, Base64, JSON, or upload a file.</p>
+                <p class="ux-empty-sub">The extractor automatically detects and decodes Firebase RTDB connections from any source.</p>
+              </div>
+            {/if}
           </div>
         {/if}
 
@@ -2779,27 +3167,6 @@ aHR0cHM6Ly8… (raw Base64)`}
                 <span class="fmt-label">{masterEnabled ? 'All ON' : 'All OFF'}</span>
               </button>
             {/if}
-            {#if hasLockedConns()}
-              {#if !sessionUnlocked}
-                <button
-                  class="fc-act-btn fc-act-locked"
-                  onclick={() => (showLockModal = true)}
-                  title="Code connections are locked. Click to enter password (qweasd123) to unlock."
-                >
-                  <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="#f97316" stroke-width="2.5"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>
-                  <span>Unlock Code</span>
-                </button>
-              {:else}
-                <button
-                  class="fc-act-btn fc-act-unlocked"
-                  onclick={lockConnections}
-                  title="Code connections unlocked. Click to lock and disable them."
-                >
-                  <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="#22c55e" stroke-width="2.5"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 9.9-1"/></svg>
-                  <span>Lock Code</span>
-                </button>
-              {/if}
-            {/if}
             {#if failedConns.length > 0}
               <button class="fc-act-btn fc-act-danger" onclick={removeFailedConns} title="Remove all {failedConns.length} failed connections">
                 <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14H6L5 6"/><path d="M10 11v6M14 11v6"/></svg>
@@ -2883,21 +3250,12 @@ aHR0cHM6Ly8… (raw Base64)`}
                     {#if conn.total > 0} · {conn.total} total{/if}
                   </span>
                   {#if hasAuth}<span class="fc-auth-badge">🔐 Auth</span>{/if}
-                  {#if realConn?.locked}
-                    <span class="fc-type-badge {sessionUnlocked ? 'fc-type-code-unlocked' : 'fc-type-code-locked'}" title={sessionUnlocked ? 'Code default (unlocked)' : 'Code default (password required: qweasd123)'}>
-                      {sessionUnlocked ? '🔓 Code' : '🔒 Locked'}
-                    </span>
-                  {:else}
-                    <span class="fc-type-badge fc-type-manual" title="Manually added connection (no password required)">
-                      Manual
-                    </span>
-                  {/if}
                   <div class="fc-card-actions">
                     <!-- Per-card enable/disable toggle -->
                     <button
                       class="fc-card-tog {realConn?.enabled ? 'fc-card-tog-on' : 'fc-card-tog-off'}"
                       onclick={() => toggleConn(conn.id)}
-                      title="{realConn?.enabled ? 'Click to disable connection' : 'Click to enable connection'}{realConn?.locked && !sessionUnlocked ? ' (requires password)' : ''}"
+                      title="{realConn?.enabled ? 'Click to disable connection' : 'Click to enable connection'}"
                       aria-label="Toggle connection status"
                     >
                       <span class="fct-knob"></span>
@@ -3948,86 +4306,6 @@ aHR0cHM6Ly8… (raw Base64)`}
     </div>
   </div>
 </div>
-
-<!-- Password Lock Modal -->
-{#if showLockModal}
-  <!-- svelte-ignore a11y_click_events_have_key_events -->
-  <div
-    class="lock-overlay"
-    role="dialog"
-    aria-modal="true"
-    tabindex="-1"
-    aria-label="Unlock code Firebase connections"
-    onclick={(e) => { if (e.target === e.currentTarget) dismissLockModal(); }}
-  >
-    <div class="lock-modal">
-      <button class="lock-close-btn" onclick={dismissLockModal} title="Close (use manual only)" aria-label="Close modal">
-        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M18 6 6 18M6 6l12 12" /></svg>
-      </button>
-      <div class="lock-icon">
-        <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="#f97316" stroke-width="1.75">
-          <rect x="3" y="11" width="18" height="11" rx="2"/>
-          <path d="M7 11V7a5 5 0 0 1 10 0v4"/>
-        </svg>
-      </div>
-      <div class="lock-title">Code Firebase Protection</div>
-      <div class="lock-sub">Enter the password to enable the default Firebase connections in the code.</div>
-      <form class="lock-form" onsubmit={(e) => { e.preventDefault(); unlockWithPassword(); }}>
-        <div class="lock-input-wrap">
-          <!-- svelte-ignore a11y_autofocus -->
-          <input
-            id="lock-pw-input"
-            class="lock-input {lockPasswordError ? 'lock-input-err' : ''}"
-            type={showPasswordText ? "text" : "password"}
-            bind:value={lockPasswordInput}
-            placeholder="Password (qweasd123)"
-            autocomplete="current-password"
-            autofocus
-            disabled={lockPasswordLoading}
-            aria-label="Unlock password"
-          />
-          <button
-            type="button"
-            class="lock-pw-toggle"
-            onclick={() => (showPasswordText = !showPasswordText)}
-            title={showPasswordText ? "Hide password" : "Show password"}
-            aria-label="Toggle password visibility"
-          >
-            {#if showPasswordText}
-              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19m-6.72-1.07a3 3 0 1 1-4.24-4.24"/><line x1="1" y1="1" x2="23" y2="23"/></svg>
-            {:else}
-              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>
-            {/if}
-          </button>
-        </div>
-        {#if lockPasswordError}
-          <div class="lock-error">
-            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M15 9l-6 6M9 9l6 6"/></svg>
-            <span>{lockPasswordError}</span>
-          </div>
-        {/if}
-        <div class="lock-btn-row">
-          <button class="btn btn-ghost lock-btn-cancel" type="button" onclick={dismissLockModal}>
-            Skip / Manual Only
-          </button>
-          <button class="btn btn-primary lock-submit" type="submit" disabled={lockPasswordLoading || !lockPasswordInput.trim()}>
-            {#if lockPasswordLoading}
-              <span class="spin-ring" style="width:13px;height:13px;border-width:2px"></span>
-              Verifying…
-            {:else}
-              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M5 12l5 5L20 7"/></svg>
-              Unlock
-            {/if}
-          </button>
-        </div>
-      </form>
-      <div class="lock-note">
-        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="#22c55e" stroke-width="2"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></svg>
-        <span>Manually added connections work without a password.</span>
-      </div>
-    </div>
-  </div>
-{/if}
 
 <!-- Toasts -->
 <div class="toast-stack">
@@ -9400,110 +9678,315 @@ aHR0cHM6Ly8… (raw Base64)`}
   .bulk-action-btn:hover { color: #38bdf8; border-color: rgba(56,189,248,0.3); background: rgba(56,189,248,0.07); }
   .bulk-clear-btn:hover { color: #ef4444 !important; border-color: rgba(239,68,68,0.3) !important; background: rgba(239,68,68,0.07) !important; }
 
-  /* ── Extract from Link ────────────────────────────────────────────────── */
-  .extractor-section {
-    border: 1px solid rgba(255,255,255,0.07);
-    border-radius: 7px;
-    overflow: hidden;
+  /* ── Universal Extractor ─────────────────────────────────────────────── */
+  .ux-container {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    padding: 12px;
   }
-  .extractor-toggle {
+  .ux-drop-zone {
+    position: relative;
+    border: 1.5px dashed rgba(255,255,255,0.12);
+    border-radius: 8px;
+    background: rgba(0,0,0,0.18);
+    transition: all 180ms;
+    display: flex;
+    flex-direction: column;
+    gap: 0;
+  }
+  .ux-drop-zone.ux-drop-active {
+    border-color: rgba(249,115,22,0.6);
+    background: rgba(249,115,22,0.06);
+    box-shadow: 0 0 20px rgba(249,115,22,0.08);
+  }
+  .ux-input-header {
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    padding: 9px 12px 0;
+    font-size: 11.5px;
+    font-weight: 600;
+    color: #64748b;
+  }
+  .ux-input-header svg { color: #f97316; flex-shrink: 0; }
+  .ux-textarea {
+    width: 100%;
+    box-sizing: border-box;
+    background: transparent;
+    border: none;
+    color: #e2e8f0;
+    font-size: 11px;
+    font-family: 'JetBrains Mono', monospace;
+    padding: 8px 12px;
+    outline: none;
+    resize: vertical;
+    min-height: 72px;
+    line-height: 1.6;
+  }
+  .ux-textarea::placeholder { color: #334155; }
+  .ux-input-actions {
     display: flex;
     align-items: center;
     gap: 6px;
-    width: 100%;
-    padding: 8px 12px;
-    background: rgba(255,255,255,0.03);
-    border: none;
-    color: #64748b;
-    font-size: 12px;
+    padding: 0 10px 9px;
+    justify-content: flex-end;
+  }
+  .ux-file-btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    padding: 4px 10px;
+    font-size: 10.5px;
     font-weight: 600;
+    border-radius: 5px;
+    border: 1px solid rgba(255,255,255,0.1);
+    background: rgba(255,255,255,0.05);
+    color: #64748b;
     cursor: pointer;
     font-family: inherit;
-    text-align: left;
-    transition: all 130ms;
+    transition: all 120ms;
   }
-  .extractor-toggle:hover { background: rgba(249,115,22,0.07); color: #f97316; }
-  .extractor-toggle svg:first-child { color: #f97316; flex-shrink: 0; }
-  .extractor-toggle svg:last-child { margin-left: auto; flex-shrink: 0; }
-  .extractor-body {
-    padding: 10px 12px;
-    border-top: 1px solid rgba(255,255,255,0.06);
-    background: rgba(0,0,0,0.15);
-    display: flex;
-    flex-direction: column;
-    gap: 8px;
-  }
-  .extractor-hint {
-    font-size: 11px;
-    color: #475569;
-    line-height: 1.4;
-  }
-  .extractor-hint code {
-    font-family: 'JetBrains Mono', monospace;
-    background: rgba(255,255,255,0.07);
-    padding: 1px 4px;
-    border-radius: 3px;
-    color: #f97316;
-  }
-  .extractor-row {
-    display: flex;
+  .ux-file-btn:hover { color: #f97316; border-color: rgba(249,115,22,0.3); background: rgba(249,115,22,0.07); }
+  .ux-clear-input-btn {
+    display: inline-flex;
     align-items: center;
-    gap: 6px;
-  }
-  .extractor-input {
-    flex: 1;
-    min-width: 0;
-    background: rgba(0,0,0,0.3);
+    gap: 4px;
+    padding: 4px 10px;
+    font-size: 10.5px;
+    font-weight: 600;
+    border-radius: 5px;
     border: 1px solid rgba(255,255,255,0.1);
-    border-radius: 6px;
-    color: #e2e8f0;
-    font-size: 11.5px;
-    padding: 7px 10px;
-    outline: none;
-    font-family: 'JetBrains Mono', monospace;
-    transition: border-color 140ms;
+    background: rgba(255,255,255,0.05);
+    color: #64748b;
+    cursor: pointer;
+    font-family: inherit;
+    transition: all 120ms;
   }
-  .extractor-input:focus { border-color: rgba(249,115,22,0.5); }
-  .extractor-input::placeholder { color: #334155; }
-  .extractor-row-col {
-    flex-direction: column;
-    align-items: stretch;
-    gap: 6px;
-  }
-  .extractor-textarea {
-    resize: vertical;
-    min-height: 62px;
-    line-height: 1.5;
-    font-size: 11px;
-  }
-  .extractor-btn {
+  .ux-clear-input-btn:hover { color: #ef4444; border-color: rgba(239,68,68,0.3); background: rgba(239,68,68,0.07); }
+  .ux-extract-btn {
     display: inline-flex;
     align-items: center;
     gap: 5px;
     flex-shrink: 0;
   }
-  .extractor-error {
+  .ux-drop-overlay {
+    position: absolute;
+    inset: 0;
+    background: rgba(249,115,22,0.08);
+    border-radius: 8px;
     display: flex;
+    flex-direction: column;
     align-items: center;
+    justify-content: center;
     gap: 6px;
-    font-size: 11px;
+    color: #f97316;
+    font-size: 13px;
+    font-weight: 600;
+    pointer-events: none;
+    z-index: 5;
+    backdrop-filter: blur(2px);
+  }
+
+  /* Uploaded file tags */
+  .ux-uploaded-files {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 5px;
+  }
+  .ux-file-tag {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    padding: 3px 8px;
+    font-size: 10px;
+    font-weight: 600;
+    border-radius: 4px;
+    background: rgba(249,115,22,0.1);
+    border: 1px solid rgba(249,115,22,0.2);
+    color: #f97316;
+  }
+  .ux-file-tag-count {
+    background: rgba(249,115,22,0.25);
+    padding: 0 4px;
+    border-radius: 3px;
+    font-size: 9.5px;
+    min-width: 12px;
+    text-align: center;
+  }
+
+  /* Error display */
+  .ux-errors {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+  }
+  .ux-error-item {
+    display: flex;
+    align-items: flex-start;
+    gap: 6px;
+    font-size: 10.5px;
     color: #ef4444;
-    background: rgba(239,68,68,0.08);
-    border: 1px solid rgba(239,68,68,0.2);
+    background: rgba(239,68,68,0.06);
+    border: 1px solid rgba(239,68,68,0.15);
     border-radius: 5px;
-    padding: 6px 10px;
+    padding: 5px 9px;
     line-height: 1.4;
   }
-  .extractor-success {
+  .ux-error-item svg { flex-shrink: 0; margin-top: 1px; }
+
+  /* Results panel */
+  .ux-results {
+    border: 1px solid rgba(255,255,255,0.08);
+    border-radius: 7px;
+    overflow: hidden;
+    background: rgba(0,0,0,0.12);
+  }
+  .ux-results-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 7px 10px;
+    background: rgba(255,255,255,0.03);
+    border-bottom: 1px solid rgba(255,255,255,0.06);
+  }
+  .ux-results-title {
     display: flex;
     align-items: center;
     gap: 6px;
-    font-size: 11px;
-    color: #22c55e;
-    background: rgba(34,197,94,0.08);
-    border: 1px solid rgba(34,197,94,0.2);
-    border-radius: 5px;
-    padding: 6px 10px;
+    font-size: 11.5px;
+    font-weight: 600;
+    color: #94a3b8;
+  }
+  .ux-stat-dim { color: #475569; font-weight: 500; font-size: 10.5px; }
+  .ux-results-actions { display: flex; gap: 5px; }
+  .ux-select-all-btn {
+    background: none;
+    border: none;
+    cursor: pointer;
+    padding: 0;
+    display: flex;
+    align-items: center;
+    flex-shrink: 0;
+  }
+  .ux-results-list {
+    max-height: 260px;
+    overflow-y: auto;
+  }
+  .ux-result-row {
+    display: flex;
+    align-items: flex-start;
+    gap: 8px;
+    padding: 7px 10px;
+    border-bottom: 1px solid rgba(255,255,255,0.04);
+    transition: background 100ms;
+  }
+  .ux-result-row:last-child { border-bottom: none; }
+  .ux-result-row:hover { background: rgba(255,255,255,0.03); }
+  .ux-result-deselected { opacity: 0.4; }
+  .ux-result-check {
+    background: none;
+    border: none;
+    cursor: pointer;
+    padding: 2px 0 0;
+    flex-shrink: 0;
+    display: flex;
+    align-items: center;
+  }
+  .ux-result-info {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+  }
+  .ux-result-name {
+    background: transparent;
+    border: none;
+    border-bottom: 1px solid transparent;
+    color: #e2e8f0;
+    font-size: 11.5px;
+    font-weight: 600;
+    padding: 0 0 1px;
+    outline: none;
+    font-family: inherit;
+    width: 100%;
+    transition: border-color 120ms;
+  }
+  .ux-result-name:hover { border-bottom-color: rgba(255,255,255,0.15); }
+  .ux-result-name:focus { border-bottom-color: rgba(249,115,22,0.5); color: #fff; }
+  .ux-result-name::placeholder { color: #334155; font-weight: 500; }
+  .ux-result-url {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 10px;
+    color: #38bdf8;
+    word-break: break-all;
+    line-height: 1.4;
+    opacity: 0.8;
+  }
+  .ux-source-tag {
+    display: inline-block;
+    padding: 1px 6px;
+    font-size: 9px;
+    font-weight: 600;
+    border-radius: 3px;
+    background: rgba(124,58,237,0.12);
+    border: 1px solid rgba(124,58,237,0.2);
+    color: #a78bfa;
+    max-width: fit-content;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    max-width: 200px;
+  }
+  .ux-result-btns {
+    display: flex;
+    gap: 3px;
+    flex-shrink: 0;
+    align-items: center;
+    padding-top: 1px;
+  }
+  .ux-action-mini {
+    background: none;
+    border: none;
+    color: #475569;
+    cursor: pointer;
+    width: 22px;
+    height: 22px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    border-radius: 4px;
+    padding: 0;
+    transition: all 100ms;
+    font-family: inherit;
+    font-size: 14px;
+  }
+  .ux-action-mini:hover { background: rgba(255,255,255,0.06); color: #94a3b8; }
+  .ux-action-remove:hover { color: #ef4444 !important; background: rgba(239,68,68,0.1) !important; }
+
+  /* Empty state */
+  .ux-empty-hint {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 8px;
+    padding: 30px 20px 24px;
+    text-align: center;
+  }
+  .ux-empty-icon { color: #334155; }
+  .ux-empty-hint p {
+    margin: 0;
+    font-size: 12px;
+    color: #64748b;
+    font-weight: 500;
+  }
+  .ux-empty-sub {
+    font-size: 10.5px !important;
+    color: #475569 !important;
+    font-weight: 400 !important;
+    max-width: 320px;
+    line-height: 1.5;
   }
 
   /* ── FC responsive ────────────────────────────────────────────────────── */
@@ -9517,241 +10000,6 @@ aHR0cHM6Ly8… (raw Base64)`}
     .fc-edit-form { padding: 8px 12px; }
   }
 
-  /* ── Password Lock Modal & Badges ────────────────────────────────────────── */
-  .lock-overlay {
-    position: fixed;
-    inset: 0;
-    z-index: 1000;
-    background: rgba(3, 7, 18, 0.82);
-    backdrop-filter: blur(8px);
-    -webkit-backdrop-filter: blur(8px);
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    padding: 16px;
-    animation: fadeIn 0.2s ease;
-  }
-  .lock-modal {
-    position: relative;
-    width: 100%;
-    max-width: 420px;
-    background: #0f172a;
-    border: 1px solid rgba(249, 115, 22, 0.35);
-    border-radius: 16px;
-    padding: 28px 24px 22px 24px;
-    box-shadow: 0 25px 60px -15px rgba(0, 0, 0, 0.9), 0 0 40px rgba(249, 115, 22, 0.15);
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    text-align: center;
-    animation: scaleUp 0.25s cubic-bezier(0.16, 1, 0.3, 1);
-  }
-  @keyframes fadeIn {
-    from { opacity: 0; }
-    to { opacity: 1; }
-  }
-  @keyframes scaleUp {
-    from { opacity: 0; transform: scale(0.94) translateY(8px); }
-    to { opacity: 1; transform: scale(1) translateY(0); }
-  }
-  .lock-close-btn {
-    position: absolute;
-    top: 14px;
-    right: 14px;
-    background: transparent;
-    border: none;
-    color: #64748b;
-    cursor: pointer;
-    padding: 6px;
-    border-radius: 6px;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    transition: all 0.15s;
-  }
-  .lock-close-btn:hover {
-    color: #e2e8f0;
-    background: rgba(255, 255, 255, 0.08);
-  }
-  .lock-icon {
-    width: 60px;
-    height: 60px;
-    border-radius: 50%;
-    background: rgba(249, 115, 22, 0.12);
-    border: 1px solid rgba(249, 115, 22, 0.3);
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    margin-bottom: 16px;
-    box-shadow: 0 0 25px rgba(249, 115, 22, 0.25);
-  }
-  .lock-title {
-    font-size: 18px;
-    font-weight: 700;
-    color: #f8fafc;
-    letter-spacing: -0.02em;
-    margin-bottom: 6px;
-  }
-  .lock-sub {
-    font-size: 13px;
-    color: #94a3b8;
-    line-height: 1.45;
-    margin-bottom: 20px;
-  }
-  .lock-form {
-    width: 100%;
-    display: flex;
-    flex-direction: column;
-    gap: 12px;
-  }
-  .lock-input-wrap {
-    position: relative;
-    width: 100%;
-    display: flex;
-    align-items: center;
-  }
-  .lock-input {
-    width: 100%;
-    background: rgba(15, 23, 42, 0.9);
-    border: 1px solid rgba(255, 255, 255, 0.15);
-    border-radius: 8px;
-    padding: 10px 40px 10px 14px;
-    font-size: 14px;
-    color: #f8fafc;
-    outline: none;
-    transition: all 0.2s;
-  }
-  .lock-input:focus {
-    border-color: #f97316;
-    box-shadow: 0 0 0 3px rgba(249, 115, 22, 0.22);
-  }
-  .lock-input.lock-input-err {
-    border-color: #ef4444;
-    box-shadow: 0 0 0 3px rgba(239, 68, 68, 0.2);
-    animation: shake 0.3s ease;
-  }
-  @keyframes shake {
-    0%, 100% { transform: translateX(0); }
-    25% { transform: translateX(-4px); }
-    75% { transform: translateX(4px); }
-  }
-  .lock-pw-toggle {
-    position: absolute;
-    right: 10px;
-    background: transparent;
-    border: none;
-    color: #64748b;
-    cursor: pointer;
-    padding: 4px;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    transition: color 0.15s;
-  }
-  .lock-pw-toggle:hover {
-    color: #cbd5e1;
-  }
-  .lock-error {
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    gap: 6px;
-    font-size: 12px;
-    color: #ef4444;
-    background: rgba(239, 68, 68, 0.1);
-    border: 1px solid rgba(239, 68, 68, 0.25);
-    border-radius: 6px;
-    padding: 6px 10px;
-  }
-  .lock-btn-row {
-    display: flex;
-    gap: 8px;
-    margin-top: 4px;
-  }
-  .lock-btn-cancel {
-    flex: 1;
-    font-size: 12px;
-    color: #94a3b8;
-    border: 1px solid rgba(255, 255, 255, 0.1);
-  }
-  .lock-btn-cancel:hover {
-    color: #e2e8f0;
-    background: rgba(255, 255, 255, 0.06);
-  }
-  .lock-submit {
-    flex: 1.2;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    gap: 6px;
-    font-weight: 600;
-  }
-  .lock-note {
-    display: flex;
-    align-items: center;
-    gap: 6px;
-    font-size: 11.5px;
-    color: #94a3b8;
-    margin-top: 16px;
-    line-height: 1.35;
-  }
-
-  /* ── Lock toolbar buttons & badges ────────────────────────────────────────── */
-  .fc-act-locked {
-    border-color: rgba(249, 115, 22, 0.45) !important;
-    background: rgba(249, 115, 22, 0.1) !important;
-    color: #f97316 !important;
-  }
-  .fc-act-locked:hover {
-    background: rgba(249, 115, 22, 0.2) !important;
-    border-color: rgba(249, 115, 22, 0.7) !important;
-  }
-  .fc-act-unlocked {
-    border-color: rgba(34, 197, 94, 0.35) !important;
-    background: rgba(34, 197, 94, 0.08) !important;
-    color: #22c55e !important;
-  }
-  .fc-act-unlocked:hover {
-    background: rgba(34, 197, 94, 0.18) !important;
-  }
-  .ico-locked {
-    border-color: rgba(249, 115, 22, 0.4) !important;
-    background: rgba(249, 115, 22, 0.1) !important;
-  }
-  .ico-unlocked {
-    border-color: rgba(34, 197, 94, 0.4) !important;
-    background: rgba(34, 197, 94, 0.1) !important;
-  }
-  .cr-lock-ico {
-    font-size: 10px;
-    opacity: 0.75;
-    margin-left: 2px;
-  }
-
-  /* ── Type badges (Code vs Manual) ────────────────────────────────────────── */
-  .fc-type-badge {
-    font-size: 10px;
-    font-weight: 600;
-    padding: 2px 7px;
-    border-radius: 12px;
-    letter-spacing: 0.02em;
-    text-transform: uppercase;
-  }
-  .fc-type-code-locked {
-    background: rgba(249, 115, 22, 0.12);
-    border: 1px solid rgba(249, 115, 22, 0.35);
-    color: #fb923c;
-  }
-  .fc-type-code-unlocked {
-    background: rgba(34, 197, 94, 0.12);
-    border: 1px solid rgba(34, 197, 94, 0.3);
-    color: #4ade80;
-  }
-  .fc-type-manual {
-    background: rgba(148, 163, 184, 0.12);
-    border: 1px solid rgba(148, 163, 184, 0.25);
-    color: #cbd5e1;
-  }
 
   /* ── Card individual toggle ─────────────────────────────────────────────── */
   .fc-card-tog {
