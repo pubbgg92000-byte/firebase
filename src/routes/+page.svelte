@@ -223,6 +223,9 @@
     path: "messages",
     infoPath: "clients",
   });
+  let bulkMode = $state(false);
+  let bulkText = $state('');
+  let bulkParsed = $derived(parseBulkFirebase(bulkText));
   const ACCENT = [
     "#f97316",
     "#38bdf8",
@@ -610,11 +613,23 @@
   }
 
   // ── Display phone: local override → Firebase mobNo → fallback ────────────
-  // Strip carrier name + country code → bare 10-digit number
+  // Strip carrier name + country code → bare 10-digit number (e.g. Jio +916002734479 → 6002734479)
   function extractNumber(phoneStr) {
     if (!phoneStr) return "";
-    const digits = String(phoneStr).replace(/\D/g, ""); // remove all non-digits
+    const s = String(phoneStr).trim();
+    const indianMatch = s.match(/(?:(?:\+?91|0)[\s-]*)?([6-9]\d{4}[\s-]?\d{5})/);
+    if (indianMatch) {
+      return indianMatch[1].replace(/\D/g, "");
+    }
+    const digits = s.replace(/\D/g, "");
     return digits.length >= 10 ? digits.slice(-10) : digits;
+  }
+
+  function copyPhone(rawPhone) {
+    const num = extractNumber(rawPhone);
+    if (!num) return;
+    copyText(num);
+    toast(`${num} copied to clipboard`, "success");
   }
 
   function getDisplayPhone(connId, key, info) {
@@ -820,6 +835,51 @@
   });
 
   // ── Connection management ─────────────────────────────────────────────────
+  function parseBulkFirebase(text) {
+    if (!text || !text.trim()) return [];
+    const urlRegex = /https:\/\/[a-zA-Z0-9_-]+-default-rtdb(?:\.[a-zA-Z0-9.-]+)?\.firebase(?:database\.app|io\.com)/gi;
+    const matches = text.match(urlRegex) || [];
+    return [...new Set(matches.map(u => u.replace(/\/+$/, '')))];
+  }
+
+  function handleUrlPaste(e) {
+    const pasted = e.clipboardData?.getData('text') || '';
+    const found = parseBulkFirebase(pasted);
+    if (found.length > 1) {
+      e.preventDefault();
+      bulkText = pasted;
+      bulkMode = true;
+      toast(`Detected ${found.length} URLs — switched to Bulk mode`, 'info');
+    }
+  }
+
+  function addBulkConns() {
+    const urls = bulkParsed;
+    if (!urls.length) { toast('No valid Firebase URLs found in text','error'); return; }
+    let added = 0, skipped = 0;
+    const newConns = [];
+    for (const rawUrl of urls) {
+      const dup = connections.find(c => c.url.replace(/\/+$/,'') === rawUrl)
+               || newConns.find(c => c.url === rawUrl);
+      if (dup) { skipped++; continue; }
+      const id = `c${Date.now()}_${added}`;
+      const color = ACCENT[(connections.length + newConns.length) % ACCENT.length];
+      let name = '';
+      try { name = new URL(rawUrl).hostname.split('-')[0]; } catch {}
+      newConns.push({ id, name: name || 'Firebase', url: rawUrl, token:'', path:'messages', infoPath:'clients', color, enabled:true });
+      added++;
+    }
+    if (newConns.length) {
+      connections = [...connections, ...newConns];
+      saveConnections(connections);
+      for (const conn of newConns) fetchConn(conn);
+    }
+    bulkText = ''; bulkMode = false; addOpen = false;
+    if (added && skipped) toast(`Added ${added} connection${added>1?'s':''}, skipped ${skipped} duplicate${skipped>1?'s':''}`, 'success');
+    else if (added) toast(`Added ${added} connection${added>1?'s':''}`, 'success');
+    else toast(`All ${skipped} URL${skipped>1?'s':''} already connected`, 'info');
+  }
+
   function addConn() {
     const rawUrl = form.url.trim().replace(/\/+$/, "");
     if (!rawUrl) {
@@ -1087,6 +1147,8 @@
       if (sideFilter === "off" && on === true) return false;
       if (sideFilter === "num" && !getDisplayPhone(d.connId, d.key, d.info))
         return false;
+      if (sideFilter === "numOn" && !(on === true && getDisplayPhone(d.connId, d.key, d.info)))
+        return false;
       if (sideFilter === "used" && !isUsed(`dev::${d.connId}::${d.key}`))
         return false;
       return true;
@@ -1184,6 +1246,13 @@
         online: onl,
         total: devs.length,
       };
+    }).sort((a, b) => {
+      const aErr = a.error ? 1 : 0, bErr = b.error ? 1 : 0;
+      if (aErr !== bErr) return aErr - bErr;
+      const aEmpty = (!a.loading && a.total === 0) ? 1 : 0;
+      const bEmpty = (!b.loading && b.total === 0) ? 1 : 0;
+      if (aEmpty !== bEmpty) return aEmpty - bEmpty;
+      return b.online - a.online;
     }),
   );
 
@@ -1398,6 +1467,12 @@
             >📱 <span class="sdp-cnt">{numCount}</span></button
           >
           <button
+            class="sdp {sideFilter === 'numOn' ? 'sdp-numon' : ''}"
+            onclick={() => (sideFilter = "numOn")}
+            title="Number + Online"
+            >📱🟢 <span class="sdp-cnt">{onlineNumCount}</span></button
+          >
+          <button
             class="sdp {sideFilter === 'off' ? 'sdp-off' : ''}"
             onclick={() => (sideFilter = "off")}
             >🔴 <span class="sdp-cnt">{offlineCount}</span></button
@@ -1449,7 +1524,14 @@
                   >{d.key.slice(0, 15)}{d.key.length > 15 ? "…" : ""}</span
                 >
                 {#if fp}
-                  <span class="sdv-phone">{fp}</span>
+                  <button
+                    class="sdv-phone-btn"
+                    title="Click to copy number"
+                    onclick={(e) => {
+                      e.stopPropagation();
+                      copyPhone(fp);
+                    }}
+                  >{fp}</button>
                 {:else}
                   <span class="sdv-fb" style="color:{d.conn.color}"
                     >{d.conn.name}</span
@@ -1467,8 +1549,7 @@
                   aria-label="Copy number"
                   onclick={(e) => {
                     e.stopPropagation();
-                    copyText(extractNumber(fp));
-                    toast("Number copied", "success");
+                    copyPhone(fp);
                   }}
                 >
                   <svg
@@ -1952,65 +2033,59 @@
       <div class="add-panel">
         <div class="ap-hdr">
           <span>Add Firebase Connection</span>
-          <button
-            class="ico-btn"
-            onclick={() => (addOpen = false)}
-            aria-label="Close"
-          >
-            <svg
-              width="13"
-              height="13"
-              viewBox="0 0 24 24"
-              fill="none"
-              stroke="currentColor"
-              stroke-width="2"><path d="M18 6 6 18M6 6l12 12" /></svg
-            >
+          <div class="ap-mode-toggle">
+            <button class="ap-mode-btn {!bulkMode ? 'ap-mode-active' : ''}" onclick={() => bulkMode=false}>Single</button>
+            <button class="ap-mode-btn {bulkMode ? 'ap-mode-active' : ''}" onclick={() => bulkMode=true}>Bulk</button>
+          </div>
+          <button class="ico-btn" onclick={() => (addOpen = false)} aria-label="Close">
+            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 6 6 18M6 6l12 12" /></svg>
           </button>
         </div>
-        <div class="ap-grid">
-          <div class="field">
-            <label for="fn">Name</label><input
-              id="fn"
-              bind:value={form.name}
-              placeholder="project-name"
-            />
+
+        {#if !bulkMode}
+          <div class="ap-grid">
+            <div class="field"><label for="fn">Name</label><input id="fn" bind:value={form.name} placeholder="project-name" /></div>
+            <div class="field"><label for="fu">Firebase URL</label><input id="fu" bind:value={form.url} onpaste={handleUrlPaste} placeholder="https://xxx-default-rtdb.firebaseio.com" /></div>
+            <div class="field"><label for="fp">Messages Path</label><input id="fp" bind:value={form.path} placeholder="messages" /></div>
+            <div class="field"><label for="fi">Device Info Path</label><input id="fi" bind:value={form.infoPath} placeholder="devices (optional)" /></div>
+            <div class="field"><label for="ft">Auth Token</label><input id="ft" type="password" bind:value={form.token} placeholder="optional" /></div>
           </div>
-          <div class="field">
-            <label for="fu">Firebase URL</label><input
-              id="fu"
-              bind:value={form.url}
-              placeholder="https://xxx-default-rtdb.firebaseio.com"
-            />
+          <div class="ap-foot">
+            <button class="btn btn-ghost" onclick={() => (addOpen = false)}>Cancel</button>
+            <button class="btn btn-primary" onclick={addConn}>Connect</button>
           </div>
-          <div class="field">
-            <label for="fp">Messages Path</label><input
-              id="fp"
-              bind:value={form.path}
-              placeholder="messages"
-            />
+        {:else}
+          <div class="bulk-area">
+            <div class="bulk-hint">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4M12 8h.01"/></svg>
+              <span>Paste Firebase RTDB URLs — one per line, numbered, comma-separated, or mixed text. All valid URLs are extracted automatically.</span>
+            </div>
+            <textarea class="bulk-input" bind:value={bulkText} placeholder={`1. https://project1-default-rtdb.firebaseio.com\n2. https://project2-default-rtdb.firebaseio.com\n3. https://project3-default-rtdb.firebaseio.com`} rows="6" aria-label="Bulk Firebase URLs"></textarea>
+            {#if bulkParsed.length}
+              <div class="bulk-preview">
+                <span class="bulk-count">{bulkParsed.length} URL{bulkParsed.length > 1 ? 's' : ''} detected</span>
+                <div class="bulk-urls">
+                  {#each bulkParsed as url, i}
+                    <div class="bulk-url-row">
+                      <span class="bulk-idx">{i + 1}</span>
+                      <span class="bulk-url-name">{(() => { try { return new URL(url).hostname.split('-')[0]; } catch { return 'Firebase'; } })()}</span>
+                      <span class="bulk-url-val">{url}</span>
+                      {#if connections.find(c => c.url.replace(/\/+$/,'') === url)}
+                        <span class="bulk-dup">already added</span>
+                      {/if}
+                    </div>
+                  {/each}
+                </div>
+              </div>
+            {/if}
+            <div class="ap-foot">
+              <button class="btn btn-ghost" onclick={() => { bulkText=''; bulkMode=false; }}>Cancel</button>
+              <button class="btn btn-primary" onclick={addBulkConns} disabled={!bulkParsed.length}>
+                Add {bulkParsed.length} Connection{bulkParsed.length !== 1 ? 's' : ''}
+              </button>
+            </div>
           </div>
-          <div class="field">
-            <label for="fi">Device Info Path</label><input
-              id="fi"
-              bind:value={form.infoPath}
-              placeholder="devices (optional)"
-            />
-          </div>
-          <div class="field">
-            <label for="ft">Auth Token</label><input
-              id="ft"
-              type="password"
-              bind:value={form.token}
-              placeholder="optional"
-            />
-          </div>
-        </div>
-        <div class="ap-foot">
-          <button class="btn btn-ghost" onclick={() => (addOpen = false)}
-            >Cancel</button
-          >
-          <button class="btn btn-primary" onclick={addConn}>Connect</button>
-        </div>
+        {/if}
 
         <!-- ── Quick Settings ── -->
         <div class="ap-settings">
@@ -2463,6 +2538,15 @@
                 {@const sc = d.info ? getSims(d.info) : null}
                 {@const isNew = newDeviceKeys.has(`${d.connId}::${d.key}`)}
                 {@const devUsed = isUsed(`dev::${d.connId}::${d.key}`)}
+                {@const lastMsgTs = Number(d.info?.lastMessageTime ?? 0)}
+                {@const lastMsgFmt = lastMsgTs ? (() => {
+                  const diff = Date.now() - lastMsgTs;
+                  if (diff < 60000) return `${Math.floor(diff/1000)}s ago`;
+                  if (diff < 3600000) return `${Math.floor(diff/60000)}m ago`;
+                  if (diff < 86400000) return `${Math.floor(diff/3600000)}h ago`;
+                  const d2 = new Date(lastMsgTs);
+                  return `${d2.getDate()}/${d2.getMonth()+1} ${String(d2.getHours()).padStart(2,'0')}:${String(d2.getMinutes()).padStart(2,'0')}`;
+                })() : null}
                 <div
                   class="dev-card {selectedKey === d.key &&
                   selectedConnId === d.connId
@@ -2496,6 +2580,8 @@
                           : ""}</span
                       >
                       {#if isNew}<span class="td-new">NEW</span>{/if}
+                      <!-- Used/Not-used badge -->
+                      <span class="dev-card-used-badge {devUsed ? 'dcub-used' : 'dcub-fresh'}" title="{devUsed ? 'Marked as used' : 'Not yet used'}">{devUsed ? 'USED' : 'FREE'}</span>
                       <button
                         class="icon-btn-xs"
                         title="Copy device ID"
@@ -2525,42 +2611,25 @@
                         >
                       </button>
                     </div>
-                    <!-- Phone + SIM row -->
+                    <!-- Phone + SIM + last SMS row -->
                     <div class="dev-card-sub">
                       {#if fp}
-                        <span class="dev-card-phone">{fp}</span>
                         <button
-                          class="icon-btn-xs"
-                          title="Copy number"
+                          class="dev-card-phone-btn"
+                          title="Copy number ({extractNumber(fp)})"
                           aria-label="Copy phone number"
                           onclick={(e) => {
                             e.stopPropagation();
-                            copyText(fp);
-                            toast("Number copied", "success");
+                            copyPhone(fp);
                           }}
-                        >
-                          <svg
-                            width="11"
-                            height="11"
-                            viewBox="0 0 24 24"
-                            fill="none"
-                            stroke="currentColor"
-                            stroke-width="2"
-                            ><rect
-                              x="9"
-                              y="9"
-                              width="13"
-                              height="13"
-                              rx="2"
-                            /><path
-                              d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"
-                            /></svg
-                          >
-                        </button>
+                        >{fp}</button>
                       {:else}
                         <span class="dev-card-no-num">{d.conn.name}</span>
                       {/if}
                       {#if sc}<span class="dev-card-sim">{sc}S</span>{/if}
+                      {#if lastMsgFmt}
+                        <span class="dev-card-last-sms" title="Last SMS received: {new Date(lastMsgTs).toLocaleString()}">📨 {lastMsgFmt}</span>
+                      {/if}
                     </div>
                   </div>
                   <!-- Right: battery + arrow -->
@@ -2799,14 +2868,17 @@
                     class="ib-v"
                     style="display:flex;align-items:center;gap:6px;flex-wrap:wrap"
                   >
-                    <span>{dispPhone ?? "—"}</span>
                     {#if dispPhone}
+                      <button
+                        class="dev-card-phone-btn"
+                        style="font-size:13px"
+                        onclick={() => copyPhone(dispPhone)}
+                        title="Click to copy number"
+                      >{dispPhone}</button>
                       <button
                         class="af-cp"
                         onclick={() => {
-                          const n = extractNumber(dispPhone);
-                          copyText(n);
-                          toast(`Copied: ${n}`, "success");
+                          copyPhone(dispPhone);
                         }}
                         title="Copy 10-digit number"
                         aria-label="Copy number"
@@ -2829,6 +2901,8 @@
                           /></svg
                         >
                       </button>
+                    {:else}
+                      <span>—</span>
                     {/if}
                     <button
                       class="edit-ph-btn"
@@ -3016,9 +3090,15 @@
                 {@const otp = extractOTP(msgText)}
                 <div class="msg-card">
                   <div class="mc-row">
-                    <span class="mc-sender"
-                      >{msg.sender ?? msg.from ?? "Unknown"}</span
-                    >
+                    {#if extractNumber(msg.sender ?? msg.from)}
+                      <button
+                        class="mc-sender-btn"
+                        onclick={() => copyPhone(msg.sender ?? msg.from)}
+                        title="Click to copy number ({extractNumber(msg.sender ?? msg.from)})"
+                      >{msg.sender ?? msg.from}</button>
+                    {:else}
+                      <span class="mc-sender">{msg.sender ?? msg.from ?? "Unknown"}</span>
+                    {/if}
                     <span
                       class="mc-badge {(msg.type || 'incoming') === 'incoming'
                         ? 'badge-in'
@@ -3848,6 +3928,30 @@
     gap: 8px;
     margin-top: 10px;
   }
+
+  /* Mode toggle (Single / Bulk) */
+  .ap-mode-toggle { display:flex; gap:2px; background:rgba(255,255,255,0.06); border-radius:6px; padding:2px; }
+  .ap-mode-btn { padding:4px 12px; font-size:11px; font-weight:600; border:none; border-radius:5px; background:transparent; color:#64748b; cursor:pointer; font-family:inherit; transition:all 140ms; }
+  .ap-mode-btn:hover { color:#94a3b8; }
+  .ap-mode-active { background:#f97316!important; color:#fff!important; box-shadow:0 1px 4px rgba(249,115,22,0.3); }
+
+  /* Bulk area */
+  .bulk-area { display:flex; flex-direction:column; gap:10px; }
+  .bulk-hint { display:flex; align-items:flex-start; gap:6px; font-size:11px; color:#64748b; line-height:1.4; padding:8px 10px; background:rgba(249,115,22,0.06); border:1px solid rgba(249,115,22,0.15); border-radius:6px; }
+  .bulk-hint svg { flex-shrink:0; margin-top:1px; color:#f97316; }
+  .bulk-input { width:100%; resize:vertical; min-height:80px; font-family:'JetBrains Mono',monospace; font-size:11.5px; line-height:1.5; padding:10px; border-radius:6px; border:1px solid rgba(255,255,255,0.1); background:rgba(0,0,0,0.3); color:#e2e8f0; outline:none; transition:border-color 140ms; }
+  .bulk-input:focus { border-color:rgba(249,115,22,0.5); }
+  .bulk-input::placeholder { color:#334155; }
+  .bulk-preview { padding:8px 10px; background:rgba(255,255,255,0.03); border:1px solid rgba(255,255,255,0.07); border-radius:6px; }
+  .bulk-count { font-size:11px; font-weight:700; color:#22c55e; display:block; margin-bottom:6px; }
+  .bulk-urls { display:flex; flex-direction:column; gap:3px; max-height:140px; overflow-y:auto; }
+  .bulk-urls::-webkit-scrollbar { width:3px; }
+  .bulk-urls::-webkit-scrollbar-thumb { background:rgba(255,255,255,0.1); border-radius:99px; }
+  .bulk-url-row { display:flex; align-items:center; gap:6px; font-size:11px; padding:3px 0; }
+  .bulk-idx { width:18px; text-align:center; font-weight:700; color:#64748b; flex-shrink:0; font-family:'JetBrains Mono',monospace; }
+  .bulk-url-name { font-weight:600; color:#e2e8f0; flex-shrink:0; min-width:70px; }
+  .bulk-url-val { color:#64748b; font-family:'JetBrains Mono',monospace; font-size:10px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; min-width:0; flex:1; }
+  .bulk-dup { font-size:9px; font-weight:700; text-transform:uppercase; color:#fbbf24; background:rgba(251,191,36,0.12); padding:1px 6px; border-radius:3px; flex-shrink:0; }
 
   .raw-drawer {
     background: #0a0d16;
@@ -4994,22 +5098,16 @@
 
   /* Tablet (≤ 900px): tighten grids */
   @media (max-width: 900px) {
-    .stat-row {
-      grid-template-columns: 1fr 1fr;
-    }
     .info-grid {
       grid-template-columns: 1fr 1fr;
     }
     .ap-grid {
       grid-template-columns: 1fr 1fr;
     }
-    .dt-scroll {
-      max-height: 320px;
-    }
   }
 
-  /* Mobile (≤ 680px): full responsive layout */
-  @media (max-width: 680px) {
+  /* Mobile & Tablet (≤ 768px): full responsive layout */
+  @media (max-width: 768px) {
     /* Show hamburger, hide sidebar by default */
     .mob-menu-btn {
       display: flex;
@@ -5018,50 +5116,65 @@
     /* Backdrop: shown when rendered (controlled by Svelte {#if}) */
     .mob-backdrop {
       display: block;
+      z-index: 190;
     }
 
-    /* Sidebar becomes a fixed drawer */
+    /* Sidebar becomes a fixed off-canvas drawer */
     .sidebar {
       position: fixed;
       left: 0;
       top: 0;
       bottom: 0;
-      z-index: 120;
+      height: 100vh !important;
+      height: 100dvh !important;
+      z-index: 200;
       transform: translateX(-100%);
       transition: transform 260ms cubic-bezier(0.4, 0, 0.2, 1);
-      width: 280px !important;
+      width: min(300px, 85vw) !important;
       box-shadow: 4px 0 30px rgba(0, 0, 0, 0.6);
+      padding-bottom: 0 !important;
     }
     .sidebar.mob-open {
       transform: translateX(0);
+    }
+    .side-dev-list {
+      padding-bottom: 28px !important;
+      min-height: 0 !important;
+      -webkit-overflow-scrolling: touch !important;
     }
 
     /* Main takes full width */
     .main {
       width: 100%;
+      min-width: 0;
     }
 
-    /* Topbar: compact */
+    /* Topbar: compact mobile layout */
     .topbar {
-      padding: 0 12px;
+      padding: 0 10px;
       height: 48px;
+      gap: 6px;
     }
     .tb-l {
       gap: 6px;
+      min-width: 0;
+      flex: 1;
+      overflow: hidden;
     }
     .tb-r {
       gap: 5px;
+      flex-shrink: 0;
     }
 
-    /* Hide stat pills on small screens — space is precious */
+    /* Hide stat text pills on mobile — already featured in overview */
     .tbstat {
       display: none;
     }
 
-    /* Smaller icon buttons for topbar */
+    /* Smaller touch buttons for topbar */
     .ico-btn {
-      width: 36px;
-      height: 36px;
+      width: 34px;
+      height: 34px;
     }
 
     /* Tab bar: scrollable */
@@ -5081,94 +5194,194 @@
       flex-shrink: 0;
     }
 
-    /* Tab body: less padding */
+    /* Tab body: safe padding for bottom nav */
     .tab-body {
-      padding: 12px 14px 80px;
+      padding: 12px 14px calc(75px + env(safe-area-inset-bottom, 0px));
       gap: 10px;
     }
 
-    /* Overview stat row: 2 col */
-    .stat-row {
-      grid-template-columns: 1fr 1fr;
-      gap: 8px;
+    /* Overview tab: maintains device-only scroll fill */
+    .tab-body-overview {
+      padding: 8px 10px calc(70px + env(safe-area-inset-bottom, 0px)) !important;
+      gap: 8px !important;
+      height: 100% !important;
+      min-height: 0 !important;
+      overflow: hidden !important;
+      display: flex !important;
+      flex-direction: column !important;
     }
-    .sc-n {
-      font-size: 28px;
+
+    /* Stat row: 4 compact columns */
+    .stat-row {
+      grid-template-columns: repeat(4, 1fr) !important;
+      gap: 5px !important;
     }
     .stat-card {
-      padding: 12px 14px;
+      padding: 6px 8px !important;
+    }
+    .sc-n {
+      font-size: 19px !important;
+    }
+    .sc-l {
+      font-size: 8px !important;
+      letter-spacing: 0.04em !important;
     }
 
     /* Live card: compact */
     .live-card {
-      padding: 12px 14px;
-      gap: 10px;
+      padding: 8px 12px !important;
+      gap: 8px !important;
     }
     .lc-icon {
-      width: 40px;
-      height: 40px;
+      width: 36px !important;
+      height: 36px !important;
     }
     .lc-title {
-      font-size: 15px;
+      font-size: 13px !important;
+    }
+    .lc-sub {
+      font-size: 10px !important;
     }
 
-    /* Device table: horizontally scrollable */
+    /* Device card & scroll container: fills remaining vertical height */
+    .dt-card {
+      flex: 1 !important;
+      min-height: 0 !important;
+      display: flex !important;
+      flex-direction: column !important;
+      border-radius: 8px;
+    }
+    .dt-filters {
+      padding: 8px 10px 6px;
+      gap: 6px;
+    }
+    .dt-chips {
+      gap: 4px;
+    }
+    .dt-chip {
+      font-size: 10.5px;
+      padding: 4px 8px;
+      min-height: 32px;
+    }
     .dt-scroll {
-      max-height: 300px;
-      overflow-x: auto;
-      -webkit-overflow-scrolling: touch;
-    }
-    .dt-table {
-      min-width: 480px;
+      flex: 1 !important;
+      min-height: 0 !important;
+      max-height: none !important;
+      overflow-y: auto !important;
+      overflow-x: hidden !important;
+      -webkit-overflow-scrolling: touch !important;
+      overscroll-behavior-y: contain;
     }
 
-    /* Info grid: 2 col */
+    /* Dev cards in single column on mobile */
+    .dev-card-grid {
+      grid-template-columns: 1fr !important;
+      gap: 6px !important;
+      padding: 6px !important;
+    }
+    .dev-card {
+      padding: 9px 10px !important;
+      min-height: 52px !important;
+      gap: 8px !important;
+      border-radius: 6px;
+    }
+    .dev-card-id {
+      font-size: 11.5px !important;
+      max-width: 140px;
+    }
+    .dev-card-sub {
+      flex-wrap: wrap !important;
+      gap: 5px !important;
+      min-width: 0;
+    }
+    .dev-card-phone-btn {
+      font-size: 11px !important;
+      max-width: 140px;
+    }
+    .dev-card-last-sms {
+      font-size: 9px !important;
+    }
+    .dev-card-bat {
+      font-size: 9.5px !important;
+      padding: 1px 4px !important;
+    }
+
+    /* Pagination bar: compact mobile */
+    .pag-bar {
+      padding: 8px 10px !important;
+      gap: 6px !important;
+      justify-content: space-between !important;
+    }
+    .pag-summary {
+      font-size: 11px !important;
+    }
+    .pag-btn-txt {
+      display: none !important;
+    }
+    .pag-btn-nav {
+      padding: 0 7px !important;
+    }
+
+    /* Info grid: 2 col on tablet/phone */
     .info-grid {
       grid-template-columns: 1fr 1fr;
+      gap: 8px;
     }
 
-    /* Device card: stack vertically on very small */
+    /* Device card: stack vertically on mobile */
     .dv-card {
       flex-direction: column;
       align-items: flex-start;
       gap: 10px;
-      padding: 14px;
+      padding: 12px;
     }
     .dv-bat {
       align-items: flex-start;
     }
     .dv-bat-n {
-      font-size: 32px;
+      font-size: 28px;
     }
     .dv-id {
-      font-size: 16px;
+      font-size: 15px;
     }
 
-    /* Action buttons: full width, bigger touch target */
+    /* Action buttons */
     .act-row {
       flex-direction: column;
       gap: 8px;
     }
     .act-btn {
-      padding: 16px;
-      font-size: 16px;
+      padding: 14px;
+      font-size: 15px;
     }
 
-    /* Add Firebase form: single column */
+    /* Add Firebase & Settings panel: scrollable on mobile */
+    .add-panel {
+      padding: 12px 14px 24px !important;
+      max-height: calc(100vh - 110px) !important;
+      max-height: calc(100dvh - 110px) !important;
+      overflow-y: auto !important;
+      -webkit-overflow-scrolling: touch !important;
+      overscroll-behavior-y: contain;
+    }
     .ap-grid {
-      grid-template-columns: 1fr;
+      grid-template-columns: 1fr !important;
+      gap: 8px;
     }
 
     /* Raw drawer: full width */
     .raw-drawer {
-      max-height: 55vh;
+      max-height: 50vh !important;
+      padding: 10px 12px 16px !important;
     }
     .rd-row {
-      flex-wrap: wrap;
-      gap: 6px;
+      flex-wrap: wrap !important;
+      gap: 6px !important;
     }
     .rd-path {
-      min-width: 0;
+      min-width: 140px !important;
+      width: 100% !important;
+      order: 3;
     }
 
     /* Send form: full width */
@@ -5178,34 +5391,37 @@
 
     /* Messages topbar: wrap */
     .msg-topbar {
-      gap: 7px;
+      gap: 6px;
+      flex-wrap: wrap;
     }
     .msg-search-wrap {
       min-width: 0;
+      flex: 1;
     }
     .msg-count {
-      font-size: 14px;
+      font-size: 13px;
     }
 
     /* Message list: touch-friendly */
     .msg-card {
-      padding: 12px 14px;
+      padding: 10px 12px;
     }
     .mc-otp {
-      padding: 8px 12px;
+      padding: 8px 10px;
     }
     .otp-code {
-      font-size: 24px;
+      font-size: 22px;
     }
 
-    /* Toasts: bottom-center, full width */
+    /* Toasts: bottom-center, above bottom nav */
     .toast-stack {
-      right: auto;
-      left: 50%;
-      bottom: 16px;
-      transform: translateX(-50%);
-      width: calc(100vw - 32px);
-      max-width: 400px;
+      right: 12px !important;
+      left: 12px !important;
+      bottom: calc(70px + env(safe-area-inset-bottom, 0px)) !important;
+      transform: none !important;
+      width: auto !important;
+      max-width: 380px !important;
+      margin: 0 auto;
       align-items: stretch;
     }
     .toast {
@@ -5214,15 +5430,17 @@
       text-align: center;
     }
 
-    /* Notifications: bottom of screen, full width on mobile */
+    /* Notifications stack: bottom of screen above bottom nav */
     .notif-stack {
-      top: auto;
-      right: 0;
-      left: 0;
-      bottom: 60px;
-      width: 100%;
-      padding: 0 10px;
-      max-height: 50vh;
+      top: auto !important;
+      right: 8px !important;
+      left: 8px !important;
+      bottom: calc(68px + env(safe-area-inset-bottom, 0px)) !important;
+      width: auto !important;
+      max-width: 420px !important;
+      padding: 0 !important;
+      max-height: 50vh !important;
+      margin: 0 auto !important;
     }
     .notif-scroll {
       max-height: 44vh;
@@ -5230,21 +5448,36 @@
     }
     .notif {
       border-radius: 16px;
-      padding: 8px 11px 8px;
+      padding: 8px 11px;
     }
     .notif-clear-all {
       border-radius: 12px;
-      padding: 10px 12px;
+      padding: 8px 12px;
       font-size: 11px;
     }
-    /* OTP stays compact on mobile */
     .n-otp-code {
       font-size: 20px;
     }
     .n-otp-row {
       padding: 7px 11px;
     }
-    /* Compact search on mobile */
+
+    /* Floating Bell notification panel */
+    .bell-panel {
+      position: fixed !important;
+      top: 52px !important;
+      left: 8px !important;
+      right: 8px !important;
+      width: auto !important;
+      max-width: calc(100vw - 16px) !important;
+      max-height: calc(100vh - 125px) !important;
+      max-height: calc(100dvh - 125px) !important;
+      transform: none !important;
+      z-index: 250 !important;
+      border-radius: 16px !important;
+    }
+
+    /* Compact sidebar controls */
     .side-search {
       margin: 6px 8px 3px;
       padding: 5px 8px;
@@ -5252,22 +5485,17 @@
     .search-in {
       font-size: 11px;
     }
-    /* Smaller filter buttons on mobile */
     .filt {
       font-size: 10px;
       padding: 4px 2px;
+      min-height: 36px;
     }
-
-    /* Touch-friendly min height for interactive items */
     .dev-item {
       min-height: 48px;
     }
     .btn,
     .btn-sm {
       min-height: 40px;
-    }
-    .filt {
-      min-height: 36px;
     }
   }
 
@@ -5278,17 +5506,31 @@
       font-size: 11px;
     }
     .stat-row {
-      grid-template-columns: 1fr 1fr;
-      gap: 6px;
+      grid-template-columns: repeat(2, 1fr) !important;
+      gap: 4px !important;
     }
     .sc-n {
-      font-size: 24px;
+      font-size: 18px !important;
+    }
+    .dev-card-id {
+      max-width: 105px !important;
+    }
+    .dev-card-phone-btn {
+      max-width: 115px !important;
     }
     .info-grid {
-      grid-template-columns: 1fr 1fr;
+      grid-template-columns: 1fr;
+    }
+    .pag-bar {
+      justify-content: center !important;
+    }
+    .pag-summary {
+      width: 100% !important;
+      text-align: center !important;
+      font-size: 10px !important;
     }
     .n-otp-code {
-      font-size: 24px;
+      font-size: 20px;
     }
     .notif {
       border-radius: 14px;
@@ -5798,7 +6040,54 @@
     background: rgba(249, 115, 22, 0.06) !important;
   }
   .dev-card-used {
-    opacity: 0.4;
+    opacity: 0.55;
+  }
+  /* Used/Free badge on card */
+  .dev-card-used-badge {
+    font-size: 8.5px;
+    font-weight: 800;
+    letter-spacing: 0.05em;
+    padding: 1px 5px;
+    border-radius: 3px;
+    flex-shrink: 0;
+  }
+  .dcub-used {
+    background: rgba(239,68,68,0.12);
+    color: #ef4444;
+    border: 1px solid rgba(239,68,68,0.25);
+  }
+  .dcub-fresh {
+    background: rgba(34,197,94,0.1);
+    color: #22c55e;
+    border: 1px solid rgba(34,197,94,0.2);
+  }
+  /* Clickable phone number */
+  .dev-card-phone-btn {
+    font-size: 11.5px;
+    color: #38bdf8;
+    font-family: "JetBrains Mono", monospace;
+    background: none;
+    border: none;
+    padding: 0;
+    cursor: pointer;
+    font-family: inherit;
+    font-family: "JetBrains Mono", monospace;
+    transition: color 120ms;
+    text-decoration: underline;
+    text-decoration-color: transparent;
+    text-underline-offset: 2px;
+  }
+  .dev-card-phone-btn:hover {
+    color: #7dd3fc;
+    text-decoration-color: #38bdf8;
+  }
+  /* Last SMS time */
+  .dev-card-last-sms {
+    font-size: 9.5px;
+    color: #475569;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
   }
   .dev-card-bar {
     width: 3px;
@@ -6846,7 +7135,7 @@
     display: flex;
     align-items: center;
     gap: 5px;
-    flex-wrap: nowrap;
+    flex-wrap: wrap;
     min-width: 0;
   }
   .dev-card-phone {
@@ -7283,6 +7572,12 @@
     color: #38bdf8 !important;
     border-color: rgba(56, 189, 248, 0.3) !important;
   }
+  .sdp-numon {
+    background: rgba(34, 197, 94, 0.12) !important;
+    color: #22c55e !important;
+    border-color: rgba(34, 197, 94, 0.3) !important;
+    font-size: 9.5px !important;
+  }
   .sdp-off {
     background: rgba(239, 68, 68, 0.1) !important;
     color: #ef4444 !important;
@@ -7369,6 +7664,54 @@
     text-overflow: ellipsis;
     white-space: nowrap;
     font-family: "JetBrains Mono", monospace;
+  }
+  .sdv-phone-btn {
+    font-size: 10.5px;
+    color: #38bdf8;
+    background: none;
+    border: none;
+    padding: 0;
+    cursor: pointer;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-family: "JetBrains Mono", monospace;
+    text-align: left;
+    transition: color 120ms;
+    text-decoration: underline;
+    text-decoration-color: transparent;
+    text-underline-offset: 2px;
+  }
+  .sdv-phone-btn:hover {
+    color: #7dd3fc;
+    text-decoration-color: #38bdf8;
+  }
+  .mc-sender-btn {
+    font-size: 12px;
+    font-weight: 700;
+    color: #e2e8f0;
+    background: none;
+    border: none;
+    padding: 0;
+    cursor: pointer;
+    font-family: inherit;
+    transition: color 120ms;
+    text-decoration: underline;
+    text-decoration-color: transparent;
+    text-underline-offset: 2px;
+  }
+  .mc-sender-btn:hover {
+    color: #38bdf8;
+    text-decoration-color: #38bdf8;
+  }
+  .mc-sender-clickable {
+    cursor: pointer;
+    transition: color 120ms;
+  }
+  .mc-sender-clickable:hover {
+    color: #38bdf8;
+    text-decoration: underline;
+    text-underline-offset: 2px;
   }
   .sdv-fb {
     font-size: 10px;
@@ -7682,8 +8025,29 @@
   /* ── Mobile responsive overrides for dashboard devices & scrolling ────────── */
   @media (max-width: 768px) {
     .tab-body-overview {
-      padding: 10px 12px calc(65px + env(safe-area-inset-bottom, 0px)) !important;
+      padding: 8px 10px calc(70px + env(safe-area-inset-bottom, 0px)) !important;
       gap: 8px !important;
+      height: 100% !important;
+      min-height: 0 !important;
+      overflow: hidden !important;
+      display: flex !important;
+      flex-direction: column !important;
+    }
+    .dt-card {
+      flex: 1 !important;
+      min-height: 0 !important;
+      display: flex !important;
+      flex-direction: column !important;
+      border-radius: 8px !important;
+    }
+    .dt-scroll {
+      flex: 1 !important;
+      min-height: 0 !important;
+      max-height: none !important;
+      overflow-y: auto !important;
+      overflow-x: hidden !important;
+      -webkit-overflow-scrolling: touch !important;
+      overscroll-behavior-y: contain !important;
     }
     .stat-row {
       grid-template-columns: repeat(4, 1fr) !important;
@@ -7693,10 +8057,11 @@
       padding: 6px 8px !important;
     }
     .sc-n {
-      font-size: 20px !important;
+      font-size: 19px !important;
     }
     .sc-l {
       font-size: 8px !important;
+      letter-spacing: 0.04em !important;
     }
     .live-card {
       padding: 8px 12px !important;
@@ -7721,19 +8086,51 @@
       -webkit-overflow-scrolling: touch !important;
     }
     .pag-bar {
-      justify-content: center;
-      padding: 8px 10px;
+      justify-content: space-between !important;
+      padding: 8px 10px !important;
+      gap: 6px !important;
     }
     .pag-summary {
-      font-size: 11px;
-      width: 100%;
-      text-align: center;
+      font-size: 11px !important;
     }
     .pag-btn-txt {
-      display: none;
+      display: none !important;
     }
     .pag-btn-nav {
-      padding: 0 7px;
+      padding: 0 7px !important;
+    }
+    .bell-panel {
+      position: fixed !important;
+      top: 52px !important;
+      left: 8px !important;
+      right: 8px !important;
+      width: auto !important;
+      max-width: calc(100vw - 16px) !important;
+      max-height: calc(100vh - 125px) !important;
+      max-height: calc(100dvh - 125px) !important;
+      transform: none !important;
+      z-index: 250 !important;
+      border-radius: 16px !important;
+    }
+    .notif-stack {
+      top: auto !important;
+      right: 8px !important;
+      left: 8px !important;
+      bottom: calc(68px + env(safe-area-inset-bottom, 0px)) !important;
+      width: auto !important;
+      max-width: 420px !important;
+      padding: 0 !important;
+      max-height: 50vh !important;
+      margin: 0 auto !important;
+    }
+    .toast-stack {
+      right: 12px !important;
+      left: 12px !important;
+      bottom: calc(70px + env(safe-area-inset-bottom, 0px)) !important;
+      transform: none !important;
+      width: auto !important;
+      max-width: 380px !important;
+      margin: 0 auto !important;
     }
   }
 </style>
