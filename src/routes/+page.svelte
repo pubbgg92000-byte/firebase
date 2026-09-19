@@ -119,7 +119,8 @@
       path: "messages",
       infoPath: "clients",
       color: "#f97316",
-      enabled: true,
+      enabled: false,
+      locked: true,
     },
     {
       id: "c1",
@@ -129,7 +130,8 @@
       path: "messages",
       infoPath: "clients",
       color: "#38bdf8",
-      enabled: true,
+      enabled: false,
+      locked: true,
     },
     {
       id: "c2",
@@ -139,7 +141,8 @@
       path: "messages",
       infoPath: "clients",
       color: "#a78bfa",
-      enabled: true,
+      enabled: false,
+      locked: true,
     },
     {
       id: "c3",
@@ -149,7 +152,8 @@
       path: "messages",
       infoPath: "clients",
       color: "#34d399",
-      enabled: true,
+      enabled: false,
+      locked: true,
     },
     {
       id: "c4",
@@ -159,7 +163,8 @@
       path: "messages",
       infoPath: "clients",
       color: "#fb7185",
-      enabled: true,
+      enabled: false,
+      locked: true,
     },
     {
       id: "c5",
@@ -169,7 +174,8 @@
       path: "messages",
       infoPath: "clients",
       color: "#fbbf24",
-      enabled: true,
+      enabled: false,
+      locked: true,
     },
     {
       id: "c6",
@@ -179,7 +185,8 @@
       path: "messages",
       infoPath: "clients",
       color: "#06b6d4",
-      enabled: true,
+      enabled: false,
+      locked: true,
     },
     {
       id: "c7",
@@ -189,7 +196,8 @@
       path: "messages",
       infoPath: "clients",
       color: "#ec4899",
-      enabled: true,
+      enabled: false,
+      locked: true,
     },
     {
       id: "c8",
@@ -199,7 +207,8 @@
       path: "messages",
       infoPath: "clients",
       color: "#84cc16",
-      enabled: true,
+      enabled: false,
+      locked: true,
     },
     {
       id: "c9",
@@ -209,7 +218,8 @@
       path: "messages",
       infoPath: "clients",
       color: "#c084fc",
-      enabled: true,
+      enabled: false,
+      locked: true,
     },
   ]);
   let refreshInterval = $state(null);
@@ -226,6 +236,73 @@
   let bulkMode = $state(false);
   let bulkText = $state('');
   let bulkParsed = $derived(parseBulkFirebase(bulkText));
+
+  // ── Password gate (for locked/hardcoded connections) ───────────────────────
+  const LOCK_SESSION_KEY = 'pd_sess_unlocked';
+  const LOCK_DEVICE_KEY = 'pd_device_unlocked';
+  const LOCK_PASSWORD = 'qweasd123';
+  let sessionUnlocked = $state(false);   // true = password was entered for this device
+  let showLockModal = $state(false);     // show the password prompt overlay
+  let showPasswordText = $state(false);  // toggle show/hide password text
+  let lockPasswordInput = $state('');
+  let lockPasswordError = $state('');
+  let lockPasswordLoading = $state(false);
+
+  function hasLockedConns() {
+    return connections.some(c => c.locked);
+  }
+
+  function applySessionUnlock() {
+    // Enable all locked connections in memory
+    connections = connections.map(c => c.locked ? { ...c, enabled: true } : c);
+    saveConnections(connections);
+    connections.filter(c => c.locked).forEach(c => fetchConn(c));
+  }
+
+  function unlockWithPassword() {
+    lockPasswordError = '';
+    const entered = lockPasswordInput.trim();
+    if (!entered) {
+      lockPasswordError = 'Please enter the password.';
+      return;
+    }
+    lockPasswordLoading = true;
+    setTimeout(() => {
+      if (entered === LOCK_PASSWORD) {
+        try {
+          sessionStorage.setItem(LOCK_SESSION_KEY, '1');
+          localStorage.setItem(LOCK_DEVICE_KEY, '1');
+        } catch {}
+        sessionUnlocked = true;
+        showLockModal = false;
+        lockPasswordInput = '';
+        lockPasswordLoading = false;
+        applySessionUnlock();
+        toast('Code Firebase connections unlocked & enabled!', 'success');
+      } else {
+        lockPasswordError = 'Incorrect password. Try again.';
+        lockPasswordInput = '';
+        lockPasswordLoading = false;
+      }
+    }, 250);
+  }
+
+  function lockConnections() {
+    try {
+      sessionStorage.removeItem(LOCK_SESSION_KEY);
+      localStorage.removeItem(LOCK_DEVICE_KEY);
+    } catch {}
+    sessionUnlocked = false;
+    connections = connections.map(c => c.locked ? { ...c, enabled: false } : c);
+    saveConnections(connections);
+    toast('Code connections locked and disabled.', 'info');
+  }
+
+  function dismissLockModal() {
+    showLockModal = false;
+    lockPasswordError = '';
+    lockPasswordInput = '';
+  }
   const ACCENT = [
     "#f97316",
     "#38bdf8",
@@ -805,6 +882,11 @@
       );
     } catch {}
     // Restore persisted connections (merge over defaults — user additions win)
+    const isDeviceUnlocked =
+      localStorage.getItem(LOCK_DEVICE_KEY) === '1' ||
+      sessionStorage.getItem(LOCK_SESSION_KEY) === '1';
+    sessionUnlocked = isDeviceUnlocked;
+
     try {
       const saved = JSON.parse(
         localStorage.getItem("pd_connections") || "null",
@@ -813,17 +895,26 @@
         // Merge: keep hardcoded defaults by id, append any extra user-added ones
         const defaultIds = new Set(connections.map((c) => c.id));
         const extras = saved.filter((c) => !defaultIds.has(c.id));
-        // Also restore enabled state from saved for existing connections
+        // Restore enabled state from saved for existing connections
+        // If not unlocked on this device, locked connections always start disabled
         connections = connections
           .map((c) => {
             const s = saved.find((x) => x.id === c.id);
+            if (c.locked && !sessionUnlocked) return { ...c, enabled: false };
             return s ? { ...c, enabled: s.enabled } : c;
           })
-          .concat(extras);
+          .concat(extras.map(e => ({ ...e, locked: e.locked ?? false })));
       }
     } catch {}
 
     fetchAll(false); // first load: show loading state
+
+    // ── Password gate check on device load ────────────────────────────────
+    if (sessionUnlocked) {
+      applySessionUnlock();
+    } else if (hasLockedConns()) {
+      showLockModal = true; // prompt for password on new device
+    }
     refreshInterval = setInterval(() => fetchAll(true), 10_000); // bg silent auto-refresh every 10s
     const ticker = setInterval(() => {
       nextRefreshSecs = nextRefreshSecs > 0 ? nextRefreshSecs - 1 : 0;
@@ -837,9 +928,144 @@
   // ── Connection management ─────────────────────────────────────────────────
   function parseBulkFirebase(text) {
     if (!text || !text.trim()) return [];
-    const urlRegex = /https:\/\/[a-zA-Z0-9_-]+-default-rtdb(?:\.[a-zA-Z0-9.-]+)?\.firebase(?:database\.app|io\.com)/gi;
+    // Support both firebasedatabase.app and firebaseio.com domains
+    const urlRegex = /https:\/\/[a-zA-Z0-9_-]+-default-rtdb(?:\.[a-zA-Z0-9-]+)*\.(?:firebasedatabase\.app|firebaseio\.com)/gi;
     const matches = text.match(urlRegex) || [];
     return [...new Set(matches.map(u => u.replace(/\/+$/, '')))];
+  }
+
+  // ── Extract Firebase URLs from a shared panel link or raw Base64 ──────────
+  function extractFirebaseUrlsFromLink(input) {
+    const raw = (input || '').trim();
+    if (!raw) return { urls: [], error: 'Input is empty.' };
+
+    let base64Val = raw;
+
+    // If it looks like a URL, pull out the `s` query param
+    if (/^https?:\/\//i.test(raw)) {
+      try {
+        const u = new URL(raw);
+        const s = u.searchParams.get('s');
+        if (s) {
+          base64Val = s;
+        } else {
+          // No `s` param — try parsing URLs directly from the URL text
+          const direct = parseBulkFirebase(raw);
+          if (direct.length) return { urls: direct, error: '' };
+          return { urls: [], error: 'No `s` parameter found in URL and no Firebase URLs detected.' };
+        }
+      } catch {
+        return { urls: [], error: 'Invalid URL format.' };
+      }
+    }
+
+    // Attempt Base64 decode
+    let decoded = '';
+    try {
+      // Fix padding if needed
+      const padded = base64Val.replace(/-/g, '+').replace(/_/g, '/') + '=='.slice((base64Val.length % 4 || 4) % 4 === 0 ? 4 : (base64Val.length % 4 || 4));
+      decoded = atob(padded.replace(/[^A-Za-z0-9+/=]/g, ''));
+    } catch {
+      // Not valid Base64 — try treating as plain text
+      const plain = parseBulkFirebase(raw);
+      if (plain.length) return { urls: plain, error: '' };
+      return { urls: [], error: 'Could not decode as Base64 and no Firebase URLs found in plain text.' };
+    }
+
+    const urls = parseBulkFirebase(decoded);
+    if (!urls.length) {
+      return { urls: [], error: 'Decoded successfully but no Firebase RTDB URLs were found in the content.' };
+    }
+    return { urls, error: '' };
+  }
+
+  // ── Extractor UI state ────────────────────────────────────────────────────
+  let extractInput = $state('');
+  let extractError = $state('');
+  let extractSuccess = $state('');
+  let extracting = $state(false);
+  let showExtractor = $state(false);
+
+  function handleExtract() {
+    extractError = '';
+    extractSuccess = '';
+    extracting = true;
+    setTimeout(() => {
+      try {
+        // Split input by newlines so the user can paste multiple links at once
+        const lines = extractInput.split(/\n/).map(l => l.trim()).filter(Boolean);
+        if (!lines.length) { extractError = 'Input is empty.'; extracting = false; return; }
+
+        const allFound = [];
+        const lineErrors = [];
+
+        for (const line of lines) {
+          const { urls, error } = extractFirebaseUrlsFromLink(line);
+          if (urls.length) {
+            allFound.push(...urls);
+          } else if (error && lines.length === 1) {
+            // Only surface the error when there's a single line
+            extractError = error;
+          } else if (error) {
+            lineErrors.push(error);
+          }
+        }
+
+        const uniqueFound = [...new Set(allFound)];
+
+        if (!uniqueFound.length) {
+          if (lines.length > 1) {
+            extractError = `No Firebase RTDB URLs found across ${lines.length} inputs.${lineErrors.length ? ' Errors: ' + lineErrors.slice(0, 2).join(' / ') : ''}`;
+          }
+          // single-line error already set above
+        } else {
+          // Merge with existing bulk text (deduplicate)
+          const existing = parseBulkFirebase(bulkText);
+          const combined = [...new Set([...existing, ...uniqueFound])];
+          bulkText = combined.join('\n');
+          const newCount = combined.length - existing.length;
+          extractSuccess = `Extracted ${uniqueFound.length} URL${uniqueFound.length !== 1 ? 's' : ''} from ${lines.length} input${lines.length !== 1 ? 's' : ''}${newCount < uniqueFound.length ? ` · ${newCount} new` : ''}.`;
+          extractInput = '';
+        }
+      } catch (e) {
+        extractError = 'Unexpected error: ' + e.message;
+      } finally {
+        extracting = false;
+      }
+    }, 50);
+  }
+
+  // ── Editable bulk URL list (driven by bulkText) ───────────────────────────
+  // Each item is { url: string, valid: bool, dup: bool }
+  let bulkEditableUrls = $state([]);
+
+  $effect(() => {
+    const parsed = parseBulkFirebase(bulkText);
+    bulkEditableUrls = parsed.map(url => ({
+      url,
+      valid: true,
+      dup: !!connections.find(c => c.url.replace(/\/+$/, '') === url)
+    }));
+  });
+
+  function removeBulkUrl(url) {
+    // Remove from bulkText by filtering out that URL
+    const lines = bulkText.split(/[\n,]+/).map(s => s.trim()).filter(Boolean);
+    const filtered = lines.filter(l => !l.includes(url));
+    bulkText = filtered.join('\n');
+  }
+
+  function updateBulkUrl(oldUrl, newUrl) {
+    const trimmed = newUrl.trim();
+    if (!trimmed) { removeBulkUrl(oldUrl); return; }
+    bulkText = bulkText.replace(oldUrl, trimmed);
+  }
+
+  function copyAllBulkUrls() {
+    const urls = bulkEditableUrls.map(u => u.url).join('\n');
+    if (!urls) return;
+    copyText(urls);
+    toast('All URLs copied!', 'success');
   }
 
   function handleUrlPaste(e) {
@@ -866,7 +1092,7 @@
       const color = ACCENT[(connections.length + newConns.length) % ACCENT.length];
       let name = '';
       try { name = new URL(rawUrl).hostname.split('-')[0]; } catch {}
-      newConns.push({ id, name: name || 'Firebase', url: rawUrl, token:'', path:'messages', infoPath:'clients', color, enabled:true });
+      newConns.push({ id, name: name || 'Firebase', url: rawUrl, token:'', path:'messages', infoPath:'clients', color, enabled:true, locked:false });
       added++;
     }
     if (newConns.length) {
@@ -906,6 +1132,7 @@
       color,
       name: name || "Firebase",
       enabled: true,
+      locked: false,
     };
     connections = [...connections, conn];
     saveConnections(connections); // persist immediately
@@ -916,6 +1143,12 @@
     toast(`Connected: ${conn.name}`, "success");
   }
   function toggleConn(id) {
+    const target = connections.find(c => c.id === id);
+    if (target?.locked && !sessionUnlocked && !target.enabled) {
+      showLockModal = true;
+      toast('Enter password to unlock code Firebase connections.', 'info');
+      return;
+    }
     connections = connections.map((c) =>
       c.id === id ? { ...c, enabled: !c.enabled } : c,
     );
@@ -924,11 +1157,160 @@
     if (conn?.enabled) fetchConn(conn);
   }
   function dropConn(id) {
-    if (!confirm("Remove connection?")) return;
+    const conn = connections.find(c => c.id === id);
+    if (!confirm(`Remove connection "${conn?.name || id}"?`)) return;
     connections = connections.filter((c) => c.id !== id);
     saveConnections(connections); // persist removal
     const { [id]: _, ...rest } = db;
     db = rest;
+    // Clear selection if removed conn was selected
+    if (selectedConnId === id) { selectedConnId = null; selectedKey = null; activeTab = 'overview'; }
+    // Clear from FC selection
+    if (fcSelected.has(id)) { const s = new Set(fcSelected); s.delete(id); fcSelected = s; }
+  }
+
+  // ── Firebase Connections Management page state ────────────────────────────
+  let fcSearch = $state('');
+  let fcStatusFilter = $state('all'); // 'all' | 'online' | 'offline'
+  let fcSelected = $state(new Set()); // Set of conn ids
+  let fcEditId = $state(null); // id of conn being edited inline
+  let fcEditForm = $state({ name: '', url: '', path: '', infoPath: '', token: '' });
+  let copiedKey = $state(''); // transient 'connId::field' for Copied! state
+  let copiedTimer = null;
+
+  let filteredConns = $derived(
+    connStats.filter(c => {
+      if (fcSearch) {
+        const q = fcSearch.toLowerCase();
+        if (!c.name.toLowerCase().includes(q) && !c.url?.toLowerCase().includes(q)) return false;
+      }
+      if (fcStatusFilter === 'online' && c.online === 0) return false;
+      if (fcStatusFilter === 'offline' && c.online > 0) return false;
+      if (fcStatusFilter === 'failed' && !c.error) return false;
+      return true;
+    })
+  );
+
+  function withCopied(key) {
+    copiedKey = key;
+    if (copiedTimer) clearTimeout(copiedTimer);
+    copiedTimer = setTimeout(() => { copiedKey = ''; }, 1500);
+  }
+
+  function copyConnUrl(conn) {
+    copyText(conn.url);
+    withCopied(`${conn.id}::url`);
+  }
+  function copyConnName(conn) {
+    copyText(conn.name);
+    withCopied(`${conn.id}::name`);
+  }
+  function copyConnDetails(conn) {
+    const line = `${conn.name} | ${conn.url} | ${conn.path || 'messages'} | ${conn.infoPath || ''}`;
+    copyText(line);
+    withCopied(`${conn.id}::details`);
+  }
+
+  function copyAllConnUrls() {
+    const text = filteredConns.map(c => c.url).join('\n');
+    copyText(text);
+    toast(`Copied ${filteredConns.length} URLs!`, 'success');
+  }
+  function copyAllConnNames() {
+    const text = filteredConns.map(c => c.name).join('\n');
+    copyText(text);
+    toast(`Copied ${filteredConns.length} names!`, 'success');
+  }
+  function copyAllConnDetails() {
+    const text = filteredConns.map(c => `${c.name} | ${c.url} | ${c.path || 'messages'} | ${c.infoPath || ''}`).join('\n');
+    copyText(text);
+    toast(`Copied ${filteredConns.length} connection details!`, 'success');
+  }
+
+  function copySelectedConnUrls() {
+    const sel = connections.filter(c => fcSelected.has(c.id));
+    copyText(sel.map(c => c.url).join('\n'));
+    toast(`Copied ${sel.length} selected URLs!`, 'success');
+  }
+
+  function fcToggleSelect(id) {
+    const s = new Set(fcSelected);
+    s.has(id) ? s.delete(id) : s.add(id);
+    fcSelected = s;
+  }
+  function fcToggleAll() {
+    if (fcSelected.size === filteredConns.length && filteredConns.length > 0) {
+      fcSelected = new Set();
+    } else {
+      fcSelected = new Set(filteredConns.map(c => c.id));
+    }
+  }
+
+  function fcStartEdit(conn) {
+    fcEditId = conn.id;
+    fcEditForm = { name: conn.name, url: conn.url, path: conn.path || 'messages', infoPath: conn.infoPath || '', token: conn.token || '' };
+  }
+  function fcCancelEdit() { fcEditId = null; }
+  function fcSaveEdit() {
+    const rawUrl = fcEditForm.url.trim().replace(/\/+$/, '');
+    if (!rawUrl) { toast('Firebase URL required', 'error'); return; }
+    connections = connections.map(c => c.id === fcEditId ? {
+      ...c,
+      name: fcEditForm.name.trim() || c.name,
+      url: rawUrl,
+      path: fcEditForm.path.trim() || 'messages',
+      infoPath: fcEditForm.infoPath.trim(),
+      token: fcEditForm.token,
+    } : c);
+    saveConnections(connections);
+    // Immediately re-fetch the edited connection
+    const updated = connections.find(c => c.id === fcEditId);
+    if (updated) fetchConn(updated);
+    fcEditId = null;
+    toast('Connection updated!', 'success');
+  }
+
+  function fcRemoveSelected() {
+    const sel = [...fcSelected];
+    if (!sel.length) return;
+    const names = sel.map(id => connections.find(c => c.id === id)?.name || id).join(', ');
+    if (!confirm(`Remove ${sel.length} connection${sel.length > 1 ? 's' : ''}?\n${names}`)) return;
+    connections = connections.filter(c => !sel.includes(c.id));
+    saveConnections(connections);
+    sel.forEach(id => { const { [id]: _, ...rest } = db; db = rest; });
+    fcSelected = new Set();
+    toast(`Removed ${sel.length} connection${sel.length > 1 ? 's' : ''}.`, 'success');
+  }
+
+  // ── Master toggle (enable / disable all) ──────────────────────────────
+  let masterEnabled = $derived(connections.length > 0 && connections.every(c => c.enabled));
+
+  function toggleAllConns() {
+    // If not unlocked on this device and code connections exist, turning all ON requires the password!
+    if (!sessionUnlocked && hasLockedConns() && !masterEnabled) {
+      showLockModal = true;
+      toast('Enter password (qweasd123) to enable code Firebase connections.', 'info');
+      return;
+    }
+    const newState = !masterEnabled;
+    connections = connections.map(c => ({ ...c, enabled: newState }));
+    saveConnections(connections);
+    if (newState) connections.forEach(c => fetchConn(c));
+    toast(newState ? 'All connections enabled.' : 'All connections disabled.', 'success');
+  }
+
+  // ── Failed connections ────────────────────────────────────────────────
+  let failedConns = $derived(connStats.filter(c => !!c.error));
+
+  function removeFailedConns() {
+    if (!failedConns.length) return;
+    if (!confirm(`Remove ${failedConns.length} failed connection${failedConns.length > 1 ? 's' : ''}?\nThis cannot be undone.`)) return;
+    const ids = failedConns.map(c => c.id);
+    connections = connections.filter(c => !ids.includes(c.id));
+    saveConnections(connections);
+    ids.forEach(id => { const { [id]: _, ...rest } = db; db = rest; });
+    if (fcSelected.size) fcSelected = new Set([...fcSelected].filter(id => !ids.includes(id)));
+    toast(`Removed ${ids.length} failed connection${ids.length > 1 ? 's' : ''}.`, 'success');
   }
 
   // ── Select device ─────────────────────────────────────────────────────────
@@ -1713,6 +2095,32 @@
             >
           {/if}
         </div>
+        {#if hasLockedConns()}
+          <button
+            class="ico-btn {sessionUnlocked ? 'ico-unlocked' : 'ico-locked'}"
+            onclick={() => {
+              if (sessionUnlocked) {
+                if (confirm("Lock code Firebase connections? This will disable them until the password is entered again.")) {
+                  lockConnections();
+                }
+              } else {
+                showLockModal = true;
+              }
+            }}
+            title={sessionUnlocked ? "Code connections unlocked (click to lock)" : "Code connections locked (click to enter password: qweasd123)"}
+            aria-label="Code Firebase lock status"
+          >
+            {#if sessionUnlocked}
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#22c55e" stroke-width="2">
+                <rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 9.9-1"/>
+              </svg>
+            {:else}
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#f97316" stroke-width="2">
+                <rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/>
+              </svg>
+            {/if}
+          </button>
+        {/if}
         <button
           class="ico-btn {addOpen ? 'ico-active' : ''}"
           onclick={() => (addOpen = !addOpen)}
@@ -2060,28 +2468,85 @@
               <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4M12 8h.01"/></svg>
               <span>Paste Firebase RTDB URLs — one per line, numbered, comma-separated, or mixed text. All valid URLs are extracted automatically.</span>
             </div>
-            <textarea class="bulk-input" bind:value={bulkText} placeholder={`1. https://project1-default-rtdb.firebaseio.com\n2. https://project2-default-rtdb.firebaseio.com\n3. https://project3-default-rtdb.firebaseio.com`} rows="6" aria-label="Bulk Firebase URLs"></textarea>
-            {#if bulkParsed.length}
+            <textarea class="bulk-input" bind:value={bulkText} placeholder={`1. https://project1-default-rtdb.firebaseio.com\n2. https://project2-default-rtdb.firebaseio.com\n3. https://project3-default-rtdb.firebaseio.com`} rows="5" aria-label="Bulk Firebase URLs"></textarea>
+
+            <!-- Editable detected URL list -->
+            {#if bulkEditableUrls.length}
               <div class="bulk-preview">
-                <span class="bulk-count">{bulkParsed.length} URL{bulkParsed.length > 1 ? 's' : ''} detected</span>
+                <div class="bulk-preview-hdr">
+                  <span class="bulk-count">{bulkEditableUrls.length} URL{bulkEditableUrls.length > 1 ? 's' : ''} detected</span>
+                  <div style="display:flex;gap:6px">
+                    <button class="bulk-action-btn" onclick={copyAllBulkUrls} title="Copy all URLs">
+                      <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
+                      Copy All
+                    </button>
+                    <button class="bulk-action-btn bulk-clear-btn" onclick={() => { bulkText = ''; }} title="Clear all URLs">
+                      <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14H6L5 6"/></svg>
+                      Clear
+                    </button>
+                  </div>
+                </div>
                 <div class="bulk-urls">
-                  {#each bulkParsed as url, i}
+                  {#each bulkEditableUrls as item, i (item.url)}
                     <div class="bulk-url-row">
                       <span class="bulk-idx">{i + 1}</span>
-                      <span class="bulk-url-name">{(() => { try { return new URL(url).hostname.split('-')[0]; } catch { return 'Firebase'; } })()}</span>
-                      <span class="bulk-url-val">{url}</span>
-                      {#if connections.find(c => c.url.replace(/\/+$/,'') === url)}
-                        <span class="bulk-dup">already added</span>
-                      {/if}
+                      <input
+                        class="bulk-url-edit"
+                        value={item.url}
+                        onchange={(e) => updateBulkUrl(item.url, e.currentTarget.value)}
+                        aria-label="Firebase URL {i+1}"
+                      />
+                      {#if item.dup}<span class="bulk-dup">already added</span>{/if}
+                      <button class="bulk-rm-btn" onclick={() => removeBulkUrl(item.url)} title="Remove" aria-label="Remove URL">×</button>
                     </div>
                   {/each}
                 </div>
               </div>
             {/if}
+
+            <!-- Extract from Link sub-section -->
+            <div class="extractor-section">
+              <button class="extractor-toggle" onclick={() => { showExtractor = !showExtractor; extractError = ''; extractSuccess = ''; }}>
+                <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></svg>
+                Extract from Link
+                <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" style="transform:rotate({showExtractor ? 180 : 0}deg);transition:transform 150ms"><path d="M6 9l6 6 6-6"/></svg>
+              </button>
+              {#if showExtractor}
+                <div class="extractor-body">
+                  <div class="extractor-hint">Paste one or more shared panel URLs or raw Base64 strings — one per line. All Firebase URLs will be extracted from every input.</div>
+                  <div class="extractor-row extractor-row-col">
+                    <textarea
+                      class="extractor-input extractor-textarea"
+                      bind:value={extractInput}
+                      placeholder={`https://panel.vercel.app/?s=aHR0cHM6Ly8…
+https://other.vercel.app/?s=aHR0cHM6Ly8…
+aHR0cHM6Ly8… (raw Base64)`}
+                      aria-label="Extract from link input"
+                      rows="3"
+                      onkeydown={(e) => e.key === 'Enter' && e.ctrlKey && !extracting && extractInput.trim() && handleExtract()}
+                    ></textarea>
+                    <div style="display:flex;gap:6px;justify-content:flex-end">
+                      {#if extractInput}<button class="bulk-rm-btn" onclick={() => { extractInput = ''; extractError = ''; extractSuccess = ''; }} title="Clear">×</button>{/if}
+                      <button class="btn btn-primary btn-sm extractor-btn" onclick={handleExtract} disabled={extracting || !extractInput.trim()}>
+                        {#if extracting}<span class="spin-ring" style="width:11px;height:11px;border-width:2px"></span>{:else}<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M7 17L17 7M7 7h10v10"/></svg>{/if}
+                        Extract All
+                      </button>
+                    </div>
+                  </div>
+                  {#if extractError}<div class="extractor-error"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M15 9l-6 6M9 9l6 6"/></svg> {extractError}</div>{/if}
+                  {#if extractSuccess}<div class="extractor-success"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M9 12l2 2 4-4"/></svg> {extractSuccess}</div>{/if}
+                </div>
+              {/if}
+            </div>
+
             <div class="ap-foot">
-              <button class="btn btn-ghost" onclick={() => { bulkText=''; bulkMode=false; }}>Cancel</button>
+              <button class="btn btn-ghost" onclick={() => { bulkText=''; bulkMode=false; showExtractor=false; extractInput=''; extractError=''; extractSuccess=''; }}>Cancel</button>
               <button class="btn btn-primary" onclick={addBulkConns} disabled={!bulkParsed.length}>
-                Add {bulkParsed.length} Connection{bulkParsed.length !== 1 ? 's' : ''}
+                {#if bulkParsed.filter(u => !connections.find(c => c.url.replace(/\/+$/,'') === u)).length > 0}
+                  Add {bulkParsed.filter(u => !connections.find(c => c.url.replace(/\/+$/,'') === u)).length} Connection{bulkParsed.filter(u => !connections.find(c => c.url.replace(/\/+$/,'') === u)).length !== 1 ? 's' : ''}
+                {:else}
+                  No New URLs
+                {/if}
               </button>
             </div>
           </div>
@@ -2257,6 +2722,11 @@
         onclick={() => (activeTab = "overview")}>Overview</button
       >
       <button
+        class="tab {activeTab === 'firebase' ? 'active' : ''}"
+        onclick={() => (activeTab = "firebase")}>
+        Firebase <span class="tab-cnt">{connections.length}</span></button
+      >
+      <button
         class="tab {activeTab === 'device' ? 'active' : ''}"
         onclick={() => switchTab("device")}
         disabled={!selectedKey}>Device</button
@@ -2275,9 +2745,238 @@
 
     <!-- Tab content -->
     <div
-      class="tab-body {activeTab === 'overview' ? 'tab-body-overview' : ''}"
+      class="tab-body {activeTab === 'overview' ? 'tab-body-overview' : ''} {activeTab === 'firebase' ? 'tab-body-firebase' : ''}"
       bind:this={tabBodyEl}
     >
+      <!-- ── FIREBASE CONNECTIONS ──────────────────────────────────── -->
+      {#if activeTab === "firebase"}
+        <!-- Toolbar -->
+        <div class="fc-toolbar">
+          <div class="fc-search-wrap">
+            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.35-4.35"/></svg>
+            <input class="fc-search-in" bind:value={fcSearch} placeholder="Search by name or URL…" aria-label="Search connections" />
+            {#if fcSearch}<button class="fc-search-clear" onclick={() => (fcSearch = '')}>×</button>{/if}
+          </div>
+          <div class="fc-filter-pills">
+            <button class="fc-pill {fcStatusFilter === 'all' ? 'fc-pill-a' : ''}" onclick={() => (fcStatusFilter = 'all')}>All <span class="fc-pill-cnt">{connections.length}</span></button>
+            <button class="fc-pill {fcStatusFilter === 'online' ? 'fc-pill-on' : ''}" onclick={() => (fcStatusFilter = 'online')}>🟢 Online</button>
+            <button class="fc-pill {fcStatusFilter === 'offline' ? 'fc-pill-off' : ''}" onclick={() => (fcStatusFilter = 'offline')}>🔴 Offline</button>
+            {#if failedConns.length > 0}
+              <button class="fc-pill fc-pill-fail {fcStatusFilter === 'failed' ? 'fc-pill-fail-a' : ''}" onclick={() => (fcStatusFilter = 'failed')}>
+                ⚠ Failed <span class="fc-pill-cnt">{failedConns.length}</span>
+              </button>
+            {/if}
+          </div>
+          <div class="fc-global-actions">
+            <!-- Master toggle -->
+            {#if connections.length > 0}
+              <button
+                class="fc-master-toggle {masterEnabled ? 'fmt-on' : 'fmt-off'}"
+                onclick={toggleAllConns}
+                title="{masterEnabled ? 'Disable all connections' : 'Enable all connections'}"
+              >
+                <span class="fmt-knob"></span>
+                <span class="fmt-label">{masterEnabled ? 'All ON' : 'All OFF'}</span>
+              </button>
+            {/if}
+            {#if hasLockedConns()}
+              {#if !sessionUnlocked}
+                <button
+                  class="fc-act-btn fc-act-locked"
+                  onclick={() => (showLockModal = true)}
+                  title="Code connections are locked. Click to enter password (qweasd123) to unlock."
+                >
+                  <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="#f97316" stroke-width="2.5"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>
+                  <span>Unlock Code</span>
+                </button>
+              {:else}
+                <button
+                  class="fc-act-btn fc-act-unlocked"
+                  onclick={lockConnections}
+                  title="Code connections unlocked. Click to lock and disable them."
+                >
+                  <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="#22c55e" stroke-width="2.5"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 9.9-1"/></svg>
+                  <span>Lock Code</span>
+                </button>
+              {/if}
+            {/if}
+            {#if failedConns.length > 0}
+              <button class="fc-act-btn fc-act-danger" onclick={removeFailedConns} title="Remove all {failedConns.length} failed connections">
+                <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14H6L5 6"/><path d="M10 11v6M14 11v6"/></svg>
+                Remove Failed ({failedConns.length})
+              </button>
+            {/if}
+            <button class="fc-act-btn" onclick={copyAllConnUrls} title="Copy all Firebase URLs">
+              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
+              Copy All URLs
+            </button>
+            <button class="fc-act-btn" onclick={copyAllConnNames} title="Copy all names">
+              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/></svg>
+              Copy Names
+            </button>
+            <button class="fc-act-btn" onclick={copyAllConnDetails} title="Copy all details (Name|URL|Path|InfoPath)">
+              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></svg>
+              Copy Details
+            </button>
+            <button class="fc-act-btn" onclick={() => (addOpen = true)} title="Add Firebase connection">
+              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M12 5v14M5 12h14"/></svg>
+              Add New
+            </button>
+          </div>
+        </div>
+
+        <!-- Multi-select action bar -->
+        {#if fcSelected.size > 0}
+          <div class="fc-sel-bar">
+            <span class="fc-sel-count">{fcSelected.size} selected</span>
+            <button class="fc-sel-btn" onclick={copySelectedConnUrls}>
+              <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
+              Copy URLs
+            </button>
+            <button class="fc-sel-btn fc-sel-danger" onclick={fcRemoveSelected}>
+              <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14H6L5 6"/><path d="M10 11v6M14 11v6"/></svg>
+              Remove Selected
+            </button>
+            <button class="fc-sel-btn" onclick={() => (fcSelected = new Set())}>Clear Selection</button>
+          </div>
+        {/if}
+
+        <!-- Connections list -->
+        {#if filteredConns.length === 0}
+          <div class="fc-empty">
+            {#if connections.length === 0}
+              <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" opacity="0.25"><path d="M4 7l8-4 8 4v10l-8 4-8-4V7z"/><path d="M4 7l8 4 8-4M12 11v10"/></svg>
+              <div class="fc-empty-title">No Firebase connections yet</div>
+              <div class="fc-empty-sub">Click "Add New" or use the + button to connect a Firebase RTDB.</div>
+              <button class="btn btn-primary" onclick={() => (addOpen = true)}>
+                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M12 5v14M5 12h14"/></svg>
+                Add Firebase Connection
+              </button>
+            {:else}
+              <div class="fc-empty-title">No connections match your search</div>
+              <button class="btn btn-ghost btn-sm" onclick={() => { fcSearch = ''; fcStatusFilter = 'all'; }}>Clear filters</button>
+            {/if}
+          </div>
+        {:else}
+          <!-- Select all checkbox row -->
+          <div class="fc-select-all-row">
+            <label class="fc-chk-label">
+              <input type="checkbox" class="fc-chk" checked={fcSelected.size === filteredConns.length && filteredConns.length > 0} onchange={fcToggleAll} />
+              {fcSelected.size === filteredConns.length && filteredConns.length > 0 ? 'Deselect All' : 'Select All'}
+            </label>
+            <span class="fc-showing">{filteredConns.length} connection{filteredConns.length !== 1 ? 's' : ''}</span>
+          </div>
+          <div class="fc-list">
+            {#each filteredConns as conn (conn.id)}
+              {@const onlineDot = conn.online > 0}
+              {@const hasAuth = !!(connections.find(c => c.id === conn.id)?.token)}
+              {@const realConn = connections.find(c => c.id === conn.id)}
+              <div class="fc-card {fcSelected.has(conn.id) ? 'fc-card-sel' : ''}">
+                <!-- Card header -->
+                <div class="fc-card-hdr">
+                  <input type="checkbox" class="fc-chk" checked={fcSelected.has(conn.id)} onchange={() => fcToggleSelect(conn.id)} />
+                  <span class="fc-dot" style="background:{conn.color}"></span>
+                  <span class="fc-name">{conn.name}</span>
+                  <span class="fc-status-badge {onlineDot ? 'fc-online' : 'fc-offline'}">
+                    <span class="fc-status-dot"></span>
+                    {onlineDot ? `${conn.online} online` : 'Offline'}
+                    {#if conn.total > 0} · {conn.total} total{/if}
+                  </span>
+                  {#if hasAuth}<span class="fc-auth-badge">🔐 Auth</span>{/if}
+                  {#if realConn?.locked}
+                    <span class="fc-type-badge {sessionUnlocked ? 'fc-type-code-unlocked' : 'fc-type-code-locked'}" title={sessionUnlocked ? 'Code default (unlocked)' : 'Code default (password required: qweasd123)'}>
+                      {sessionUnlocked ? '🔓 Code' : '🔒 Locked'}
+                    </span>
+                  {:else}
+                    <span class="fc-type-badge fc-type-manual" title="Manually added connection (no password required)">
+                      Manual
+                    </span>
+                  {/if}
+                  <div class="fc-card-actions">
+                    <!-- Per-card enable/disable toggle -->
+                    <button
+                      class="fc-card-tog {realConn?.enabled ? 'fc-card-tog-on' : 'fc-card-tog-off'}"
+                      onclick={() => toggleConn(conn.id)}
+                      title="{realConn?.enabled ? 'Click to disable connection' : 'Click to enable connection'}{realConn?.locked && !sessionUnlocked ? ' (requires password)' : ''}"
+                      aria-label="Toggle connection status"
+                    >
+                      <span class="fct-knob"></span>
+                      <span class="fct-lbl">{realConn?.enabled ? 'ON' : 'OFF'}</span>
+                    </button>
+                    <button class="fc-copy-btn {copiedKey === `${conn.id}::url` ? 'fc-copied' : ''}" onclick={() => copyConnUrl(conn)} title="Copy URL">
+                      {copiedKey === `${conn.id}::url` ? '✓' : ''}
+                      <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
+                      {copiedKey === `${conn.id}::url` ? 'Copied!' : 'URL'}
+                    </button>
+                    <button class="fc-copy-btn {copiedKey === `${conn.id}::name` ? 'fc-copied' : ''}" onclick={() => copyConnName(conn)} title="Copy name">
+                      {copiedKey === `${conn.id}::name` ? '✓' : ''}
+                      <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/></svg>
+                      {copiedKey === `${conn.id}::name` ? 'Copied!' : 'Name'}
+                    </button>
+                    <button class="fc-copy-btn {copiedKey === `${conn.id}::details` ? 'fc-copied' : ''}" onclick={() => copyConnDetails(conn)} title="Copy all details">
+                      {copiedKey === `${conn.id}::details` ? '✓' : ''}
+                      <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>
+                      {copiedKey === `${conn.id}::details` ? 'Copied!' : 'Details'}
+                    </button>
+                    <button class="fc-edit-btn" onclick={() => fcStartEdit(conn)} title="Edit connection">
+                      <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>
+                      Edit
+                    </button>
+                    <button class="fc-remove-btn" onclick={() => dropConn(conn.id)} title="Remove connection">
+                      <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14H6L5 6"/><path d="M10 11v6M14 11v6"/></svg>
+                    </button>
+                  </div>
+                </div>
+                <!-- Card body: URL + paths -->
+                <div class="fc-card-body">
+                  <div class="fc-url-row">
+                    <span class="fc-url-label">URL</span>
+                    <code class="fc-url-val">{conn.url}</code>
+                  </div>
+                  <div class="fc-meta-row">
+                    <span class="fc-meta-item"><span class="fc-meta-lbl">Messages Path:</span> <code class="fc-meta-val">{realConn?.path || 'messages'}</code></span>
+                    {#if realConn?.infoPath}<span class="fc-meta-item"><span class="fc-meta-lbl">Device Info:</span> <code class="fc-meta-val">{realConn.infoPath}</code></span>{/if}
+                    <span class="fc-meta-item"><span class="fc-meta-lbl">Auth:</span> <span class="fc-meta-val {hasAuth ? 'fc-auth-yes' : 'fc-auth-no'}">{hasAuth ? '🔐 Configured' : 'None'}</span></span>
+                    {#if conn.error}<span class="fc-meta-item fc-error-item"><span class="fc-meta-lbl">Error:</span> {conn.error}</span>{/if}
+                  </div>
+                </div>
+                <!-- Inline Edit form -->
+                {#if fcEditId === conn.id}
+                  <div class="fc-edit-form">
+                    <div class="fc-edit-grid">
+                      <div class="field">
+                        <label for="fce-name-{conn.id}">Name</label>
+                        <input id="fce-name-{conn.id}" bind:value={fcEditForm.name} placeholder="project-name" />
+                      </div>
+                      <div class="field">
+                        <label for="fce-url-{conn.id}">Firebase URL</label>
+                        <input id="fce-url-{conn.id}" bind:value={fcEditForm.url} placeholder="https://xxx-default-rtdb.firebaseio.com" />
+                      </div>
+                      <div class="field">
+                        <label for="fce-path-{conn.id}">Messages Path</label>
+                        <input id="fce-path-{conn.id}" bind:value={fcEditForm.path} placeholder="messages" />
+                      </div>
+                      <div class="field">
+                        <label for="fce-info-{conn.id}">Device Info Path</label>
+                        <input id="fce-info-{conn.id}" bind:value={fcEditForm.infoPath} placeholder="clients (optional)" />
+                      </div>
+                      <div class="field">
+                        <label for="fce-tok-{conn.id}">Auth Token</label>
+                        <input id="fce-tok-{conn.id}" type="password" bind:value={fcEditForm.token} placeholder="optional" />
+                      </div>
+                    </div>
+                    <div class="fc-edit-foot">
+                      <button class="btn btn-ghost btn-sm" onclick={fcCancelEdit}>Cancel</button>
+                      <button class="btn btn-primary btn-sm" onclick={fcSaveEdit}>Save Changes</button>
+                    </div>
+                  </div>
+                {/if}
+              </div>
+            {/each}
+          </div>
+        {/if}
+      {/if}
+
       <!-- ── OVERVIEW ──────────────────────────────────────────────────── -->
       {#if activeTab === "overview"}
         <div class="live-card">
@@ -3249,6 +3948,86 @@
     </div>
   </div>
 </div>
+
+<!-- Password Lock Modal -->
+{#if showLockModal}
+  <!-- svelte-ignore a11y_click_events_have_key_events -->
+  <div
+    class="lock-overlay"
+    role="dialog"
+    aria-modal="true"
+    tabindex="-1"
+    aria-label="Unlock code Firebase connections"
+    onclick={(e) => { if (e.target === e.currentTarget) dismissLockModal(); }}
+  >
+    <div class="lock-modal">
+      <button class="lock-close-btn" onclick={dismissLockModal} title="Close (use manual only)" aria-label="Close modal">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M18 6 6 18M6 6l12 12" /></svg>
+      </button>
+      <div class="lock-icon">
+        <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="#f97316" stroke-width="1.75">
+          <rect x="3" y="11" width="18" height="11" rx="2"/>
+          <path d="M7 11V7a5 5 0 0 1 10 0v4"/>
+        </svg>
+      </div>
+      <div class="lock-title">Code Firebase Protection</div>
+      <div class="lock-sub">Enter the password to enable the default Firebase connections in the code.</div>
+      <form class="lock-form" onsubmit={(e) => { e.preventDefault(); unlockWithPassword(); }}>
+        <div class="lock-input-wrap">
+          <!-- svelte-ignore a11y_autofocus -->
+          <input
+            id="lock-pw-input"
+            class="lock-input {lockPasswordError ? 'lock-input-err' : ''}"
+            type={showPasswordText ? "text" : "password"}
+            bind:value={lockPasswordInput}
+            placeholder="Password (qweasd123)"
+            autocomplete="current-password"
+            autofocus
+            disabled={lockPasswordLoading}
+            aria-label="Unlock password"
+          />
+          <button
+            type="button"
+            class="lock-pw-toggle"
+            onclick={() => (showPasswordText = !showPasswordText)}
+            title={showPasswordText ? "Hide password" : "Show password"}
+            aria-label="Toggle password visibility"
+          >
+            {#if showPasswordText}
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19m-6.72-1.07a3 3 0 1 1-4.24-4.24"/><line x1="1" y1="1" x2="23" y2="23"/></svg>
+            {:else}
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>
+            {/if}
+          </button>
+        </div>
+        {#if lockPasswordError}
+          <div class="lock-error">
+            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M15 9l-6 6M9 9l6 6"/></svg>
+            <span>{lockPasswordError}</span>
+          </div>
+        {/if}
+        <div class="lock-btn-row">
+          <button class="btn btn-ghost lock-btn-cancel" type="button" onclick={dismissLockModal}>
+            Skip / Manual Only
+          </button>
+          <button class="btn btn-primary lock-submit" type="submit" disabled={lockPasswordLoading || !lockPasswordInput.trim()}>
+            {#if lockPasswordLoading}
+              <span class="spin-ring" style="width:13px;height:13px;border-width:2px"></span>
+              Verifying…
+            {:else}
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M5 12l5 5L20 7"/></svg>
+              Unlock
+            {/if}
+          </button>
+        </div>
+      </form>
+      <div class="lock-note">
+        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="#22c55e" stroke-width="2"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></svg>
+        <span>Manually added connections work without a password.</span>
+      </div>
+    </div>
+  </div>
+{/if}
 
 <!-- Toasts -->
 <div class="toast-stack">
@@ -8132,5 +8911,891 @@
       max-width: 380px !important;
       margin: 0 auto !important;
     }
+  }
+
+
+  /* ── Tab count badge ──────────────────────────────────────────────────── */
+  .tab-cnt {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    min-width: 17px;
+    height: 16px;
+    font-size: 10px;
+    font-weight: 700;
+    font-family: 'JetBrains Mono', monospace;
+    background: rgba(249,115,22,0.2);
+    color: #f97316;
+    border-radius: 4px;
+    padding: 0 4px;
+    margin-left: 4px;
+    vertical-align: middle;
+  }
+  .tab.active .tab-cnt {
+    background: rgba(249,115,22,0.3);
+  }
+
+  /* ── Firebase Connections tab body ───────────────────────────────────── */
+  .tab-body-firebase {
+    overflow-y: auto !important;
+    padding: 0 !important;
+    gap: 0 !important;
+    display: flex !important;
+    flex-direction: column !important;
+    height: 100% !important;
+    min-height: 0 !important;
+  }
+
+  /* ── FC Toolbar ──────────────────────────────────────────────────────── */
+  .fc-toolbar {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 12px 18px;
+    border-bottom: 1px solid rgba(255,255,255,0.07);
+    background: #0e1420;
+    flex-shrink: 0;
+    flex-wrap: wrap;
+  }
+  .fc-search-wrap {
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    background: rgba(255,255,255,0.05);
+    border: 1px solid rgba(255,255,255,0.09);
+    border-radius: 7px;
+    padding: 6px 10px;
+    min-width: 200px;
+    flex: 1;
+  }
+  .fc-search-in {
+    background: none;
+    border: none;
+    outline: none;
+    color: #e2e8f0;
+    font-size: 12.5px;
+    font-family: inherit;
+    width: 100%;
+  }
+  .fc-search-in::placeholder { color: #475569; }
+  .fc-search-clear {
+    background: none;
+    border: none;
+    color: #64748b;
+    cursor: pointer;
+    font-size: 14px;
+    padding: 0;
+    line-height: 1;
+    font-family: inherit;
+  }
+  .fc-search-clear:hover { color: #ef4444; }
+  .fc-filter-pills {
+    display: flex;
+    gap: 4px;
+    flex-shrink: 0;
+  }
+  .fc-pill {
+    padding: 5px 10px;
+    font-size: 11.5px;
+    font-weight: 600;
+    border-radius: 6px;
+    border: 1px solid rgba(255,255,255,0.1);
+    background: transparent;
+    color: #64748b;
+    cursor: pointer;
+    font-family: inherit;
+    transition: all 130ms;
+  }
+  .fc-pill:hover { color: #94a3b8; border-color: rgba(255,255,255,0.18); }
+  .fc-pill-a { background: #f97316 !important; color: #fff !important; border-color: #f97316 !important; }
+  .fc-pill-on { background: rgba(34,197,94,0.18) !important; color: #22c55e !important; border-color: rgba(34,197,94,0.4) !important; }
+  .fc-pill-off { background: rgba(239,68,68,0.14) !important; color: #ef4444 !important; border-color: rgba(239,68,68,0.3) !important; }
+  .fc-pill-fail { color: #f59e0b; border-color: rgba(245,158,11,0.3); }
+  .fc-pill-fail:hover { background: rgba(245,158,11,0.1) !important; color: #f59e0b !important; }
+  .fc-pill-fail-a { background: rgba(245,158,11,0.18) !important; color: #f59e0b !important; border-color: rgba(245,158,11,0.45) !important; }
+  .fc-pill-cnt {
+    display: inline-flex;
+    background: rgba(255,255,255,0.12);
+    border-radius: 3px;
+    padding: 0 4px;
+    font-size: 10px;
+    margin-left: 3px;
+  }
+  .fc-global-actions {
+    display: flex;
+    gap: 5px;
+    flex-shrink: 0;
+    flex-wrap: wrap;
+    align-items: center;
+  }
+  .fc-act-btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    padding: 5px 10px;
+    font-size: 11.5px;
+    font-weight: 600;
+    border-radius: 6px;
+    border: 1px solid rgba(255,255,255,0.12);
+    background: rgba(255,255,255,0.05);
+    color: #94a3b8;
+    cursor: pointer;
+    font-family: inherit;
+    transition: all 130ms;
+    white-space: nowrap;
+  }
+  .fc-act-btn:hover { background: rgba(249,115,22,0.12); color: #f97316; border-color: rgba(249,115,22,0.35); }
+  .fc-act-danger { color: #f59e0b !important; border-color: rgba(245,158,11,0.3) !important; }
+  .fc-act-danger:hover { background: rgba(245,158,11,0.14) !important; color: #f59e0b !important; border-color: rgba(245,158,11,0.5) !important; }
+
+  /* ── Master toggle ──────────────────────────────────────────────────────── */
+  .fc-master-toggle {
+    display: inline-flex;
+    align-items: center;
+    gap: 7px;
+    padding: 4px 10px 4px 5px;
+    border-radius: 20px;
+    border: 1px solid rgba(255,255,255,0.12);
+    background: rgba(255,255,255,0.05);
+    cursor: pointer;
+    font-family: inherit;
+    font-size: 11.5px;
+    font-weight: 700;
+    transition: all 180ms;
+    position: relative;
+    flex-shrink: 0;
+  }
+  .fmt-knob {
+    width: 28px;
+    height: 15px;
+    border-radius: 8px;
+    position: relative;
+    flex-shrink: 0;
+    transition: background 180ms;
+  }
+  .fmt-knob::after {
+    content: '';
+    position: absolute;
+    width: 11px;
+    height: 11px;
+    background: #fff;
+    border-radius: 50%;
+    top: 2px;
+    transition: left 180ms;
+  }
+  .fmt-on .fmt-knob { background: #22c55e; box-shadow: 0 0 8px rgba(34,197,94,0.35); }
+  .fmt-on .fmt-knob::after { left: 15px; }
+  .fmt-off .fmt-knob { background: #334155; }
+  .fmt-off .fmt-knob::after { left: 2px; }
+  .fmt-label { color: #94a3b8; letter-spacing: 0.02em; }
+  .fmt-on .fmt-label { color: #22c55e; }
+  .fmt-off .fmt-label { color: #ef4444; }
+  .fc-master-toggle:hover { border-color: rgba(255,255,255,0.22); background: rgba(255,255,255,0.09); }
+
+  /* ── FC Selection bar ─────────────────────────────────────────────────── */
+  .fc-sel-bar {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 8px 18px;
+    background: rgba(249,115,22,0.08);
+    border-bottom: 1px solid rgba(249,115,22,0.2);
+    flex-shrink: 0;
+    flex-wrap: wrap;
+  }
+  .fc-sel-count { font-size: 12px; font-weight: 700; color: #f97316; margin-right: 4px; }
+  .fc-sel-btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    padding: 4px 10px;
+    font-size: 11.5px;
+    font-weight: 600;
+    border-radius: 5px;
+    border: 1px solid rgba(255,255,255,0.12);
+    background: rgba(255,255,255,0.07);
+    color: #e2e8f0;
+    cursor: pointer;
+    font-family: inherit;
+    transition: all 130ms;
+  }
+  .fc-sel-btn:hover { background: rgba(255,255,255,0.13); }
+  .fc-sel-danger { border-color: rgba(239,68,68,0.3) !important; color: #ef4444 !important; }
+  .fc-sel-danger:hover { background: rgba(239,68,68,0.15) !important; }
+
+  /* ── FC Select All Row ──────────────────────────────────────────────── */
+  .fc-select-all-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 8px 18px;
+    border-bottom: 1px solid rgba(255,255,255,0.05);
+    flex-shrink: 0;
+  }
+  .fc-chk-label {
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    font-size: 12px;
+    color: #64748b;
+    cursor: pointer;
+    user-select: none;
+  }
+  .fc-chk { accent-color: #f97316; cursor: pointer; }
+  .fc-showing { font-size: 11px; color: #475569; }
+
+  /* ── FC List ──────────────────────────────────────────────────────────── */
+  .fc-list {
+    display: flex;
+    flex-direction: column;
+    gap: 0;
+    overflow-y: auto;
+    flex: 1;
+    min-height: 0;
+  }
+  .fc-list::-webkit-scrollbar { width: 5px; }
+  .fc-list::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.1); border-radius: 99px; }
+
+  /* ── FC Card ──────────────────────────────────────────────────────────── */
+  .fc-card {
+    border-bottom: 1px solid rgba(255,255,255,0.06);
+    transition: background 120ms;
+  }
+  .fc-card:hover { background: rgba(255,255,255,0.02); }
+  .fc-card-sel { background: rgba(249,115,22,0.05) !important; }
+  .fc-card-hdr {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 10px 18px;
+    flex-wrap: wrap;
+  }
+  .fc-dot {
+    width: 9px;
+    height: 9px;
+    border-radius: 50%;
+    flex-shrink: 0;
+  }
+  .fc-name {
+    font-size: 13px;
+    font-weight: 700;
+    color: #e2e8f0;
+    flex-shrink: 0;
+  }
+  .fc-status-badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    font-size: 11px;
+    font-weight: 600;
+    padding: 2px 8px;
+    border-radius: 5px;
+    flex-shrink: 0;
+  }
+  .fc-status-dot {
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    flex-shrink: 0;
+  }
+  .fc-online { background: rgba(34,197,94,0.12); color: #22c55e; border: 1px solid rgba(34,197,94,0.25); }
+  .fc-online .fc-status-dot { background: #22c55e; box-shadow: 0 0 4px rgba(34,197,94,0.6); }
+  .fc-offline { background: rgba(100,116,139,0.1); color: #64748b; border: 1px solid rgba(100,116,139,0.2); }
+  .fc-offline .fc-status-dot { background: #334155; }
+  .fc-auth-badge {
+    font-size: 10.5px;
+    font-weight: 700;
+    padding: 2px 6px;
+    border-radius: 4px;
+    background: rgba(167,139,250,0.12);
+    color: #a78bfa;
+    border: 1px solid rgba(167,139,250,0.25);
+    flex-shrink: 0;
+  }
+  .fc-card-actions {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    margin-left: auto;
+    flex-wrap: wrap;
+  }
+  .fc-copy-btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    padding: 4px 8px;
+    font-size: 11px;
+    font-weight: 600;
+    border-radius: 5px;
+    border: 1px solid rgba(255,255,255,0.1);
+    background: rgba(255,255,255,0.05);
+    color: #64748b;
+    cursor: pointer;
+    font-family: inherit;
+    transition: all 120ms;
+    white-space: nowrap;
+  }
+  .fc-copy-btn:hover { background: rgba(56,189,248,0.1); color: #38bdf8; border-color: rgba(56,189,248,0.3); }
+  .fc-copied { background: rgba(34,197,94,0.12) !important; color: #22c55e !important; border-color: rgba(34,197,94,0.3) !important; }
+  .fc-edit-btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    padding: 4px 8px;
+    font-size: 11px;
+    font-weight: 600;
+    border-radius: 5px;
+    border: 1px solid rgba(255,255,255,0.1);
+    background: rgba(255,255,255,0.05);
+    color: #64748b;
+    cursor: pointer;
+    font-family: inherit;
+    transition: all 120ms;
+  }
+  .fc-edit-btn:hover { background: rgba(249,115,22,0.12); color: #f97316; border-color: rgba(249,115,22,0.35); }
+  .fc-remove-btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 27px;
+    height: 27px;
+    border-radius: 5px;
+    border: 1px solid rgba(255,255,255,0.08);
+    background: rgba(255,255,255,0.03);
+    color: #475569;
+    cursor: pointer;
+    transition: all 120ms;
+  }
+  .fc-remove-btn:hover { background: rgba(239,68,68,0.15); color: #ef4444; border-color: rgba(239,68,68,0.3); }
+
+  /* ── FC Card Body ─────────────────────────────────────────────────────── */
+  .fc-card-body {
+    padding: 0 18px 10px 35px;
+    display: flex;
+    flex-direction: column;
+    gap: 5px;
+  }
+  .fc-url-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+  .fc-url-label {
+    font-size: 9.5px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: #334155;
+    flex-shrink: 0;
+    width: 28px;
+  }
+  .fc-url-val {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 11.5px;
+    color: #38bdf8;
+    word-break: break-all;
+    background: none;
+    padding: 0;
+  }
+  .fc-meta-row {
+    display: flex;
+    gap: 14px;
+    flex-wrap: wrap;
+    align-items: center;
+  }
+  .fc-meta-item { font-size: 11px; color: #475569; }
+  .fc-meta-lbl { color: #334155; font-weight: 600; }
+  .fc-meta-val { font-family: 'JetBrains Mono', monospace; color: #64748b; font-size: 10.5px; }
+  .fc-auth-yes { color: #a78bfa !important; font-family: inherit !important; }
+  .fc-auth-no { color: #334155 !important; font-family: inherit !important; }
+  .fc-error-item { color: #ef4444 !important; }
+
+  /* ── FC Edit Form ─────────────────────────────────────────────────────── */
+  .fc-edit-form {
+    padding: 10px 18px 12px 35px;
+    border-top: 1px solid rgba(255,255,255,0.06);
+    background: rgba(0,0,0,0.2);
+  }
+  .fc-edit-grid {
+    display: grid;
+    grid-template-columns: 1fr 2fr 1fr 1fr 1fr;
+    gap: 8px;
+    margin-bottom: 8px;
+  }
+  .fc-edit-foot {
+    display: flex;
+    justify-content: flex-end;
+    gap: 7px;
+  }
+
+  /* ── FC Empty state ───────────────────────────────────────────────────── */
+  .fc-empty {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 12px;
+    flex: 1;
+    padding: 60px 20px;
+    text-align: center;
+  }
+  .fc-empty-title { font-size: 15px; font-weight: 700; color: #475569; }
+  .fc-empty-sub { font-size: 12px; color: #334155; max-width: 320px; line-height: 1.5; }
+
+  /* ── Bulk editable URLs ───────────────────────────────────────────────── */
+  .bulk-preview-hdr {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: 7px;
+  }
+  .bulk-url-edit {
+    flex: 1;
+    min-width: 0;
+    background: rgba(0,0,0,0.25);
+    border: 1px solid rgba(255,255,255,0.08);
+    border-radius: 4px;
+    color: #94a3b8;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 10.5px;
+    padding: 3px 6px;
+    outline: none;
+    transition: border-color 120ms;
+  }
+  .bulk-url-edit:focus { border-color: rgba(249,115,22,0.4); color: #e2e8f0; }
+  .bulk-rm-btn {
+    background: none;
+    border: none;
+    color: #475569;
+    cursor: pointer;
+    font-size: 14px;
+    width: 20px;
+    height: 20px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    border-radius: 3px;
+    padding: 0;
+    flex-shrink: 0;
+    transition: all 110ms;
+    font-family: inherit;
+    line-height: 1;
+  }
+  .bulk-rm-btn:hover { color: #ef4444; background: rgba(239,68,68,0.1); }
+  .bulk-action-btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    padding: 3px 8px;
+    font-size: 10.5px;
+    font-weight: 600;
+    border-radius: 5px;
+    border: 1px solid rgba(255,255,255,0.1);
+    background: rgba(255,255,255,0.05);
+    color: #64748b;
+    cursor: pointer;
+    font-family: inherit;
+    transition: all 120ms;
+  }
+  .bulk-action-btn:hover { color: #38bdf8; border-color: rgba(56,189,248,0.3); background: rgba(56,189,248,0.07); }
+  .bulk-clear-btn:hover { color: #ef4444 !important; border-color: rgba(239,68,68,0.3) !important; background: rgba(239,68,68,0.07) !important; }
+
+  /* ── Extract from Link ────────────────────────────────────────────────── */
+  .extractor-section {
+    border: 1px solid rgba(255,255,255,0.07);
+    border-radius: 7px;
+    overflow: hidden;
+  }
+  .extractor-toggle {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    width: 100%;
+    padding: 8px 12px;
+    background: rgba(255,255,255,0.03);
+    border: none;
+    color: #64748b;
+    font-size: 12px;
+    font-weight: 600;
+    cursor: pointer;
+    font-family: inherit;
+    text-align: left;
+    transition: all 130ms;
+  }
+  .extractor-toggle:hover { background: rgba(249,115,22,0.07); color: #f97316; }
+  .extractor-toggle svg:first-child { color: #f97316; flex-shrink: 0; }
+  .extractor-toggle svg:last-child { margin-left: auto; flex-shrink: 0; }
+  .extractor-body {
+    padding: 10px 12px;
+    border-top: 1px solid rgba(255,255,255,0.06);
+    background: rgba(0,0,0,0.15);
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+  }
+  .extractor-hint {
+    font-size: 11px;
+    color: #475569;
+    line-height: 1.4;
+  }
+  .extractor-hint code {
+    font-family: 'JetBrains Mono', monospace;
+    background: rgba(255,255,255,0.07);
+    padding: 1px 4px;
+    border-radius: 3px;
+    color: #f97316;
+  }
+  .extractor-row {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+  .extractor-input {
+    flex: 1;
+    min-width: 0;
+    background: rgba(0,0,0,0.3);
+    border: 1px solid rgba(255,255,255,0.1);
+    border-radius: 6px;
+    color: #e2e8f0;
+    font-size: 11.5px;
+    padding: 7px 10px;
+    outline: none;
+    font-family: 'JetBrains Mono', monospace;
+    transition: border-color 140ms;
+  }
+  .extractor-input:focus { border-color: rgba(249,115,22,0.5); }
+  .extractor-input::placeholder { color: #334155; }
+  .extractor-row-col {
+    flex-direction: column;
+    align-items: stretch;
+    gap: 6px;
+  }
+  .extractor-textarea {
+    resize: vertical;
+    min-height: 62px;
+    line-height: 1.5;
+    font-size: 11px;
+  }
+  .extractor-btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    flex-shrink: 0;
+  }
+  .extractor-error {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 11px;
+    color: #ef4444;
+    background: rgba(239,68,68,0.08);
+    border: 1px solid rgba(239,68,68,0.2);
+    border-radius: 5px;
+    padding: 6px 10px;
+    line-height: 1.4;
+  }
+  .extractor-success {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 11px;
+    color: #22c55e;
+    background: rgba(34,197,94,0.08);
+    border: 1px solid rgba(34,197,94,0.2);
+    border-radius: 5px;
+    padding: 6px 10px;
+  }
+
+  /* ── FC responsive ────────────────────────────────────────────────────── */
+  @media (max-width: 768px) {
+    .fc-toolbar { padding: 10px 12px; gap: 8px; }
+    .fc-global-actions { display: none; }
+    .fc-edit-grid { grid-template-columns: 1fr 1fr !important; }
+    .fc-card-hdr { padding: 8px 12px; gap: 6px; }
+    .fc-card-body { padding: 0 12px 8px 12px; }
+    .fc-card-actions { flex-wrap: wrap; }
+    .fc-edit-form { padding: 8px 12px; }
+  }
+
+  /* ── Password Lock Modal & Badges ────────────────────────────────────────── */
+  .lock-overlay {
+    position: fixed;
+    inset: 0;
+    z-index: 1000;
+    background: rgba(3, 7, 18, 0.82);
+    backdrop-filter: blur(8px);
+    -webkit-backdrop-filter: blur(8px);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 16px;
+    animation: fadeIn 0.2s ease;
+  }
+  .lock-modal {
+    position: relative;
+    width: 100%;
+    max-width: 420px;
+    background: #0f172a;
+    border: 1px solid rgba(249, 115, 22, 0.35);
+    border-radius: 16px;
+    padding: 28px 24px 22px 24px;
+    box-shadow: 0 25px 60px -15px rgba(0, 0, 0, 0.9), 0 0 40px rgba(249, 115, 22, 0.15);
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    text-align: center;
+    animation: scaleUp 0.25s cubic-bezier(0.16, 1, 0.3, 1);
+  }
+  @keyframes fadeIn {
+    from { opacity: 0; }
+    to { opacity: 1; }
+  }
+  @keyframes scaleUp {
+    from { opacity: 0; transform: scale(0.94) translateY(8px); }
+    to { opacity: 1; transform: scale(1) translateY(0); }
+  }
+  .lock-close-btn {
+    position: absolute;
+    top: 14px;
+    right: 14px;
+    background: transparent;
+    border: none;
+    color: #64748b;
+    cursor: pointer;
+    padding: 6px;
+    border-radius: 6px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    transition: all 0.15s;
+  }
+  .lock-close-btn:hover {
+    color: #e2e8f0;
+    background: rgba(255, 255, 255, 0.08);
+  }
+  .lock-icon {
+    width: 60px;
+    height: 60px;
+    border-radius: 50%;
+    background: rgba(249, 115, 22, 0.12);
+    border: 1px solid rgba(249, 115, 22, 0.3);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    margin-bottom: 16px;
+    box-shadow: 0 0 25px rgba(249, 115, 22, 0.25);
+  }
+  .lock-title {
+    font-size: 18px;
+    font-weight: 700;
+    color: #f8fafc;
+    letter-spacing: -0.02em;
+    margin-bottom: 6px;
+  }
+  .lock-sub {
+    font-size: 13px;
+    color: #94a3b8;
+    line-height: 1.45;
+    margin-bottom: 20px;
+  }
+  .lock-form {
+    width: 100%;
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+  }
+  .lock-input-wrap {
+    position: relative;
+    width: 100%;
+    display: flex;
+    align-items: center;
+  }
+  .lock-input {
+    width: 100%;
+    background: rgba(15, 23, 42, 0.9);
+    border: 1px solid rgba(255, 255, 255, 0.15);
+    border-radius: 8px;
+    padding: 10px 40px 10px 14px;
+    font-size: 14px;
+    color: #f8fafc;
+    outline: none;
+    transition: all 0.2s;
+  }
+  .lock-input:focus {
+    border-color: #f97316;
+    box-shadow: 0 0 0 3px rgba(249, 115, 22, 0.22);
+  }
+  .lock-input.lock-input-err {
+    border-color: #ef4444;
+    box-shadow: 0 0 0 3px rgba(239, 68, 68, 0.2);
+    animation: shake 0.3s ease;
+  }
+  @keyframes shake {
+    0%, 100% { transform: translateX(0); }
+    25% { transform: translateX(-4px); }
+    75% { transform: translateX(4px); }
+  }
+  .lock-pw-toggle {
+    position: absolute;
+    right: 10px;
+    background: transparent;
+    border: none;
+    color: #64748b;
+    cursor: pointer;
+    padding: 4px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    transition: color 0.15s;
+  }
+  .lock-pw-toggle:hover {
+    color: #cbd5e1;
+  }
+  .lock-error {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 6px;
+    font-size: 12px;
+    color: #ef4444;
+    background: rgba(239, 68, 68, 0.1);
+    border: 1px solid rgba(239, 68, 68, 0.25);
+    border-radius: 6px;
+    padding: 6px 10px;
+  }
+  .lock-btn-row {
+    display: flex;
+    gap: 8px;
+    margin-top: 4px;
+  }
+  .lock-btn-cancel {
+    flex: 1;
+    font-size: 12px;
+    color: #94a3b8;
+    border: 1px solid rgba(255, 255, 255, 0.1);
+  }
+  .lock-btn-cancel:hover {
+    color: #e2e8f0;
+    background: rgba(255, 255, 255, 0.06);
+  }
+  .lock-submit {
+    flex: 1.2;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 6px;
+    font-weight: 600;
+  }
+  .lock-note {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 11.5px;
+    color: #94a3b8;
+    margin-top: 16px;
+    line-height: 1.35;
+  }
+
+  /* ── Lock toolbar buttons & badges ────────────────────────────────────────── */
+  .fc-act-locked {
+    border-color: rgba(249, 115, 22, 0.45) !important;
+    background: rgba(249, 115, 22, 0.1) !important;
+    color: #f97316 !important;
+  }
+  .fc-act-locked:hover {
+    background: rgba(249, 115, 22, 0.2) !important;
+    border-color: rgba(249, 115, 22, 0.7) !important;
+  }
+  .fc-act-unlocked {
+    border-color: rgba(34, 197, 94, 0.35) !important;
+    background: rgba(34, 197, 94, 0.08) !important;
+    color: #22c55e !important;
+  }
+  .fc-act-unlocked:hover {
+    background: rgba(34, 197, 94, 0.18) !important;
+  }
+  .ico-locked {
+    border-color: rgba(249, 115, 22, 0.4) !important;
+    background: rgba(249, 115, 22, 0.1) !important;
+  }
+  .ico-unlocked {
+    border-color: rgba(34, 197, 94, 0.4) !important;
+    background: rgba(34, 197, 94, 0.1) !important;
+  }
+  .cr-lock-ico {
+    font-size: 10px;
+    opacity: 0.75;
+    margin-left: 2px;
+  }
+
+  /* ── Type badges (Code vs Manual) ────────────────────────────────────────── */
+  .fc-type-badge {
+    font-size: 10px;
+    font-weight: 600;
+    padding: 2px 7px;
+    border-radius: 12px;
+    letter-spacing: 0.02em;
+    text-transform: uppercase;
+  }
+  .fc-type-code-locked {
+    background: rgba(249, 115, 22, 0.12);
+    border: 1px solid rgba(249, 115, 22, 0.35);
+    color: #fb923c;
+  }
+  .fc-type-code-unlocked {
+    background: rgba(34, 197, 94, 0.12);
+    border: 1px solid rgba(34, 197, 94, 0.3);
+    color: #4ade80;
+  }
+  .fc-type-manual {
+    background: rgba(148, 163, 184, 0.12);
+    border: 1px solid rgba(148, 163, 184, 0.25);
+    color: #cbd5e1;
+  }
+
+  /* ── Card individual toggle ─────────────────────────────────────────────── */
+  .fc-card-tog {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    height: 22px;
+    padding: 2px 8px 2px 4px;
+    border-radius: 12px;
+    cursor: pointer;
+    font-size: 10px;
+    font-weight: 700;
+    letter-spacing: 0.03em;
+    transition: all 0.18s ease;
+    border: 1px solid transparent;
+  }
+  .fc-card-tog-on {
+    background: rgba(34, 197, 94, 0.15);
+    border-color: rgba(34, 197, 94, 0.4);
+    color: #22c55e;
+  }
+  .fc-card-tog-on:hover {
+    background: rgba(34, 197, 94, 0.25);
+    box-shadow: 0 0 10px rgba(34, 197, 94, 0.25);
+  }
+  .fc-card-tog-off {
+    background: rgba(239, 68, 68, 0.12);
+    border-color: rgba(239, 68, 68, 0.35);
+    color: #ef4444;
+  }
+  .fc-card-tog-off:hover {
+    background: rgba(239, 68, 68, 0.2);
+  }
+  .fct-knob {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    transition: background 0.18s;
+  }
+  .fc-card-tog-on .fct-knob {
+    background: #22c55e;
+    box-shadow: 0 0 5px #22c55e;
+  }
+  .fc-card-tog-off .fct-knob {
+    background: #ef4444;
   }
 </style>
