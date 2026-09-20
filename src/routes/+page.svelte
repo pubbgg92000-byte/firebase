@@ -369,7 +369,7 @@
     return false;
   }
 
-  const NOTIF_DURATION_MS = 30000; // 30 seconds per notification
+  const NOTIF_DURATION_MS = 90000; // 90 seconds per notification
 
   function getStoredNotifications() {
     if (typeof localStorage === "undefined") return [];
@@ -1352,7 +1352,7 @@
       if (savedPos && typeof savedPos.x === "number" && typeof savedPos.y === "number") notifPanelPos = savedPos;
       if (localStorage.getItem("pd_bell_panel_open") === "true") showBellPanel = true;
     } catch {}
-    // Ensure countdown timers are running for all active notifications for their remaining 30s lifetime
+    // Ensure countdown timers are running for all active notifications for their remaining 90s lifetime
     const now = Date.now();
     for (const n of notifications) {
       const elapsed = now - (n.createdAt || now);
@@ -3419,7 +3419,7 @@
                     <!-- Green progress bar -->
                     <div
                       class="bp-progress"
-                      style="animation-delay: -{Math.max(0, Math.min(29.9, ((Date.now() - (n.createdAt || Date.now())) / 1000))).toFixed(1)}s;"
+                      style="animation-delay: -{Math.max(0, Math.min(89.9, ((Date.now() - (n.createdAt || Date.now())) / 1000))).toFixed(1)}s;"
                     ></div>
                   </div>
                 {:else}
@@ -3472,7 +3472,7 @@
                     <!-- Green progress bar -->
                     <div
                       class="bp-progress"
-                      style="animation-delay: -{Math.max(0, Math.min(29.9, ((Date.now() - (n.createdAt || Date.now())) / 1000))).toFixed(1)}s;"
+                      style="animation-delay: -{Math.max(0, Math.min(89.9, ((Date.now() - (n.createdAt || Date.now())) / 1000))).toFixed(1)}s;"
                     ></div>
                   </div>
                 {/if}
@@ -9322,7 +9322,7 @@
     height: 2px;
     background: linear-gradient(90deg, #22c55e, transparent);
     border-radius: 0 0 10px 10px;
-    animation: bp-shrink 30s linear both;
+    animation: bp-shrink 90s linear both;
   }
   @keyframes bp-shrink {
     from {
