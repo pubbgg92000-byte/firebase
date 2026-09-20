@@ -313,13 +313,81 @@
   let sideOpen = $state(false); // mobile sidebar drawer
   let sideTab = $state("firebase"); // 'firebase' | 'devices'
 
+  // ── Floating Bell Notification Panel Persistence Helpers ────────────────
+  function getStoredNotifWidth() {
+    if (typeof localStorage === "undefined") return 360;
+    try {
+      const v = parseInt(localStorage.getItem("pd_notif_panel_w"), 10);
+      if (v && v >= 300 && v <= 1400) return v;
+    } catch {}
+    return 360;
+  }
+
+  function getStoredNotifHeight() {
+    if (typeof localStorage === "undefined") return null;
+    try {
+      const v = parseInt(localStorage.getItem("pd_notif_panel_h"), 10);
+      if (v && v >= 200 && v <= 2500) return v;
+    } catch {}
+    return null;
+  }
+
+  function getStoredNotifPos() {
+    if (typeof localStorage === "undefined") return { x: 0, y: 0 };
+    try {
+      const v = JSON.parse(localStorage.getItem("pd_notif_panel_pos") || "null");
+      if (v && typeof v.x === "number" && typeof v.y === "number") return v;
+    } catch {}
+    return { x: 0, y: 0 };
+  }
+
+  function getStoredBellPanelOpen() {
+    if (typeof localStorage === "undefined") return false;
+    try {
+      return localStorage.getItem("pd_bell_panel_open") === "true";
+    } catch {}
+    return false;
+  }
+
+  const NOTIF_DURATION_MS = 30000; // 30 seconds per notification
+
+  function getStoredNotifications() {
+    if (typeof localStorage === "undefined") return [];
+    try {
+      const raw = localStorage.getItem("pd_active_notifs");
+      if (!raw) return [];
+      const list = JSON.parse(raw);
+      if (!Array.isArray(list)) return [];
+      const now = Date.now();
+      const active = [];
+      for (const item of list) {
+        if (!item || !item.createdAt) continue;
+        const elapsed = now - item.createdAt;
+        if (elapsed < NOTIF_DURATION_MS) {
+          active.push(item);
+        }
+      }
+      return active;
+    } catch {
+      return [];
+    }
+  }
+
   // ── Notifications ───────────────────────────────────────────────────────────
-  let notifications = $state([]);
+  let notifications = $state(getStoredNotifications());
   let prevLastMsgTime = {}; // non-reactive: {connId:{devKey:ts}}
   let notifExpanded = $state(false); // show all vs 2 newest
-  let showBellPanel = $state(false); // floating bell dropdown open
+  let showBellPanel = $state(getStoredBellPanelOpen()); // floating bell dropdown open (persisted)
   let expandedNotifs = $state(new Set()); // IDs of expanded cards
   let notifSeen = new Set(); // non-reactive: 'connId::devKey::msgId' dedupe
+
+  $effect(() => {
+    if (typeof localStorage !== "undefined") {
+      try {
+        localStorage.setItem("pd_bell_panel_open", String(showBellPanel));
+      } catch {}
+    }
+  });
 
   // ── Dashboard table filters (multi-select AND logic) ─────────────────────
   let tableActiveFilters = $state(new Set()); // Set of 'on'|'off'|'num'|'used'|'new'
@@ -382,9 +450,9 @@
   });
 
   // ── Notification panel drag & resize (mouse + touch via pointer events) ───
-  let notifPanelPos = $state({ x: 0, y: 0 }); // offset from default anchor
-  let notifPanelWidth = $state(360); // custom width in px (min 300, max min(950, window width))
-  let notifPanelHeight = $state(null); // custom height in px (null = auto)
+  let notifPanelPos = $state(getStoredNotifPos()); // offset from default anchor (persisted)
+  let notifPanelWidth = $state(getStoredNotifWidth()); // custom width in px (min 300, max min(950, window width))
+  let notifPanelHeight = $state(getStoredNotifHeight()); // custom height in px (null = auto)
   let _ndDragging = $state(false);
   let _ndStart = { cx: 0, cy: 0, px: 0, py: 0 };
 
@@ -392,6 +460,19 @@
   let _nrType = null; // 'left' | 'bottom' | 'bl' | 'br'
   let _nrStart = { cx: 0, cy: 0, w: 360, h: 420 };
   let bellPanelEl = $state(null);
+
+  function saveNotifPanelDims() {
+    if (typeof localStorage === "undefined") return;
+    try {
+      localStorage.setItem("pd_notif_panel_w", String(notifPanelWidth));
+      if (notifPanelHeight) {
+        localStorage.setItem("pd_notif_panel_h", String(notifPanelHeight));
+      } else {
+        localStorage.removeItem("pd_notif_panel_h");
+      }
+      localStorage.setItem("pd_notif_panel_pos", JSON.stringify(notifPanelPos));
+    } catch {}
+  }
 
   function notifPanelDragStart(e) {
     // Ignore drag start on buttons, actions, or resize grips
@@ -401,6 +482,9 @@
     const cx = e.clientX ?? e.touches?.[0]?.clientX ?? 0;
     const cy = e.clientY ?? e.touches?.[0]?.clientY ?? 0;
     _ndStart = { cx, cy, px: notifPanelPos.x, py: notifPanelPos.y };
+    window.addEventListener("pointermove", notifPanelDragMove);
+    window.addEventListener("pointerup", notifPanelDragEnd);
+    window.addEventListener("pointercancel", notifPanelDragEnd);
     try {
       e.currentTarget.setPointerCapture?.(e.pointerId);
     } catch {}
@@ -413,13 +497,18 @@
       x: _ndStart.px + (cx - _ndStart.cx),
       y: _ndStart.py + (cy - _ndStart.cy),
     };
+    saveNotifPanelDims();
   }
   function notifPanelDragEnd(e) {
     if (_ndDragging) {
       _ndDragging = false;
+      window.removeEventListener("pointermove", notifPanelDragMove);
+      window.removeEventListener("pointerup", notifPanelDragEnd);
+      window.removeEventListener("pointercancel", notifPanelDragEnd);
       try {
         e?.currentTarget?.releasePointerCapture?.(e.pointerId);
       } catch {}
+      saveNotifPanelDims();
     }
   }
 
@@ -437,6 +526,9 @@
       w: rect?.width ? Math.round(rect.width) : notifPanelWidth,
       h: rect?.height ? Math.round(rect.height) : (notifPanelHeight || 420),
     };
+    window.addEventListener("pointermove", notifResizeMove);
+    window.addEventListener("pointerup", notifResizeEnd);
+    window.addEventListener("pointercancel", notifResizeEnd);
     try {
       e.currentTarget.setPointerCapture?.(e.pointerId);
     } catch {}
@@ -444,7 +536,7 @@
 
   function notifResizeMove(e) {
     if (!_nrResizing) return;
-    e.stopPropagation();
+    e.stopPropagation?.();
     const cx = e.clientX ?? e.touches?.[0]?.clientX ?? 0;
     const cy = e.clientY ?? e.touches?.[0]?.clientY ?? 0;
     const maxW = typeof window !== "undefined" ? Math.max(300, window.innerWidth - 24) : 950;
@@ -462,21 +554,20 @@
       const deltaH = cy - _nrStart.cy;
       notifPanelHeight = Math.round(Math.max(200, Math.min(maxH, _nrStart.h + deltaH)));
     }
+    saveNotifPanelDims();
   }
 
   function notifResizeEnd(e) {
     if (_nrResizing) {
       _nrResizing = false;
       _nrType = null;
+      window.removeEventListener("pointermove", notifResizeMove);
+      window.removeEventListener("pointerup", notifResizeEnd);
+      window.removeEventListener("pointercancel", notifResizeEnd);
       try {
         e?.currentTarget?.releasePointerCapture?.(e.pointerId);
       } catch {}
-      try {
-        localStorage.setItem("pd_notif_panel_w", String(notifPanelWidth));
-        if (notifPanelHeight) {
-          localStorage.setItem("pd_notif_panel_h", String(notifPanelHeight));
-        }
-      } catch {}
+      saveNotifPanelDims();
     }
   }
 
@@ -487,6 +578,7 @@
     try {
       localStorage.removeItem("pd_notif_panel_w");
       localStorage.removeItem("pd_notif_panel_h");
+      localStorage.removeItem("pd_notif_panel_pos");
     } catch {}
     toast("Notification panel size reset", "info");
   }
@@ -591,6 +683,47 @@
   // ── Notification system ───────────────────────────────────────────────────
   const notifTimers = new Map(); // id → timeoutId so we can cancel on clear
 
+  function saveNotifications() {
+    if (typeof localStorage === "undefined") return;
+    try {
+      const now = Date.now();
+      const valid = notifications
+        .filter((n) => n && n.createdAt && (now - n.createdAt) < NOTIF_DURATION_MS)
+        .map((n) => ({
+          id: n.id,
+          createdAt: n.createdAt,
+          ts: typeof n.ts === "string" ? n.ts : (n.ts ? new Date(n.ts).toISOString() : new Date().toISOString()),
+          connId: n.connId,
+          conn: n.conn ? { id: n.conn.id, name: n.conn.name, color: n.conn.color } : null,
+          devKey: n.devKey,
+          sender: n.sender,
+          message: n.message,
+          otp: n.otp,
+          about: n.about,
+          msgId: n.msgId,
+        }));
+      localStorage.setItem("pd_active_notifs", JSON.stringify(valid));
+    } catch {}
+  }
+
+  function scheduleNotifDismiss(id, remainingMs) {
+    if (notifTimers.has(id)) {
+      clearTimeout(notifTimers.get(id));
+      notifTimers.delete(id);
+    }
+    const t = setTimeout(() => {
+      notifTimers.delete(id);
+      notifications = notifications.map((x) =>
+        x.id === id ? { ...x, leaving: true } : x,
+      );
+      setTimeout(() => {
+        notifications = notifications.filter((x) => x.id !== id);
+        saveNotifications();
+      }, 350);
+    }, Math.max(150, remainingMs));
+    notifTimers.set(id, t);
+  }
+
   function addNotif(n) {
     if (!notifsEnabled) return;
     // ── Deduplication: skip if we've already seen this exact message ──
@@ -606,21 +739,19 @@
       } catch {}
     }
     const id = Date.now() + Math.random();
-    notifications = [{ id, ...n, ts: new Date() }, ...notifications].slice(
-      0,
-      8,
-    );
-    const t = setTimeout(() => {
-      notifTimers.delete(id);
-      notifications = notifications.map((x) =>
-        x.id === id ? { ...x, leaving: true } : x,
-      );
-      setTimeout(
-        () => (notifications = notifications.filter((x) => x.id !== id)),
-        350,
-      );
-    }, 30000);
-    notifTimers.set(id, t);
+    const createdAt = Date.now();
+    const notifObj = {
+      id,
+      createdAt,
+      ts: new Date().toISOString(),
+      ...n,
+      conn: n.conn || connections.find((c) => c.id === n.connId) || { color: "#f97316", name: n.connId },
+    };
+
+    notifications = [notifObj, ...notifications].slice(0, 8);
+    scheduleNotifDismiss(id, NOTIF_DURATION_MS);
+    saveNotifications();
+
     // Notification panel stays closed by default — only auto-opens if user explicitly turned it ON in settings
     if (autoOpenNotif) {
       showBellPanel = true;
@@ -635,10 +766,10 @@
     notifications = notifications.map((n) =>
       n.id === id ? { ...n, leaving: true } : n,
     );
-    setTimeout(
-      () => (notifications = notifications.filter((n) => n.id !== id)),
-      350,
-    );
+    setTimeout(() => {
+      notifications = notifications.filter((n) => n.id !== id);
+      saveNotifications();
+    }, 350);
   }
 
   function clearAllNotifs() {
@@ -647,6 +778,7 @@
     notifTimers.clear();
     notifications = [];
     notifExpanded = false;
+    saveNotifications();
     if (count > 0) {
       toast(`Cleared ${count} notification${count === 1 ? "" : "s"}`, "info");
     }
@@ -936,13 +1068,27 @@
     try {
       autoOpenNotif = localStorage.getItem("pd_auto_open_notif") === "true";
     } catch {}
-    // Restore resized notification panel dimensions
+    // Restore resized notification panel dimensions & position
     try {
       const savedW = parseInt(localStorage.getItem("pd_notif_panel_w"), 10);
       if (savedW && savedW >= 300 && savedW <= 1400) notifPanelWidth = savedW;
       const savedH = parseInt(localStorage.getItem("pd_notif_panel_h"), 10);
       if (savedH && savedH >= 200 && savedH <= 2500) notifPanelHeight = savedH;
+      const savedPos = JSON.parse(localStorage.getItem("pd_notif_panel_pos") || "null");
+      if (savedPos && typeof savedPos.x === "number" && typeof savedPos.y === "number") notifPanelPos = savedPos;
+      if (localStorage.getItem("pd_bell_panel_open") === "true") showBellPanel = true;
     } catch {}
+    // Ensure countdown timers are running for all active notifications for their remaining 30s lifetime
+    const now = Date.now();
+    for (const n of notifications) {
+      const elapsed = now - (n.createdAt || now);
+      const remaining = NOTIF_DURATION_MS - elapsed;
+      if (remaining > 0) {
+        scheduleNotifDismiss(n.id, remaining);
+      } else {
+        dismissNotif(n.id);
+      }
+    }
     // Restore seen notification IDs so refresh doesn't re-trigger same messages
     try {
       notifSeen = new Set(
@@ -2094,6 +2240,27 @@
         .sort(([a], [b]) => Number(b) - Number(a)); // newest first
     })(),
   );
+
+  // ── Filtered notifications (match ONLY from message content / sender, NOT device ID or phone number) ───
+  let notifSearchQuery = $state("");
+
+  let filteredNotifications = $derived.by(() => {
+    const q = notifSearchQuery.trim().toLowerCase();
+    if (!q) return notifications;
+    return notifications.filter((n) => {
+      const msg = String(n.message ?? "").toLowerCase();
+      const sender = String(n.sender ?? "").toLowerCase();
+      const about = String(n.about ?? "").toLowerCase();
+
+      // Only match against the SMS message body, sender, or detected service
+      // Do NOT match against the phone number, device ID, or connection name
+      return (
+        msg.includes(q) ||
+        sender.includes(q) ||
+        about.includes(q)
+      );
+    });
+  });
 </script>
 
 <svelte:window
@@ -2667,7 +2834,9 @@
         >
           <span class="bp-title"
             >Notifications {#if notifications.length > 0}<span class="bp-cnt"
-                >({notifications.length})</span
+                >({notifSearchQuery.trim()
+                  ? `${filteredNotifications.length}/${notifications.length}`
+                  : notifications.length})</span
               >{/if}</span
           >
           <div class="bp-actions" role="toolbar" tabindex="-1" aria-label="Notification actions" onpointerdown={(e) => e.stopPropagation()}>
@@ -2777,6 +2946,38 @@
           </div>
         </div>
 
+        <!-- Notification Search / Filter Bar -->
+        <div class="bp-search-wrap" role="search" aria-label="Filter notifications" onpointerdown={(e) => e.stopPropagation()}>
+          <div class="bp-search-box">
+            <svg class="bp-search-ico" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+              <circle cx="11" cy="11" r="8" />
+              <line x1="21" y1="21" x2="16.65" y2="16.65" />
+            </svg>
+            <input
+              type="text"
+              class="bp-search-input"
+              placeholder="Filter OTPs (e.g. Swiggy, Jio)..."
+              bind:value={notifSearchQuery}
+            />
+            {#if notifSearchQuery}
+              <button
+                class="bp-search-clear"
+                onclick={() => (notifSearchQuery = "")}
+                title="Clear filter"
+                aria-label="Clear filter"
+              >×</button>
+            {/if}
+          </div>
+          {#if notifSearchQuery.trim()}
+            <div class="bp-search-status">
+              <span>Filtered: {filteredNotifications.length} of {notifications.length}</span>
+              {#if filteredNotifications.length === 0}
+                <span style="color:#ef4444">No match</span>
+              {/if}
+            </div>
+          {/if}
+        </div>
+
         <!-- Notification list -->
         {#if notifications.length === 0}
           <div class="bp-empty">
@@ -2786,9 +2987,19 @@
               <span>No new notifications</span>
             {/if}
           </div>
+        {:else if filteredNotifications.length === 0}
+          <div class="bp-empty bp-empty-filtered">
+            <span>No notifications matching "{notifSearchQuery}"</span>
+            <button
+              class="bp-search-reset-btn"
+              onclick={() => (notifSearchQuery = "")}
+            >
+              Clear Filter
+            </button>
+          </div>
         {:else}
           <div class="bp-list">
-            {#each notifications as n (n.id)}
+            {#each filteredNotifications as n (n.id)}
               {@const msgFull = n.message ?? ""}
               {@const msgShort =
                 msgFull.length > 120 ? msgFull.slice(0, 120) + "…" : msgFull}
@@ -2832,6 +3043,7 @@
                 </div>
                 <!-- Row 2: OTP green pill + device ID + copy + navigate -->
                 {#if n.otp}
+                  {@const notifPhone = getDisplayPhone(n.connId, n.devKey, getDevInfo(n.connId, n.devKey))}
                   <div class="bp-card-bot">
                     <button
                       class="bp-otp-pill"
@@ -2888,7 +3100,7 @@
                         stroke-width="2"
                         ><rect x="5" y="2" width="14" height="20" rx="2" /></svg
                       >
-                      <span class="mono">{(n.devKey ?? "").slice(0, 8)}…</span>
+                      <span class="mono">{n.devKey ?? ""}</span>
                       <svg
                         width="9"
                         height="9"
@@ -2901,6 +3113,17 @@
                         /></svg
                       >
                     </button>
+                    {#if notifPhone}
+                      <button
+                        class="bp-phone-pill"
+                        onclick={(e) => {
+                          e.stopPropagation();
+                          copyPhone(notifPhone);
+                        }}
+                        title="Copy phone number"
+                      >📱 {notifPhone}</button>
+                    {/if}
+                    <!-- Navigate button -->
                     <button
                       class="bp-nav-btn"
                       onclick={() => {
@@ -2920,9 +3143,13 @@
                       >
                     </button>
                     <!-- Green progress bar -->
-                    <div class="bp-progress"></div>
+                    <div
+                      class="bp-progress"
+                      style="animation-delay: -{Math.max(0, Math.min(29.9, ((Date.now() - (n.createdAt || Date.now())) / 1000))).toFixed(1)}s;"
+                    ></div>
                   </div>
                 {:else}
+                  {@const notifPhoneV = getDisplayPhone(n.connId, n.devKey, getDevInfo(n.connId, n.devKey))}
                   <div class="bp-card-bot">
                     <span class="bp-verif-chip">VERIF</span>
                     <span class="bp-verif-text"
@@ -2930,6 +3157,25 @@
                         ? "…"
                         : ""}</span
                     >
+                    {#if notifPhoneV}
+                      <button
+                        class="bp-phone-pill"
+                        onclick={(e) => {
+                          e.stopPropagation();
+                          copyPhone(notifPhoneV);
+                        }}
+                        title="Copy phone number"
+                      >📱 {notifPhoneV}</button>
+                    {/if}
+                    <button
+                      class="bp-dev-pill"
+                      onclick={(e) => {
+                        e.stopPropagation();
+                        copyText(n.devKey ?? "");
+                        toast("Device ID copied", "success");
+                      }}
+                      title="Copy device ID"
+                    ><span class="mono">{n.devKey ?? ""}</span></button>
                     <button
                       class="bp-nav-btn"
                       onclick={() => {
@@ -2949,6 +3195,11 @@
                         ><path d="M7 17L17 7M7 7h10v10" /></svg
                       >
                     </button>
+                    <!-- Green progress bar -->
+                    <div
+                      class="bp-progress"
+                      style="animation-delay: -{Math.max(0, Math.min(29.9, ((Date.now() - (n.createdAt || Date.now())) / 1000))).toFixed(1)}s;"
+                    ></div>
                   </div>
                 {/if}
               </div>
@@ -8396,6 +8647,96 @@
     background: rgba(239, 68, 68, 0.08) !important;
   }
 
+  /* ── Bell panel search / filter bar ──────────────────────────────────────── */
+  .bp-search-wrap {
+    padding: 8px 10px 7px;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.07);
+    background: rgba(0, 0, 0, 0.18);
+    display: flex;
+    flex-direction: column;
+    gap: 5px;
+    flex-shrink: 0;
+  }
+  .bp-search-box {
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    background: rgba(255, 255, 255, 0.05);
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    border-radius: 9px;
+    padding: 6px 10px;
+    transition: all 150ms;
+  }
+  .bp-search-box:focus-within {
+    border-color: rgba(249, 115, 22, 0.55);
+    background: rgba(255, 255, 255, 0.08);
+    box-shadow: 0 0 0 2px rgba(249, 115, 22, 0.15);
+  }
+  .bp-search-ico {
+    color: #64748b;
+    flex-shrink: 0;
+  }
+  .bp-search-input {
+    flex: 1;
+    min-width: 0;
+    background: transparent;
+    border: none;
+    outline: none;
+    color: #e2e8f0;
+    font-size: 11.5px;
+    font-family: inherit;
+  }
+  .bp-search-input::placeholder {
+    color: #475569;
+    font-size: 11px;
+  }
+  .bp-search-clear {
+    width: 17px;
+    height: 17px;
+    border-radius: 50%;
+    border: none;
+    background: rgba(255, 255, 255, 0.12);
+    color: #94a3b8;
+    font-size: 11px;
+    line-height: 1;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    cursor: pointer;
+    transition: all 120ms;
+    padding: 0;
+    flex-shrink: 0;
+  }
+  .bp-search-clear:hover {
+    background: rgba(239, 68, 68, 0.3);
+    color: #f87171;
+  }
+  .bp-search-status {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    font-size: 10px;
+    color: #f97316;
+    font-weight: 500;
+    padding: 0 2px;
+  }
+  .bp-search-reset-btn {
+    margin-top: 6px;
+    background: rgba(249, 115, 22, 0.15);
+    border: 1px solid rgba(249, 115, 22, 0.35);
+    color: #f97316;
+    border-radius: 6px;
+    padding: 4px 10px;
+    font-size: 11px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: all 140ms;
+  }
+  .bp-search-reset-btn:hover {
+    background: rgba(249, 115, 22, 0.25);
+    color: #fb923c;
+  }
+
   /* Panel empty state */
   .bp-empty {
     padding: 28px 16px;
@@ -8404,6 +8745,8 @@
     font-size: 13px;
     flex: 1;
     display: flex;
+    flex-direction: column;
+    gap: 8px;
     align-items: center;
     justify-content: center;
   }
@@ -8552,6 +8895,29 @@
   .bp-dev-pill:hover {
     background: rgba(255, 255, 255, 0.1);
     color: #e2e8f0;
+  }
+
+  /* Phone number pill */
+  .bp-phone-pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    background: rgba(52, 211, 153, 0.1);
+    border: 1px solid rgba(52, 211, 153, 0.3);
+    border-radius: 8px;
+    padding: 4px 9px;
+    cursor: pointer;
+    font-family: 'JetBrains Mono', monospace;
+    color: #34d399;
+    font-size: 11px;
+    font-weight: 600;
+    transition: all 150ms;
+    flex-shrink: 0;
+  }
+  .bp-phone-pill:hover {
+    background: rgba(52, 211, 153, 0.2);
+    border-color: rgba(52, 211, 153, 0.55);
+    color: #6ee7b7;
   }
 
   /* Navigate button */
