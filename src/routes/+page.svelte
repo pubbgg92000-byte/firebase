@@ -257,6 +257,35 @@
   let smsDraft = $state({ to: "", body: "", sim: "0" });
   let smsSending = $state(false);
 
+  // ── Discovered Numbers ──────────────────────────────────────────────────
+  let discoveryRecords = $state([]);
+  let discoverySearch = $state('');
+  let discoverySort = $state('date-desc'); // date-desc | date-asc | conn
+  function loadDiscoveryRecords() {
+    try {
+      const raw = localStorage.getItem('device-number-discovery:engine');
+      if (raw) {
+        const data = JSON.parse(raw);
+        discoveryRecords = (data.records ?? []).filter(r => r.status === 'discovered');
+      }
+    } catch { discoveryRecords = []; }
+  }
+  let filteredDiscovery = $derived.by(() => {
+    let list = [...discoveryRecords];
+    if (discoverySearch.trim()) {
+      const q = discoverySearch.trim().toLowerCase();
+      list = list.filter(r =>
+        r.deviceId?.toLowerCase().includes(q) ||
+        r.phoneNumber?.toLowerCase().includes(q) ||
+        r.connectionName?.toLowerCase().includes(q)
+      );
+    }
+    if (discoverySort === 'date-desc') list.sort((a, b) => new Date(b.discoveredAt) - new Date(a.discoveredAt));
+    else if (discoverySort === 'date-asc') list.sort((a, b) => new Date(a.discoveredAt) - new Date(b.discoveredAt));
+    else if (discoverySort === 'conn') list.sort((a, b) => (a.connectionName ?? '').localeCompare(b.connectionName ?? ''));
+    return list;
+  });
+
   // ── Sidebar ───────────────────────────────────────────────────────────────
   let sideFilter = $state("all");
   let searchQuery = $state("");
@@ -869,6 +898,7 @@
     try {
       usedSet = new Set(JSON.parse(localStorage.getItem("pd_used") || "[]"));
     } catch {}
+    loadDiscoveryRecords();
     try {
       localPhones = JSON.parse(localStorage.getItem("pd_phones") || "{}");
     } catch {}
@@ -2409,6 +2439,13 @@
         <span class="tbstat tt">{totalCount} total</span>
         <span class="tbstat to">{onlineCount} online</span>
         <span class="tbstat tf">{offlineCount} offline</span>
+        <a
+          href="/discovery"
+          class="ico-btn"
+          title="Device Number Discovery"
+          aria-label="Device Number Discovery"
+          style="text-decoration:none;font-size:12px;"
+        >📡</a>
         <button
           class="ico-btn {bgRefreshing ? 'ico-active' : ''}"
           onclick={() => fetchAll(false)}
@@ -3327,6 +3364,11 @@
         class="tab {activeTab === 'send' ? 'active' : ''}"
         onclick={() => switchTab("send")}
         disabled={!selectedKey}>Send SMS</button
+      >
+      <button
+        class="tab {activeTab === 'discovered' ? 'active' : ''}"
+        onclick={() => { activeTab = 'discovered'; loadDiscoveryRecords(); }}
+        >Discovered <span class="tab-cnt">{discoveryRecords.length}</span></button
       >
     </div>
 
@@ -4502,6 +4544,70 @@
           </div>
         {/if}
       {/if}
+
+      <!-- ── DISCOVERED NUMBERS ─────────────────────────────────────── -->
+      {:else if activeTab === 'discovered'}
+        <div class="disc-wrap">
+          <div class="disc-hdr">
+            <div class="disc-hdr-top">
+              <h3 class="disc-title">📱 Discovered Numbers</h3>
+              <span class="disc-count">{filteredDiscovery.length} of {discoveryRecords.length}</span>
+            </div>
+            <div class="disc-controls">
+              <input type="search" class="disc-search" placeholder="Search device ID, phone, connection…"
+                bind:value={discoverySearch} />
+              <select class="disc-sort" bind:value={discoverySort}>
+                <option value="date-desc">Newest first</option>
+                <option value="date-asc">Oldest first</option>
+                <option value="conn">By connection</option>
+              </select>
+              <button class="disc-refresh" onclick={loadDiscoveryRecords} title="Refresh">↻</button>
+            </div>
+          </div>
+
+          {#if filteredDiscovery.length === 0}
+            <div class="disc-empty">
+              {#if discoveryRecords.length === 0}
+                No discovered numbers yet. Go to <a href="/discovery">Discovery</a> to start.
+              {:else}
+                No results match "{discoverySearch}"
+              {/if}
+            </div>
+          {:else}
+            <div class="disc-list">
+              {#each filteredDiscovery as rec (rec.deviceId + rec.discoveredAt)}
+                <div class="disc-row">
+                  <div class="disc-row-top">
+                    <button class="disc-devid" onclick={() => {
+                      try { navigator.clipboard.writeText(rec.deviceId); } catch {}
+                      addToast(rec.deviceId.slice(0, 12) + '… copied', 'success');
+                    }}>{rec.deviceId}</button>
+                    <span class="disc-arrow">→</span>
+                    <button class="disc-phone" onclick={() => {
+                      try { navigator.clipboard.writeText(rec.phoneNumber); } catch {}
+                      addToast(rec.phoneNumber + ' copied', 'success');
+                    }}>{rec.phoneNumber}</button>
+                  </div>
+                  <div class="disc-row-meta">
+                    {#if rec.connectionName}
+                      <span class="disc-conn">{rec.connectionName}</span>
+                    {/if}
+                    <span class="disc-method {rec.discoveryMethod === 'manual' ? 'disc-method-manual' : 'disc-method-sms'}">
+                      {rec.discoveryMethod === 'manual' ? '✏️ manual' : '📡 sms'}
+                    </span>
+                    {#if rec.attemptCount > 0}
+                      <span class="disc-attempts">{rec.attemptCount}×</span>
+                    {/if}
+                    <span class="disc-date">
+                      {new Date(rec.discoveredAt).toLocaleDateString('en-IN', { day: '2-digit', month: 'short', year: 'numeric', timeZone: 'Asia/Kolkata' })}
+                      {new Date(rec.discoveredAt).toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit', hour12: true, timeZone: 'Asia/Kolkata' })}
+                    </span>
+                  </div>
+                </div>
+              {/each}
+            </div>
+          {/if}
+        </div>
     </div>
   </div>
 </div>
@@ -6145,6 +6251,67 @@
   }
 
   /* SEND */
+  /* ── Discovered Numbers Tab ──────────────────────────────────── */
+  .disc-wrap { max-width: 700px; }
+  .disc-hdr { margin-bottom: 12px; }
+  .disc-hdr-top { display: flex; align-items: center; justify-content: space-between; margin-bottom: 8px; }
+  .disc-title { font-size: 18px; font-weight: 800; margin: 0; display: flex; align-items: center; gap: 6px; }
+  .disc-count { font-size: 11px; color: #64748b; font-weight: 600; }
+  .disc-controls { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+  .disc-search {
+    flex: 1; min-width: 160px; padding: 7px 10px; font-size: 12px;
+    background: rgba(0,0,0,0.3); border: 1px solid rgba(255,255,255,0.08);
+    border-radius: 7px; color: #e2e8f0; font-family: inherit; outline: none;
+  }
+  .disc-search:focus { border-color: rgba(56,189,248,0.4); }
+  .disc-search::placeholder { color: #475569; }
+  .disc-sort {
+    padding: 7px 10px; font-size: 11px; background: rgba(0,0,0,0.3);
+    border: 1px solid rgba(255,255,255,0.08); border-radius: 7px;
+    color: #e2e8f0; font-family: inherit; cursor: pointer; outline: none;
+  }
+  .disc-refresh {
+    width: 32px; height: 32px; display: flex; align-items: center; justify-content: center;
+    background: rgba(0,0,0,0.3); border: 1px solid rgba(255,255,255,0.08);
+    border-radius: 7px; color: #94a3b8; font-size: 16px; cursor: pointer;
+    transition: all 0.15s;
+  }
+  .disc-refresh:hover { background: rgba(56,189,248,0.1); color: #38bdf8; }
+  .disc-empty {
+    text-align: center; padding: 40px 16px; color: #475569; font-size: 13px;
+  }
+  .disc-empty a { color: #38bdf8; text-decoration: none; }
+  .disc-empty a:hover { text-decoration: underline; }
+  .disc-list { display: flex; flex-direction: column; gap: 4px; }
+  .disc-row {
+    background: rgba(0,0,0,0.2); border: 1px solid rgba(255,255,255,0.04);
+    border-radius: 8px; padding: 8px 12px; transition: border-color 0.15s;
+  }
+  .disc-row:hover { border-color: rgba(56,189,248,0.15); }
+  .disc-row-top { display: flex; align-items: center; gap: 6px; margin-bottom: 4px; flex-wrap: wrap; }
+  .disc-devid {
+    font-family: 'JetBrains Mono', monospace; font-size: 11px; color: #7dd3fc;
+    background: none; border: none; cursor: pointer; padding: 0; text-align: left;
+    word-break: break-all;
+  }
+  .disc-devid:hover { color: #38bdf8; text-decoration: underline; }
+  .disc-arrow { color: #475569; font-size: 12px; flex-shrink: 0; }
+  .disc-phone {
+    font-family: 'JetBrains Mono', monospace; font-size: 12px; color: #34d399;
+    font-weight: 600; background: none; border: none; cursor: pointer; padding: 0;
+  }
+  .disc-phone:hover { color: #22c55e; text-decoration: underline; }
+  .disc-row-meta { display: flex; align-items: center; gap: 8px; font-size: 10px; color: #475569; flex-wrap: wrap; }
+  .disc-conn { color: #64748b; font-weight: 500; }
+  .disc-method {
+    font-size: 9px; font-weight: 600; padding: 1px 6px; border-radius: 4px;
+    text-transform: uppercase; letter-spacing: 0.04em;
+  }
+  .disc-method-sms { background: rgba(56,189,248,0.1); color: #38bdf8; }
+  .disc-method-manual { background: rgba(251,191,36,0.1); color: #fbbf24; }
+  .disc-attempts { color: #64748b; font-family: 'JetBrains Mono', monospace; }
+  .disc-date { color: #475569; margin-left: auto; white-space: nowrap; }
+
   .send-wrap {
     max-width: 560px;
   }
