@@ -91,17 +91,37 @@
   function copyText(txt) {
     const s = String(txt ?? "");
     if (!s) return;
+    if (navigator.clipboard && window.isSecureContext) {
+      navigator.clipboard.writeText(s).catch(() => fallbackCopy(s));
+    } else {
+      fallbackCopy(s);
+    }
+  }
+
+  function fallbackCopy(s) {
     try {
-      navigator.clipboard.writeText(s);
-    } catch {
       const ta = document.createElement("textarea");
       ta.value = s;
-      ta.style.cssText = "position:fixed;opacity:0;top:-9999px";
+      ta.setAttribute("readonly", "");
+      ta.style.position = "fixed";
+      ta.style.top = "0";
+      ta.style.left = "0";
+      ta.style.width = "1px";
+      ta.style.height = "1px";
+      ta.style.padding = "0";
+      ta.style.border = "none";
+      ta.style.outline = "none";
+      ta.style.boxShadow = "none";
+      ta.style.background = "transparent";
+      ta.style.opacity = "0.01";
+      ta.style.fontSize = "16px";
       document.body.appendChild(ta);
-      ta.select();
+      ta.focus({ preventScroll: true });
+      ta.setSelectionRange(0, s.length);
       document.execCommand("copy");
+      ta.blur();
       document.body.removeChild(ta);
-    }
+    } catch {}
   }
 
   import "../app.css";
@@ -879,6 +899,260 @@
     }
     editingPhone = null;
     editPhoneVal = "";
+  }
+
+  // ── Full Backup & Restore ────────────────────────────────────────────────
+  let showRestoreModal = $state(false);
+  let restorePasteText = $state("");
+  let restoreFile = $state(null);
+  let restorePreview = $state(null); // parsed backup data for preview
+  let restoreError = $state("");
+  let restoreProcessing = $state(false);
+
+  function buildBackupPayload() {
+    const payload = {
+      version: 1,
+      type: "full-backup",
+      exportTimestamp: new Date().toISOString(),
+      connections: connections.map((c) => ({
+        id: c.id,
+        name: c.name,
+        url: c.url,
+        token: c.token ?? "",
+        path: c.path,
+        infoPath: c.infoPath ?? "",
+        color: c.color,
+        enabled: c.enabled,
+      })),
+      localPhones: { ...localPhones },
+      usedOtps: [...usedSet],
+      deletedDevices: [...deletedDevices],
+      settings: {
+        notifsEnabled,
+        showNotifsTab,
+        autoOpenNotif,
+      },
+    };
+    // Include discovery engine state from localStorage directly
+    try {
+      const raw = localStorage.getItem("device-number-discovery:engine");
+      if (raw) payload.discoveryEngine = JSON.parse(raw);
+    } catch {}
+    return payload;
+  }
+
+  function triggerDownload(blob, filename) {
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = filename;
+    a.click();
+    URL.revokeObjectURL(url);
+  }
+
+  function exportBackupJSON() {
+    const payload = buildBackupPayload();
+    const blob = new Blob([JSON.stringify(payload, null, 2)], {
+      type: "application/json",
+    });
+    const d = new Date().toISOString().split("T")[0];
+    triggerDownload(blob, `firebase-full-backup-${d}.json`);
+    toast("Full backup exported as JSON", "success");
+  }
+
+  async function exportBackupZIP() {
+    try {
+      // Dynamically load JSZip from CDN
+      if (!window.JSZip) {
+        const script = document.createElement("script");
+        script.src =
+          "https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js";
+        await new Promise((resolve, reject) => {
+          script.onload = resolve;
+          script.onerror = reject;
+          document.head.appendChild(script);
+        });
+      }
+      const zip = new window.JSZip();
+      const payload = buildBackupPayload();
+      zip.file("backup.json", JSON.stringify(payload, null, 2));
+      const blob = await zip.generateAsync({ type: "blob" });
+      const d = new Date().toISOString().split("T")[0];
+      triggerDownload(blob, `firebase-full-backup-${d}.zip`);
+      toast("Full backup exported as ZIP", "success");
+    } catch (e) {
+      toast(`ZIP export failed: ${e.message}`, "error");
+    }
+  }
+
+  function validateBackup(data) {
+    if (!data || typeof data !== "object") return "Invalid JSON structure";
+    if (data.type !== "full-backup") return "Not a full-backup file (missing type field)";
+    if (!Array.isArray(data.connections) || data.connections.length === 0)
+      return "No connections found in backup";
+    // Validate each connection has at minimum url + name
+    for (const c of data.connections) {
+      if (!c.url || !c.name) return `Connection missing url or name: ${JSON.stringify(c).slice(0, 80)}`;
+    }
+    return null; // valid
+  }
+
+  function previewBackupData(data) {
+    const connCount = data.connections?.length ?? 0;
+    const phoneCount = data.localPhones ? Object.keys(data.localPhones).length : 0;
+    const discoveredCount = data.discoveryEngine?.records
+      ? data.discoveryEngine.records.filter((r) => r.status === "discovered").length
+      : 0;
+    const totalRecords = data.discoveryEngine?.records?.length ?? 0;
+    const tomorrowCount = data.discoveryEngine?.tryTomorrow?.length ?? 0;
+    const usedOtpCount = data.usedOtps?.length ?? 0;
+    const deletedCount = data.deletedDevices?.length ?? 0;
+    return {
+      connCount,
+      phoneCount,
+      discoveredCount,
+      totalRecords,
+      tomorrowCount,
+      usedOtpCount,
+      deletedCount,
+      timestamp: data.exportTimestamp ?? "unknown",
+      connNames: (data.connections ?? []).map((c) => c.name).join(", "),
+    };
+  }
+
+  async function handleRestoreFileSelect(e) {
+    restoreError = "";
+    restorePreview = null;
+    const file = e.target?.files?.[0];
+    if (!file) return;
+    restoreFile = file;
+    try {
+      let jsonData;
+      if (file.name.endsWith(".zip")) {
+        if (!window.JSZip) {
+          const script = document.createElement("script");
+          script.src =
+            "https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js";
+          await new Promise((resolve, reject) => {
+            script.onload = resolve;
+            script.onerror = reject;
+            document.head.appendChild(script);
+          });
+        }
+        const zip = await window.JSZip.loadAsync(file);
+        const entry = zip.file("backup.json");
+        if (!entry) {
+          restoreError = "ZIP does not contain backup.json";
+          return;
+        }
+        const text = await entry.async("string");
+        jsonData = JSON.parse(text);
+      } else {
+        const text = await file.text();
+        jsonData = JSON.parse(text);
+      }
+      const err = validateBackup(jsonData);
+      if (err) {
+        restoreError = err;
+        return;
+      }
+      restorePreview = previewBackupData(jsonData);
+      restorePreview._raw = jsonData; // store for actual restore
+    } catch (err) {
+      restoreError = `Failed to parse file: ${err.message}`;
+    }
+  }
+
+  function handleRestorePaste() {
+    restoreError = "";
+    restorePreview = null;
+    restoreFile = null;
+    const text = restorePasteText.trim();
+    if (!text) {
+      restoreError = "Paste your backup JSON first";
+      return;
+    }
+    try {
+      const jsonData = JSON.parse(text);
+      const err = validateBackup(jsonData);
+      if (err) {
+        restoreError = err;
+        return;
+      }
+      restorePreview = previewBackupData(jsonData);
+      restorePreview._raw = jsonData;
+    } catch (err) {
+      restoreError = `Invalid JSON: ${err.message}`;
+    }
+  }
+
+  function executeRestore() {
+    if (!restorePreview?._raw) return;
+    restoreProcessing = true;
+    const data = restorePreview._raw;
+    try {
+      // 1. Connections
+      if (Array.isArray(data.connections)) {
+        localStorage.setItem("pd_connections", JSON.stringify(data.connections));
+      }
+      // 2. Local phones (merge: backup phones + existing — backup wins on conflict)
+      if (data.localPhones && typeof data.localPhones === "object") {
+        let existing = {};
+        try {
+          existing = JSON.parse(localStorage.getItem("pd_phones") || "{}");
+        } catch {}
+        const merged = { ...existing, ...data.localPhones };
+        localStorage.setItem("pd_phones", JSON.stringify(merged));
+      }
+      // 3. Discovery engine state
+      if (data.discoveryEngine && typeof data.discoveryEngine === "object") {
+        localStorage.setItem(
+          "device-number-discovery:engine",
+          JSON.stringify(data.discoveryEngine),
+        );
+      }
+      // 4. Used OTPs (merge)
+      if (Array.isArray(data.usedOtps)) {
+        let existing = [];
+        try {
+          existing = JSON.parse(localStorage.getItem("pd_used") || "[]");
+        } catch {}
+        const merged = [...new Set([...existing, ...data.usedOtps])];
+        localStorage.setItem("pd_used", JSON.stringify(merged));
+      }
+      // 5. Deleted devices (merge)
+      if (Array.isArray(data.deletedDevices)) {
+        let existing = [];
+        try {
+          existing = JSON.parse(localStorage.getItem("pd_deleted") || "[]");
+        } catch {}
+        const merged = [...new Set([...existing, ...data.deletedDevices])];
+        localStorage.setItem("pd_deleted", JSON.stringify(merged));
+      }
+      // 6. Settings
+      if (data.settings && typeof data.settings === "object") {
+        if (typeof data.settings.notifsEnabled === "boolean")
+          localStorage.setItem("pd_notifs_on", String(data.settings.notifsEnabled));
+        if (typeof data.settings.showNotifsTab === "boolean")
+          localStorage.setItem("pd_show_notifs_tab", String(data.settings.showNotifsTab));
+        if (typeof data.settings.autoOpenNotif === "boolean")
+          localStorage.setItem("pd_auto_open_notif", String(data.settings.autoOpenNotif));
+      }
+      toast("Backup restored! Reloading…", "success");
+      setTimeout(() => window.location.reload(), 800);
+    } catch (e) {
+      restoreError = `Restore failed: ${e.message}`;
+      restoreProcessing = false;
+    }
+  }
+
+  function closeRestoreModal() {
+    showRestoreModal = false;
+    restorePasteText = "";
+    restoreFile = null;
+    restorePreview = null;
+    restoreError = "";
+    restoreProcessing = false;
   }
 
   // ── Display phone: local override → Firebase mobNo → fallback ────────────
@@ -3546,6 +3820,104 @@
               <span class="aps-knob"></span>
             </button>
           </label>
+
+          <!-- ── Backup & Restore ── -->
+          <div class="aps-title" style="margin-top:14px">📦 Backup & Restore</div>
+          <div class="bkp-section">
+            <div class="bkp-desc">Export all Firebase connections, discovered numbers, and settings as a backup. Restore from a backup file after clearing cache.</div>
+            <div class="bkp-btns">
+              <button class="bkp-btn bkp-json" onclick={exportBackupJSON} title="Export full backup as JSON">
+                <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+                JSON
+              </button>
+              <button class="bkp-btn bkp-zip" onclick={exportBackupZIP} title="Export full backup as ZIP">
+                <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+                ZIP
+              </button>
+              <button class="bkp-btn bkp-restore" onclick={() => (showRestoreModal = true)} title="Restore from backup file">
+                <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 15v4a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
+                Restore
+              </button>
+            </div>
+          </div>
+        </div>
+      </div>
+    {/if}
+
+    <!-- ── Restore Modal ── -->
+    {#if showRestoreModal}
+      <!-- svelte-ignore a11y_no_static_element_interactions -->
+      <div class="restore-overlay" onclick={closeRestoreModal} onkeydown={(e) => e.key === 'Escape' && closeRestoreModal()}>
+        <!-- svelte-ignore a11y_no_static_element_interactions -->
+        <div class="restore-modal" onclick={(e) => e.stopPropagation()} onkeydown={(e) => e.stopPropagation()}>
+          <div class="rm-hdr">
+            <span class="rm-title">📤 Restore from Backup</span>
+            <button class="rm-close" onclick={closeRestoreModal} aria-label="Close">×</button>
+          </div>
+
+          <div class="rm-body">
+            <!-- File upload -->
+            <div class="rm-section">
+              <label class="rm-label">Upload .json or .zip file</label>
+              <input
+                type="file"
+                accept=".json,.zip"
+                class="rm-file-input"
+                onchange={handleRestoreFileSelect}
+              />
+            </div>
+
+            <!-- OR divider -->
+            <div class="rm-divider"><span>OR</span></div>
+
+            <!-- Paste JSON -->
+            <div class="rm-section">
+              <label class="rm-label">Paste backup JSON</label>
+              <textarea
+                class="rm-paste"
+                rows="5"
+                placeholder='Paste your backup JSON here...'
+                bind:value={restorePasteText}
+              ></textarea>
+              <button class="bkp-btn bkp-parse" onclick={handleRestorePaste} disabled={!restorePasteText.trim()}>
+                Parse JSON
+              </button>
+            </div>
+
+            <!-- Error -->
+            {#if restoreError}
+              <div class="rm-error">⚠ {restoreError}</div>
+            {/if}
+
+            <!-- Preview -->
+            {#if restorePreview}
+              <div class="rm-preview">
+                <div class="rm-preview-title">Backup Preview</div>
+                <div class="rm-preview-ts">Exported: {restorePreview.timestamp}</div>
+                <div class="rm-preview-grid">
+                  <div class="rm-stat"><span class="rm-stat-n">{restorePreview.connCount}</span><span class="rm-stat-l">Firebase DBs</span></div>
+                  <div class="rm-stat"><span class="rm-stat-n">{restorePreview.phoneCount}</span><span class="rm-stat-l">Phone Numbers</span></div>
+                  <div class="rm-stat"><span class="rm-stat-n">{restorePreview.discoveredCount}</span><span class="rm-stat-l">Discovered</span></div>
+                  <div class="rm-stat"><span class="rm-stat-n">{restorePreview.totalRecords}</span><span class="rm-stat-l">Total Records</span></div>
+                  <div class="rm-stat"><span class="rm-stat-n">{restorePreview.tomorrowCount}</span><span class="rm-stat-l">Try Tomorrow</span></div>
+                  <div class="rm-stat"><span class="rm-stat-n">{restorePreview.usedOtpCount}</span><span class="rm-stat-l">Used OTPs</span></div>
+                </div>
+                <div class="rm-preview-conns">Connections: {restorePreview.connNames}</div>
+                <div class="rm-warn">⚠ This will overwrite your current connections and discovery data. Phone numbers and OTPs are merged.</div>
+                <button
+                  class="bkp-btn bkp-confirm-restore"
+                  onclick={executeRestore}
+                  disabled={restoreProcessing}
+                >
+                  {#if restoreProcessing}
+                    <span class="dspin"></span> Restoring…
+                  {:else}
+                    ✅ Confirm Restore
+                  {/if}
+                </button>
+              </div>
+            {/if}
+          </div>
         </div>
       </div>
     {/if}
@@ -4865,12 +5237,12 @@
                 <div class="disc-row">
                   <div class="disc-row-top">
                     <button class="disc-devid" onclick={() => {
-                      try { navigator.clipboard.writeText(rec.deviceId); } catch {}
+                      copyText(rec.deviceId);
                       addToast(rec.deviceId.slice(0, 12) + '… copied', 'success');
                     }}>{rec.deviceId}</button>
                     <span class="disc-arrow">→</span>
                     <button class="disc-phone" onclick={() => {
-                      try { navigator.clipboard.writeText(rec.phoneNumber); } catch {}
+                      copyText(rec.phoneNumber);
                       addToast(rec.phoneNumber + ' copied', 'success');
                     }}>{rec.phoneNumber}</button>
                   </div>
@@ -10937,5 +11309,305 @@
   }
   .fc-card-tog-off .fct-knob {
     background: #ef4444;
+  }
+
+  /* ── Backup & Restore section ─────────────────────────────────────────── */
+  .bkp-section {
+    padding: 10px 0 4px;
+  }
+  .bkp-desc {
+    font-size: 11px;
+    color: #94a3b8;
+    line-height: 1.45;
+    margin-bottom: 10px;
+  }
+  .bkp-btns {
+    display: flex;
+    gap: 8px;
+    flex-wrap: wrap;
+  }
+  .bkp-btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    padding: 6px 12px;
+    border-radius: 8px;
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    background: rgba(255, 255, 255, 0.06);
+    color: #e2e8f0;
+    font-size: 11.5px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: all 150ms;
+  }
+  .bkp-btn:hover {
+    background: rgba(255, 255, 255, 0.12);
+    border-color: rgba(255, 255, 255, 0.2);
+  }
+  .bkp-btn:disabled {
+    opacity: 0.4;
+    cursor: not-allowed;
+  }
+  .bkp-json {
+    color: #38bdf8;
+    border-color: rgba(56, 189, 248, 0.25);
+  }
+  .bkp-json:hover {
+    background: rgba(56, 189, 248, 0.12);
+    border-color: rgba(56, 189, 248, 0.4);
+  }
+  .bkp-zip {
+    color: #a78bfa;
+    border-color: rgba(167, 139, 250, 0.25);
+  }
+  .bkp-zip:hover {
+    background: rgba(167, 139, 250, 0.12);
+    border-color: rgba(167, 139, 250, 0.4);
+  }
+  .bkp-restore {
+    color: #f97316;
+    border-color: rgba(249, 115, 22, 0.25);
+  }
+  .bkp-restore:hover {
+    background: rgba(249, 115, 22, 0.12);
+    border-color: rgba(249, 115, 22, 0.4);
+  }
+  .bkp-parse {
+    margin-top: 6px;
+    color: #38bdf8;
+    border-color: rgba(56, 189, 248, 0.25);
+  }
+  .bkp-parse:hover {
+    background: rgba(56, 189, 248, 0.12);
+  }
+  .bkp-confirm-restore {
+    margin-top: 10px;
+    width: 100%;
+    padding: 8px 14px;
+    color: #22c55e;
+    border-color: rgba(34, 197, 94, 0.35);
+    font-size: 13px;
+    justify-content: center;
+  }
+  .bkp-confirm-restore:hover {
+    background: rgba(34, 197, 94, 0.15);
+    border-color: rgba(34, 197, 94, 0.55);
+  }
+
+  /* ── Restore Modal ──────────────────────────────────────────────────────── */
+  .restore-overlay {
+    position: fixed;
+    inset: 0;
+    z-index: 10000;
+    background: rgba(0, 0, 0, 0.65);
+    backdrop-filter: blur(4px);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 20px;
+    animation: fadeIn 200ms ease;
+  }
+  @keyframes fadeIn {
+    from { opacity: 0; }
+    to { opacity: 1; }
+  }
+  .restore-modal {
+    background: #0f172a;
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    border-radius: 16px;
+    width: 100%;
+    max-width: 480px;
+    max-height: 85vh;
+    overflow-y: auto;
+    box-shadow: 0 25px 60px rgba(0, 0, 0, 0.5), 0 0 0 1px rgba(255, 255, 255, 0.06);
+    animation: modalSlide 250ms ease;
+  }
+  @keyframes modalSlide {
+    from { opacity: 0; transform: translateY(20px) scale(0.97); }
+    to { opacity: 1; transform: translateY(0) scale(1); }
+  }
+  .rm-hdr {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 14px 18px;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+    background: rgba(255, 255, 255, 0.03);
+  }
+  .rm-title {
+    font-size: 14px;
+    font-weight: 700;
+    color: #f1f5f9;
+  }
+  .rm-close {
+    width: 24px;
+    height: 24px;
+    border-radius: 50%;
+    border: none;
+    background: rgba(255, 255, 255, 0.08);
+    color: #94a3b8;
+    font-size: 14px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    cursor: pointer;
+    transition: all 120ms;
+  }
+  .rm-close:hover {
+    background: rgba(239, 68, 68, 0.3);
+    color: #f87171;
+  }
+  .rm-body {
+    padding: 16px 18px 20px;
+  }
+  .rm-section {
+    margin-bottom: 12px;
+  }
+  .rm-label {
+    display: block;
+    font-size: 11px;
+    font-weight: 600;
+    color: #94a3b8;
+    margin-bottom: 6px;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+  }
+  .rm-file-input {
+    width: 100%;
+    padding: 10px;
+    background: rgba(255, 255, 255, 0.04);
+    border: 1px dashed rgba(255, 255, 255, 0.15);
+    border-radius: 10px;
+    color: #e2e8f0;
+    font-size: 12px;
+    cursor: pointer;
+    transition: all 150ms;
+  }
+  .rm-file-input:hover {
+    border-color: rgba(249, 115, 22, 0.4);
+    background: rgba(249, 115, 22, 0.05);
+  }
+  .rm-file-input::file-selector-button {
+    background: rgba(249, 115, 22, 0.15);
+    border: 1px solid rgba(249, 115, 22, 0.3);
+    color: #f97316;
+    padding: 4px 10px;
+    border-radius: 6px;
+    font-size: 11px;
+    font-weight: 600;
+    cursor: pointer;
+    margin-right: 10px;
+  }
+  .rm-divider {
+    text-align: center;
+    position: relative;
+    margin: 14px 0;
+    color: #475569;
+    font-size: 11px;
+    font-weight: 600;
+  }
+  .rm-divider::before {
+    content: "";
+    position: absolute;
+    left: 0;
+    right: 0;
+    top: 50%;
+    height: 1px;
+    background: rgba(255, 255, 255, 0.08);
+  }
+  .rm-divider span {
+    background: #0f172a;
+    padding: 0 10px;
+    position: relative;
+  }
+  .rm-paste {
+    width: 100%;
+    padding: 10px;
+    background: rgba(255, 255, 255, 0.04);
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    border-radius: 10px;
+    color: #e2e8f0;
+    font-family: "JetBrains Mono", monospace;
+    font-size: 11px;
+    resize: vertical;
+    min-height: 60px;
+    outline: none;
+    transition: all 150ms;
+  }
+  .rm-paste:focus {
+    border-color: rgba(56, 189, 248, 0.5);
+    box-shadow: 0 0 0 2px rgba(56, 189, 248, 0.12);
+  }
+  .rm-paste::placeholder {
+    color: #475569;
+  }
+  .rm-error {
+    background: rgba(239, 68, 68, 0.1);
+    border: 1px solid rgba(239, 68, 68, 0.3);
+    border-radius: 8px;
+    padding: 8px 12px;
+    color: #f87171;
+    font-size: 12px;
+    margin-bottom: 12px;
+  }
+  .rm-preview {
+    background: rgba(34, 197, 94, 0.06);
+    border: 1px solid rgba(34, 197, 94, 0.2);
+    border-radius: 12px;
+    padding: 14px;
+  }
+  .rm-preview-title {
+    font-size: 13px;
+    font-weight: 700;
+    color: #22c55e;
+    margin-bottom: 4px;
+  }
+  .rm-preview-ts {
+    font-size: 10.5px;
+    color: #64748b;
+    margin-bottom: 10px;
+  }
+  .rm-preview-grid {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 8px;
+    margin-bottom: 10px;
+  }
+  .rm-stat {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 2px;
+    padding: 8px 4px;
+    background: rgba(255, 255, 255, 0.04);
+    border-radius: 8px;
+    border: 1px solid rgba(255, 255, 255, 0.06);
+  }
+  .rm-stat-n {
+    font-size: 18px;
+    font-weight: 800;
+    color: #f1f5f9;
+    font-family: "JetBrains Mono", monospace;
+  }
+  .rm-stat-l {
+    font-size: 9.5px;
+    color: #94a3b8;
+    text-transform: uppercase;
+    letter-spacing: 0.4px;
+    font-weight: 500;
+  }
+  .rm-preview-conns {
+    font-size: 11px;
+    color: #cbd5e1;
+    word-break: break-word;
+    margin-bottom: 8px;
+  }
+  .rm-warn {
+    font-size: 11px;
+    color: #fbbf24;
+    background: rgba(251, 191, 36, 0.08);
+    border-radius: 6px;
+    padding: 6px 10px;
+    margin-bottom: 4px;
   }
 </style>

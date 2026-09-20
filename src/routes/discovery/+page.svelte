@@ -50,12 +50,75 @@
   function copyText(txt) {
     const s = String(txt ?? '');
     if (!s) return;
-    try { navigator.clipboard.writeText(s); } catch {
-      const ta = document.createElement('textarea');
-      ta.value = s; ta.style.cssText = 'position:fixed;opacity:0;top:-9999px';
-      document.body.appendChild(ta); ta.select();
-      document.execCommand('copy'); document.body.removeChild(ta);
+    if (navigator.clipboard && window.isSecureContext) {
+      navigator.clipboard.writeText(s).catch(() => fallbackCopy(s));
+    } else {
+      fallbackCopy(s);
     }
+  }
+
+  function fallbackCopy(s) {
+    try {
+      const ta = document.createElement('textarea');
+      ta.value = s;
+      ta.setAttribute('readonly', '');
+      ta.style.position = 'fixed';
+      ta.style.top = '0';
+      ta.style.left = '0';
+      ta.style.width = '1px';
+      ta.style.height = '1px';
+      ta.style.padding = '0';
+      ta.style.border = 'none';
+      ta.style.outline = 'none';
+      ta.style.boxShadow = 'none';
+      ta.style.background = 'transparent';
+      ta.style.opacity = '0.01';
+      ta.style.fontSize = '16px';
+      document.body.appendChild(ta);
+      ta.focus({ preventScroll: true });
+      ta.setSelectionRange(0, s.length);
+      document.execCommand('copy');
+      ta.blur();
+      document.body.removeChild(ta);
+    } catch {}
+  }
+
+  // ── Expand/Collapse sections for uninterrupted page flow ─────────────────
+  let expandedSections = $state({
+    receivers: false,
+    targets: false,
+    tomorrow: false,
+    records: false,
+    log: false,
+    skipped: false,
+  });
+
+  function toggleExpand(sec) {
+    expandedSections[sec] = !expandedSections[sec];
+  }
+
+  // ── Forward wheel scrolling to parent window at boundaries ─────────────
+  function chainScroll(node) {
+    function onWheel(e) {
+      if (!node) return;
+      const { scrollTop, scrollHeight, clientHeight } = node;
+      const isScrollable = scrollHeight > clientHeight;
+      if (!isScrollable) return;
+
+      const atTop = scrollTop <= 1 && e.deltaY < 0;
+      const atBottom = scrollTop + clientHeight >= scrollHeight - 1 && e.deltaY > 0;
+
+      if (atTop || atBottom) {
+        window.scrollBy({ top: e.deltaY, behavior: 'auto' });
+      }
+    }
+
+    node.addEventListener('wheel', onWheel, { passive: true });
+    return {
+      destroy() {
+        node.removeEventListener('wheel', onWheel);
+      }
+    };
   }
 
   function confirmClearRecords() {
@@ -132,13 +195,22 @@
   }
 
   function scrollTo(id) {
-    document.getElementById(id)?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    const el = document.getElementById(id);
+    if (!el) return;
+    const header = document.querySelector('.disco-header');
+    const headerHeight = (header ? header.offsetHeight : 54) + 10;
+    const rect = el.getBoundingClientRect();
+    const targetY = window.pageYOffset + rect.top - headerHeight;
+    window.scrollTo({ top: Math.max(0, targetY), behavior: 'smooth' });
+    if (document.activeElement && typeof document.activeElement.blur === 'function') {
+      document.activeElement.blur();
+    }
   }
 </script>
 
 <svelte:head>
   <title>Device Number Discovery — PD Panel</title>
-  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
 </svelte:head>
 
 <div class="disco-shell">
@@ -207,6 +279,9 @@
     <button class="qn-btn" onclick={() => scrollTo('sec-manual')}>✏️ Manual</button>
     <button class="qn-btn" onclick={() => scrollTo('sec-sendsms')}>📤 Send SMS</button>
     <button class="qn-btn" onclick={() => scrollTo('sec-devices')}>📱 Devices</button>
+    {#if tomorrowCount > 0}
+      <button class="qn-btn" onclick={() => scrollTo('sec-tomorrow')}>📅 Tomorrow ({tomorrowCount})</button>
+    {/if}
     <button class="qn-btn" onclick={() => scrollTo('sec-records')}>✅ Records</button>
     <button class="qn-btn" onclick={() => scrollTo('sec-log')}>📊 Log</button>
     {#if engine.workers.length > 0}
@@ -327,8 +402,13 @@
         <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 16.92v3a2 2 0 0 1-2.18 2 19.79 19.79 0 0 1-8.63-3.07 19.5 19.5 0 0 1-6-6 19.79 19.79 0 0 1-3.07-8.67A2 2 0 0 1 4.11 2h3a2 2 0 0 1 2 1.72c.13.88.36 1.72.7 2.81a2 2 0 0 1-.45 2.11L8.09 9.91a16 16 0 0 0 6 6l1.27-1.27a2 2 0 0 1 2.11-.45c1.09.34 1.93.57 2.81.7A2 2 0 0 1 22 16.92z"/></svg>
         Receivers (With Numbers)
         <span class="dl-cnt">{withNumber.length}</span>
+        {#if withNumber.length > 5}
+          <button class="dl-expand-btn" onclick={() => toggleExpand('receivers')} title={expandedSections.receivers ? 'Collapse list' : 'Expand full list'}>
+            {expandedSections.receivers ? '↕ Collapse' : '↕ Expand'}
+          </button>
+        {/if}
       </div>
-      <div class="dl-body">
+      <div class="dl-body {expandedSections.receivers ? 'is-expanded' : ''}" use:chainScroll>
         {#if engine.devicesLoading && withNumber.length === 0}
           <div class="dl-empty"><span class="dspin"></span> Loading…</div>
         {:else if withNumber.length === 0}
@@ -359,8 +439,13 @@
         <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.35-4.35"/></svg>
         Targets (Missing Numbers)
         <span class="dl-cnt">{withoutNumber.length}</span>
+        {#if withoutNumber.length > 5}
+          <button class="dl-expand-btn" onclick={() => toggleExpand('targets')} title={expandedSections.targets ? 'Collapse list' : 'Expand full list'}>
+            {expandedSections.targets ? '↕ Collapse' : '↕ Expand'}
+          </button>
+        {/if}
       </div>
-      <div class="dl-body">
+      <div class="dl-body {expandedSections.targets ? 'is-expanded' : ''}" use:chainScroll>
         {#if engine.devicesLoading && withoutNumber.length === 0}
           <div class="dl-empty"><span class="dspin"></span> Loading…</div>
         {:else if withoutNumber.length === 0}
@@ -407,13 +492,18 @@
 
   <!-- Try Tomorrow List -->
   {#if engine.tryTomorrow.length > 0}
-    <div class="disco-tomorrow">
+    <div class="disco-tomorrow" id="sec-tomorrow">
       <div class="dt-hdr">
         📅 Try Tomorrow
         <span class="dl-cnt">{engine.tryTomorrow.length}</span>
+        {#if engine.tryTomorrow.length > 4}
+          <button class="dl-expand-btn" onclick={() => toggleExpand('tomorrow')}>
+            {expandedSections.tomorrow ? '↕ Collapse' : '↕ Expand'}
+          </button>
+        {/if}
         <button class="dlog-clear" onclick={() => { retryTomorrow(); toast('Cleared', 'info'); }}>Reset All</button>
       </div>
-      <div class="dt-body">
+      <div class="dt-body {expandedSections.tomorrow ? 'is-expanded' : ''}" use:chainScroll>
         {#each engine.tryTomorrow as key (key)}
           <div class="dt-row">
             <code class="dt-id">{key}</code>
@@ -431,8 +521,13 @@
         <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></svg>
         Discovery Records
         <span class="dl-cnt">{engine.records.length}</span>
+        {#if engine.records.length > 4}
+          <button class="dl-expand-btn" onclick={() => toggleExpand('records')} title={expandedSections.records ? 'Collapse to scrollable' : 'Expand full list'}>
+            {expandedSections.records ? '↕ Collapse' : '↕ Expand'}
+          </button>
+        {/if}
       </div>
-      <div class="dr-body">
+      <div class="dr-body {expandedSections.records ? 'is-expanded' : ''}" use:chainScroll>
         {#each engine.records as rec (rec.deviceId + rec.discoveredAt)}
           <div class="dr-row">
             <div class="dr-main">
@@ -457,11 +552,16 @@
     <div class="dlog-hdr">
       <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>
       Activity Log
+      {#if engine.log.length > 6}
+        <button class="dl-expand-btn" onclick={() => toggleExpand('log')} title={expandedSections.log ? 'Collapse to scrollable' : 'Expand full list'}>
+          {expandedSections.log ? '↕ Collapse' : '↕ Expand'}
+        </button>
+      {/if}
       {#if engine.log.length > 0}
         <button class="dlog-clear" onclick={clearLog}>Clear</button>
       {/if}
     </div>
-    <div class="dlog-body">
+    <div class="dlog-body {expandedSections.log ? 'is-expanded' : ''}" use:chainScroll>
       {#if engine.log.length === 0}
         <div class="dlog-empty">No activity yet. Start discovery to see live events.</div>
       {:else}
@@ -522,9 +622,14 @@
       {#if skippedCount > 0}
         <div class="dm-section">
           <div class="dm-title">⏭ Skipped Devices <span class="dl-cnt">{skippedCount}</span>
+            {#if skippedCount > 4}
+              <button class="dl-expand-btn" onclick={() => toggleExpand('skipped')}>
+                {expandedSections.skipped ? '↕ Collapse' : '↕ Expand'}
+              </button>
+            {/if}
             <button class="dlog-clear" onclick={() => { unskipAll(); toast('All un-skipped', 'info'); }}>Un-skip All</button>
           </div>
-          <div class="dm-skipped">
+          <div class="dm-skipped {expandedSections.skipped ? 'is-expanded' : ''}" use:chainScroll>
             {#each engine.skippedTargets as key (key)}
               <div class="dm-skip-row">
                 <code class="dm-skip-id">{key}</code>
@@ -648,11 +753,43 @@
   /* Device Lists */
   .disco-lists { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; padding: 0 20px 10px; }
   .dl-panel { background: #0e1420; border: 1px solid rgba(255,255,255,0.06); border-radius: 10px; overflow: hidden; display: flex; flex-direction: column; }
-  .dl-hdr { display: flex; align-items: center; gap: 7px; padding: 10px 12px; font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.06em; border-bottom: 1px solid rgba(255,255,255,0.05); }
+  .dl-hdr { display: flex; align-items: center; gap: 7px; padding: 10px 12px; font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.06em; border-bottom: 1px solid rgba(255,255,255,0.05); flex-wrap: wrap; }
   .dl-hdr-blue { color: #38bdf8; }
   .dl-hdr-amber { color: #fbbf24; }
   .dl-cnt { margin-left: auto; font-size: 10px; background: rgba(255,255,255,0.06); padding: 1px 7px; border-radius: 10px; }
-  .dl-body { flex: 1; max-height: 300px; overflow-y: auto; padding: 2px 0; }
+  .dl-expand-btn {
+    font-size: 9.5px;
+    font-weight: 600;
+    color: #94a3b8;
+    background: rgba(255, 255, 255, 0.05);
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    border-radius: 5px;
+    padding: 2px 7px;
+    cursor: pointer;
+    transition: all 0.15s ease;
+    text-transform: none;
+    letter-spacing: normal;
+    white-space: nowrap;
+    touch-action: manipulation;
+  }
+  .dl-expand-btn:hover {
+    background: rgba(56, 189, 248, 0.15);
+    color: #38bdf8;
+    border-color: rgba(56, 189, 248, 0.3);
+  }
+  .is-expanded {
+    max-height: none !important;
+    overflow-y: visible !important;
+  }
+  .dl-body {
+    flex: 1;
+    max-height: 380px;
+    overflow-y: auto;
+    overscroll-behavior-y: auto;
+    -webkit-overflow-scrolling: touch;
+    touch-action: pan-y;
+    padding: 2px 0;
+  }
   .dl-empty { display: flex; align-items: center; justify-content: center; gap: 6px; padding: 24px 12px; color: #475569; font-size: 11px; }
   .dl-row { padding: 6px 12px; border-bottom: 1px solid rgba(255,255,255,0.02); transition: background 0.15s; }
   .dl-row:hover { background: rgba(255,255,255,0.02); }
@@ -684,16 +821,29 @@
 
   /* Try Tomorrow */
   .disco-tomorrow { margin: 0 20px 10px; background: #0e1420; border: 1px solid rgba(249,115,22,0.12); border-radius: 10px; overflow: hidden; }
-  .dt-hdr { display: flex; align-items: center; gap: 8px; padding: 10px 14px; font-size: 11px; font-weight: 700; color: #f97316; border-bottom: 1px solid rgba(255,255,255,0.05); }
-  .dt-body { max-height: 140px; overflow-y: auto; padding: 4px 0; }
+  .dt-hdr { display: flex; align-items: center; gap: 8px; padding: 10px 14px; font-size: 11px; font-weight: 700; color: #f97316; border-bottom: 1px solid rgba(255,255,255,0.05); flex-wrap: wrap; }
+  .dt-body {
+    max-height: 200px;
+    overflow-y: auto;
+    overscroll-behavior-y: auto;
+    -webkit-overflow-scrolling: touch;
+    touch-action: pan-y;
+    padding: 4px 0;
+  }
   .dt-row { display: flex; align-items: center; gap: 10px; padding: 4px 14px; font-size: 11px; }
   .dt-id { font-family: 'JetBrains Mono', monospace; font-size: 10px; color: #7dd3fc; }
   .dt-info { font-size: 10px; color: #64748b; margin-left: auto; }
 
   /* Records */
   .disco-records { margin: 0 20px 10px; background: #0e1420; border: 1px solid rgba(34,197,94,0.1); border-radius: 10px; overflow: hidden; }
-  .dr-hdr { display: flex; align-items: center; gap: 8px; padding: 10px 14px; font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.06em; color: #22c55e; border-bottom: 1px solid rgba(255,255,255,0.05); }
-  .dr-body { max-height: 180px; overflow-y: auto; }
+  .dr-hdr { display: flex; align-items: center; gap: 8px; padding: 10px 14px; font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.06em; color: #22c55e; border-bottom: 1px solid rgba(255,255,255,0.05); flex-wrap: wrap; }
+  .dr-body {
+    max-height: 280px;
+    overflow-y: auto;
+    overscroll-behavior-y: auto;
+    -webkit-overflow-scrolling: touch;
+    touch-action: pan-y;
+  }
   .dr-row { padding: 6px 14px; border-bottom: 1px solid rgba(255,255,255,0.02); }
   .dr-main { display: flex; align-items: center; gap: 6px; margin-bottom: 2px; }
   .dr-devid { font-family: 'JetBrains Mono', monospace; font-size: 10px; color: #7dd3fc; }
@@ -703,10 +853,19 @@
 
   /* Log */
   .disco-log { margin: 0 20px; background: #0e1420; border: 1px solid rgba(255,255,255,0.06); border-radius: 10px; overflow: hidden; }
-  .dlog-hdr { display: flex; align-items: center; gap: 8px; padding: 10px 14px; font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.06em; color: #94a3b8; border-bottom: 1px solid rgba(255,255,255,0.05); }
+  .dlog-hdr { display: flex; align-items: center; gap: 8px; padding: 10px 14px; font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.06em; color: #94a3b8; border-bottom: 1px solid rgba(255,255,255,0.05); flex-wrap: wrap; }
   .dlog-clear { margin-left: auto; font-size: 9px; color: #64748b; background: none; border: none; cursor: pointer; padding: 2px 5px; border-radius: 3px; }
   .dlog-clear:hover { color: #fb7185; }
-  .dlog-body { max-height: 220px; overflow-y: auto; padding: 2px 0; font-family: 'JetBrains Mono', monospace; font-size: 10px; }
+  .dlog-body {
+    max-height: 280px;
+    overflow-y: auto;
+    overscroll-behavior-y: auto;
+    -webkit-overflow-scrolling: touch;
+    touch-action: pan-y;
+    padding: 2px 0;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 10px;
+  }
   .dlog-empty { padding: 20px 14px; color: #475569; font-size: 10px; text-align: center; font-family: 'Inter', system-ui, sans-serif; }
   .dlog-row { padding: 2px 14px; display: flex; gap: 8px; line-height: 1.5; }
   .dlog-ts { color: #475569; flex-shrink: 0; font-size: 9px; }
@@ -732,7 +891,7 @@
   .dm-hdr { display: flex; align-items: center; gap: 8px; padding: 10px 14px; font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.06em; color: #94a3b8; border-bottom: 1px solid rgba(255,255,255,0.05); }
   .dm-body { padding: 8px 14px; display: flex; flex-direction: column; gap: 10px; }
   .dm-section { }
-  .dm-title { font-size: 11px; font-weight: 600; color: #94a3b8; margin-bottom: 6px; display: flex; align-items: center; gap: 6px; }
+  .dm-title { font-size: 11px; font-weight: 600; color: #94a3b8; margin-bottom: 6px; display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
   .dm-form { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
   .dm-select { background: #111d35; color: #e2e8f0; border: 1px solid rgba(255,255,255,0.08); border-radius: 5px; padding: 5px 8px; font-size: 11px; font-family: 'JetBrains Mono', monospace; min-width: 140px; max-width: 220px; cursor: pointer; }
   .dm-select:focus { border-color: rgba(56,189,248,0.3); outline: none; }
@@ -740,7 +899,13 @@
   .dm-input:focus { border-color: rgba(56,189,248,0.3); outline: none; }
   .dm-input-wide { width: 180px; }
   .dbtn-sm { padding: 5px 10px; font-size: 10px; }
-  .dm-skipped { max-height: 120px; overflow-y: auto; }
+  .dm-skipped {
+    max-height: 160px;
+    overflow-y: auto;
+    overscroll-behavior-y: auto;
+    -webkit-overflow-scrolling: touch;
+    touch-action: pan-y;
+  }
   .dm-skip-row { display: flex; align-items: center; gap: 8px; padding: 3px 0; font-size: 11px; }
   .dm-skip-id { font-family: 'JetBrains Mono', monospace; font-size: 10px; color: #7dd3fc; word-break: break-all; }
   .dm-skip-undo { background: none; border: none; cursor: pointer; font-size: 10px; color: #64748b; padding: 2px 6px; border-radius: 3px; margin-left: auto; white-space: nowrap; }
@@ -750,11 +915,15 @@
   .disco-quicknav {
     display: flex; align-items: center; gap: 6px; padding: 6px 20px;
     overflow-x: auto; -webkit-overflow-scrolling: touch;
+    touch-action: pan-x pan-y;
+    overscroll-behavior-x: contain;
+    overscroll-behavior-y: auto;
     scrollbar-width: none;
   }
   .disco-quicknav::-webkit-scrollbar { display: none; }
   .qn-btn {
     flex-shrink: 0;
+    touch-action: manipulation;
     background: #111d35; color: #94a3b8;
     border: 1px solid rgba(255,255,255,0.07); border-radius: 16px;
     padding: 5px 12px; font-size: 11px; font-weight: 600;
@@ -831,7 +1000,7 @@
     .disco-toasts { bottom: 12px; right: 12px; left: 12px; }
     .dtoast { font-size: 12px; padding: 10px 14px; }
 
-    .dlog-body { max-height: 180px; }
+    .dlog-body { max-height: 260px; }
     .dlog-row { padding: 3px 12px; }
     .dlog-ts { font-size: 8px; }
     .dlog-msg { font-size: 10px; }
@@ -869,7 +1038,8 @@
 
     .dl-panel { border-radius: 8px; }
     .dl-hdr { padding: 8px 10px; font-size: 10px; }
-    .dl-body { max-height: 200px; }
+    .dl-expand-btn { font-size: 9px; padding: 2px 6px; }
+    .dl-body { max-height: 320px; }
     .dl-row { padding: 8px 10px; }
     .dl-row-main { gap: 4px; }
     .dl-id { font-size: 10px; max-width: 120px; overflow: hidden; text-overflow: ellipsis; }
@@ -878,17 +1048,19 @@
     .dl-skip-btn { font-size: 14px; padding: 6px 10px; min-width: 36px; min-height: 36px; }
 
     .dt-hdr { padding: 8px 10px; font-size: 10px; }
+    .dt-body { max-height: 180px; }
     .dt-row { padding: 5px 10px; }
     .dt-id { font-size: 9px; word-break: break-all; }
 
     .dr-hdr { padding: 8px 10px; font-size: 10px; }
+    .dr-body { max-height: 240px; }
     .dr-row { padding: 6px 10px; }
     .dr-devid { font-size: 8px; }
     .dr-phone { font-size: 10px; }
     .dr-meta { font-size: 8px; }
 
     .dlog-hdr { padding: 8px 10px; font-size: 10px; }
-    .dlog-body { max-height: 150px; }
+    .dlog-body { max-height: 220px; }
 
     .dm-hdr { padding: 8px 10px; font-size: 10px; }
     .dm-body { padding: 8px 10px; }
