@@ -332,19 +332,29 @@
     setDevicePage(0);
   });
 
-  // ── Notification panel drag (mouse + touch via pointer events) ────────────
+  // ── Notification panel drag & resize (mouse + touch via pointer events) ───
   let notifPanelPos = $state({ x: 0, y: 0 }); // offset from default anchor
+  let notifPanelWidth = $state(360); // custom width in px (min 300, max min(950, window width))
+  let notifPanelHeight = $state(null); // custom height in px (null = auto)
   let _ndDragging = $state(false);
   let _ndStart = { cx: 0, cy: 0, px: 0, py: 0 };
 
+  let _nrResizing = $state(false);
+  let _nrType = null; // 'left' | 'bottom' | 'bl' | 'br'
+  let _nrStart = { cx: 0, cy: 0, w: 360, h: 420 };
+  let bellPanelEl = $state(null);
+
   function notifPanelDragStart(e) {
+    // Ignore drag start on buttons, actions, or resize grips
+    if (e.target.closest("button, a, input, select, textarea, [role='button'], .bp-actions, .bp-resize-edge, .bp-resize-corner")) return;
     if (e.button !== undefined && e.button !== 0) return; // left click only
     _ndDragging = true;
     const cx = e.clientX ?? e.touches?.[0]?.clientX ?? 0;
     const cy = e.clientY ?? e.touches?.[0]?.clientY ?? 0;
     _ndStart = { cx, cy, px: notifPanelPos.x, py: notifPanelPos.y };
-    e.currentTarget.setPointerCapture?.(e.pointerId);
-    e.preventDefault();
+    try {
+      e.currentTarget.setPointerCapture?.(e.pointerId);
+    } catch {}
   }
   function notifPanelDragMove(e) {
     if (!_ndDragging) return;
@@ -355,8 +365,81 @@
       y: _ndStart.py + (cy - _ndStart.cy),
     };
   }
-  function notifPanelDragEnd() {
-    _ndDragging = false;
+  function notifPanelDragEnd(e) {
+    if (_ndDragging) {
+      _ndDragging = false;
+      try {
+        e?.currentTarget?.releasePointerCapture?.(e.pointerId);
+      } catch {}
+    }
+  }
+
+  function notifResizeStart(type, e) {
+    if (e.button !== undefined && e.button !== 0) return;
+    e.stopPropagation();
+    _nrResizing = true;
+    _nrType = type;
+    const cx = e.clientX ?? e.touches?.[0]?.clientX ?? 0;
+    const cy = e.clientY ?? e.touches?.[0]?.clientY ?? 0;
+    const rect = bellPanelEl?.getBoundingClientRect();
+    _nrStart = {
+      cx,
+      cy,
+      w: rect?.width ? Math.round(rect.width) : notifPanelWidth,
+      h: rect?.height ? Math.round(rect.height) : (notifPanelHeight || 420),
+    };
+    try {
+      e.currentTarget.setPointerCapture?.(e.pointerId);
+    } catch {}
+  }
+
+  function notifResizeMove(e) {
+    if (!_nrResizing) return;
+    e.stopPropagation();
+    const cx = e.clientX ?? e.touches?.[0]?.clientX ?? 0;
+    const cy = e.clientY ?? e.touches?.[0]?.clientY ?? 0;
+    const maxW = typeof window !== "undefined" ? Math.max(300, window.innerWidth - 24) : 950;
+    const maxH = typeof window !== "undefined" ? Math.max(200, window.innerHeight - 70) : 800;
+
+    if (_nrType === "left" || _nrType === "bl") {
+      const deltaW = _nrStart.cx - cx;
+      notifPanelWidth = Math.round(Math.max(300, Math.min(maxW, _nrStart.w + deltaW)));
+    } else if (_nrType === "br") {
+      const deltaW = cx - _nrStart.cx;
+      notifPanelWidth = Math.round(Math.max(300, Math.min(maxW, _nrStart.w + deltaW)));
+    }
+
+    if (_nrType === "bottom" || _nrType === "bl" || _nrType === "br") {
+      const deltaH = cy - _nrStart.cy;
+      notifPanelHeight = Math.round(Math.max(200, Math.min(maxH, _nrStart.h + deltaH)));
+    }
+  }
+
+  function notifResizeEnd(e) {
+    if (_nrResizing) {
+      _nrResizing = false;
+      _nrType = null;
+      try {
+        e?.currentTarget?.releasePointerCapture?.(e.pointerId);
+      } catch {}
+      try {
+        localStorage.setItem("pd_notif_panel_w", String(notifPanelWidth));
+        if (notifPanelHeight) {
+          localStorage.setItem("pd_notif_panel_h", String(notifPanelHeight));
+        }
+      } catch {}
+    }
+  }
+
+  function resetNotifPanelSize() {
+    notifPanelWidth = 360;
+    notifPanelHeight = null;
+    notifPanelPos = { x: 0, y: 0 };
+    try {
+      localStorage.removeItem("pd_notif_panel_w");
+      localStorage.removeItem("pd_notif_panel_h");
+    } catch {}
+    toast("Notification panel size reset", "info");
   }
 
   // ── Raw ──────────────────────────────────────────────────────────────────
@@ -510,10 +593,14 @@
   }
 
   function clearAllNotifs() {
+    const count = notifications.length;
     notifTimers.forEach((t) => clearTimeout(t));
     notifTimers.clear();
     notifications = [];
     notifExpanded = false;
+    if (count > 0) {
+      toast(`Cleared ${count} notification${count === 1 ? "" : "s"}`, "info");
+    }
   }
 
   function clearAllNotifsConfirm() {
@@ -798,6 +885,13 @@
     } catch {}
     try {
       autoOpenNotif = localStorage.getItem("pd_auto_open_notif") === "true";
+    } catch {}
+    // Restore resized notification panel dimensions
+    try {
+      const savedW = parseInt(localStorage.getItem("pd_notif_panel_w"), 10);
+      if (savedW && savedW >= 300 && savedW <= 1400) notifPanelWidth = savedW;
+      const savedH = parseInt(localStorage.getItem("pd_notif_panel_h"), 10);
+      if (savedH && savedH >= 200 && savedH <= 2500) notifPanelHeight = savedH;
     } catch {}
     // Restore seen notification IDs so refresh doesn't re-trigger same messages
     try {
@@ -2424,9 +2518,75 @@
     <!-- ══ FLOATING NOTIFICATION PANEL ════════════════════════════════════ -->
     {#if showBellPanel}
       <div
-        class="bell-panel"
-        style="transform:translate({notifPanelPos.x}px,{notifPanelPos.y}px)"
+        bind:this={bellPanelEl}
+        class="bell-panel {_nrResizing ? 'bp-resizing' : ''} {_ndDragging ? 'bp-dragging' : ''}"
+        style="transform:translate({notifPanelPos.x}px,{notifPanelPos.y}px); width:{notifPanelWidth}px; {notifPanelHeight ? `height:${notifPanelHeight}px;` : ''}"
       >
+        <!-- Large screen resize handle: Left border -->
+        <div
+          class="bp-resize-edge bp-resize-left"
+          role="separator"
+          tabindex="-1"
+          onpointerdown={(e) => notifResizeStart('left', e)}
+          onpointermove={notifResizeMove}
+          onpointerup={notifResizeEnd}
+          onpointercancel={notifResizeEnd}
+          ondblclick={resetNotifPanelSize}
+          title="Drag to resize width · Double-click to reset"
+          aria-hidden="true"
+        ></div>
+
+        <!-- Large screen resize handle: Bottom border -->
+        <div
+          class="bp-resize-edge bp-resize-bottom"
+          role="separator"
+          tabindex="-1"
+          onpointerdown={(e) => notifResizeStart('bottom', e)}
+          onpointermove={notifResizeMove}
+          onpointerup={notifResizeEnd}
+          onpointercancel={notifResizeEnd}
+          ondblclick={resetNotifPanelSize}
+          title="Drag to resize height · Double-click to reset"
+          aria-hidden="true"
+        ></div>
+
+        <!-- Large screen resize handle: Bottom-left corner -->
+        <div
+          class="bp-resize-corner bp-resize-bl"
+          role="separator"
+          tabindex="-1"
+          onpointerdown={(e) => notifResizeStart('bl', e)}
+          onpointermove={notifResizeMove}
+          onpointerup={notifResizeEnd}
+          onpointercancel={notifResizeEnd}
+          ondblclick={resetNotifPanelSize}
+          title="Drag to resize width & height · Double-click to reset"
+          aria-hidden="true"
+        ></div>
+
+        <!-- Large screen resize handle: Bottom-right corner with visual grip dots -->
+        <div
+          class="bp-resize-corner bp-resize-br"
+          role="separator"
+          tabindex="-1"
+          onpointerdown={(e) => notifResizeStart('br', e)}
+          onpointermove={notifResizeMove}
+          onpointerup={notifResizeEnd}
+          onpointercancel={notifResizeEnd}
+          ondblclick={resetNotifPanelSize}
+          title="Drag to resize · Double-click to reset"
+          aria-hidden="true"
+        >
+          <svg width="10" height="10" viewBox="0 0 10 10" fill="none" class="bp-grip-icon">
+            <circle cx="8" cy="8" r="1" fill="currentColor" />
+            <circle cx="8" cy="5" r="1" fill="currentColor" />
+            <circle cx="8" cy="2" r="1" fill="currentColor" />
+            <circle cx="5" cy="8" r="1" fill="currentColor" />
+            <circle cx="5" cy="5" r="1" fill="currentColor" />
+            <circle cx="2" cy="8" r="1" fill="currentColor" />
+          </svg>
+        </div>
+
         <!-- Draggable panel header -->
         <div
           class="bp-hdr bp-drag-handle"
@@ -2437,6 +2597,7 @@
           onpointermove={notifPanelDragMove}
           onpointerup={notifPanelDragEnd}
           onpointercancel={notifPanelDragEnd}
+          ondblclick={resetNotifPanelSize}
           style="cursor:{_ndDragging
             ? 'grabbing'
             : 'grab'};touch-action:none;user-select:none"
@@ -2446,11 +2607,14 @@
                 >({notifications.length})</span
               >{/if}</span
           >
-          <div class="bp-actions">
+          <div class="bp-actions" role="toolbar" tabindex="-1" aria-label="Notification actions" onpointerdown={(e) => e.stopPropagation()}>
             <!-- Mute toggle -->
             <button
               class="bp-icon-btn {!notifsEnabled ? 'bp-muted' : ''}"
-              onclick={toggleNotifsEnabled}
+              onclick={(e) => {
+                e.stopPropagation();
+                toggleNotifsEnabled();
+              }}
               title={notifsEnabled ? "Mute" : "Unmute"}
               aria-label="Toggle mute"
             >
@@ -2480,12 +2644,39 @@
                 >
               {/if}
             </button>
+            <!-- Reset size/position button if custom size or position -->
+            {#if notifPanelWidth !== 360 || notifPanelHeight !== null || notifPanelPos.x !== 0 || notifPanelPos.y !== 0}
+              <button
+                class="bp-icon-btn"
+                onclick={(e) => {
+                  e.stopPropagation();
+                  resetNotifPanelSize();
+                }}
+                title="Reset panel size and position"
+                aria-label="Reset panel size and position"
+              >
+                <svg
+                  width="12"
+                  height="12"
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  stroke-width="2"
+                  ><path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8" /><path
+                    d="M3 3v5h5"
+                  /></svg
+                >
+              </button>
+            {/if}
             <!-- Clear all -->
             {#if notifications.length > 0}
               <button
-                class="bp-icon-btn"
-                onclick={clearAllNotifs}
-                title="Clear all"
+                class="bp-icon-btn bp-clear-btn"
+                onclick={(e) => {
+                  e.stopPropagation();
+                  clearAllNotifs();
+                }}
+                title="Clear all notifications"
                 aria-label="Clear all notifications"
               >
                 <svg
@@ -2501,10 +2692,14 @@
                 >
               </button>
             {/if}
-            <!-- Collapse -->
+            <!-- Collapse / Close cross button -->
             <button
-              class="bp-icon-btn"
-              onclick={() => (showBellPanel = false)}
+              class="bp-icon-btn bp-close-btn"
+              onclick={(e) => {
+                e.stopPropagation();
+                showBellPanel = false;
+              }}
+              title="Close panel"
               aria-label="Close"
             >
               <svg
@@ -2533,7 +2728,7 @@
             {#each notifications as n (n.id)}
               {@const msgFull = n.message ?? ""}
               {@const msgShort =
-                msgFull.slice(0, 55) + (msgFull.length > 55 ? "…" : "")}
+                msgFull.length > 120 ? msgFull.slice(0, 120) + "…" : msgFull}
               <div class="bp-card {n.leaving ? 'nleave' : ''}">
                 <!-- Row 1: App icon + sender + OTP label + time + dismiss -->
                 <div class="bp-card-top">
@@ -2564,7 +2759,11 @@
                   <span class="bp-time">{toIST(n.ts)}</span>
                   <button
                     class="n-close"
-                    onclick={() => dismissNotif(n.id)}
+                    onclick={(e) => {
+                      e.stopPropagation();
+                      dismissNotif(n.id);
+                    }}
+                    title="Dismiss notification"
                     aria-label="Dismiss">×</button
                   >
                 </div>
@@ -6526,12 +6725,17 @@
       left: 8px !important;
       right: 8px !important;
       width: auto !important;
+      height: auto !important;
       max-width: calc(100vw - 16px) !important;
       max-height: calc(100vh - 125px) !important;
       max-height: calc(100dvh - 125px) !important;
       transform: none !important;
       z-index: 250 !important;
       border-radius: 16px !important;
+    }
+    .bp-resize-edge,
+    .bp-resize-corner {
+      display: none !important;
     }
 
     /* Compact sidebar controls */
@@ -6713,15 +6917,17 @@
     }
   }
   .n-close {
-    width: 17px;
-    height: 17px;
+    width: 22px;
+    height: 22px;
+    min-width: 22px;
+    min-height: 22px;
     border-radius: 50%;
     flex-shrink: 0;
-    border: 1px solid rgba(255, 255, 255, 0.14);
-    background: rgba(255, 255, 255, 0.07);
-    color: rgba(255, 255, 255, 0.4);
+    border: 1px solid rgba(255, 255, 255, 0.16);
+    background: rgba(255, 255, 255, 0.08);
+    color: rgba(255, 255, 255, 0.55);
     cursor: pointer;
-    font-size: 12px;
+    font-size: 14px;
     display: flex;
     align-items: center;
     justify-content: center;
@@ -6730,12 +6936,15 @@
     font-family: inherit;
     transition:
       background 160ms,
-      transform 160ms;
+      transform 160ms,
+      color 160ms,
+      border-color 160ms;
   }
   .n-close:hover {
     background: rgba(239, 68, 68, 0.35);
     border-color: rgba(239, 68, 68, 0.5);
     color: #fff;
+    transform: scale(1.08);
   }
   .n-close:active {
     transform: scale(0.92);
@@ -7709,9 +7918,14 @@
       top: 58px;
       right: 8px;
       left: 8px;
-      width: auto;
+      width: auto !important;
+      height: auto !important;
       border-radius: 18px;
       max-height: calc(100vh - 140px);
+    }
+    .bp-resize-edge,
+    .bp-resize-corner {
+      display: none !important;
     }
 
     /* Smaller device cards on mobile */
@@ -7806,7 +8020,9 @@
     top: 52px;
     right: 12px;
     z-index: 300;
-    width: 340px;
+    width: 360px;
+    min-width: 300px;
+    max-width: calc(100vw - 24px);
     max-height: calc(100vh - 80px);
     display: flex;
     flex-direction: column;
@@ -7822,6 +8038,83 @@
     overflow: hidden;
     animation: panel-drop 0.28s cubic-bezier(0.34, 1.3, 0.64, 1) both;
   }
+  .bp-resizing {
+    user-select: none !important;
+    transition: none !important;
+  }
+  .bp-dragging {
+    user-select: none !important;
+    transition: none !important;
+  }
+
+  /* Large screen edge & corner resize handles */
+  .bp-resize-edge {
+    position: absolute;
+    z-index: 20;
+  }
+  .bp-resize-left {
+    top: 0;
+    bottom: 14px;
+    left: 0;
+    width: 8px;
+    cursor: ew-resize;
+    transition: background 150ms;
+  }
+  .bp-resize-left:hover,
+  .bp-resizing .bp-resize-left {
+    background: rgba(249, 115, 22, 0.35);
+  }
+  .bp-resize-bottom {
+    left: 14px;
+    right: 14px;
+    bottom: 0;
+    height: 8px;
+    cursor: ns-resize;
+    transition: background 150ms;
+  }
+  .bp-resize-bottom:hover,
+  .bp-resizing .bp-resize-bottom {
+    background: rgba(249, 115, 22, 0.35);
+  }
+  .bp-resize-corner {
+    position: absolute;
+    width: 18px;
+    height: 18px;
+    z-index: 25;
+  }
+  .bp-resize-bl {
+    bottom: 0;
+    left: 0;
+    cursor: nesw-resize;
+    border-bottom-left-radius: 20px;
+    transition: background 150ms;
+  }
+  .bp-resize-bl:hover,
+  .bp-resizing .bp-resize-bl {
+    background: rgba(249, 115, 22, 0.35);
+  }
+  .bp-resize-br {
+    bottom: 0;
+    right: 0;
+    cursor: nwse-resize;
+    display: flex;
+    align-items: flex-end;
+    justify-content: flex-end;
+    padding: 3px;
+    border-bottom-right-radius: 20px;
+    color: rgba(255, 255, 255, 0.3);
+    transition: color 150ms, background 150ms;
+  }
+  .bp-resize-br:hover,
+  .bp-resizing .bp-resize-br {
+    color: #f97316;
+    background: rgba(249, 115, 22, 0.2);
+  }
+  .bp-grip-icon {
+    display: block;
+    pointer-events: none;
+  }
+
   @keyframes panel-drop {
     from {
       opacity: 0;
@@ -7856,6 +8149,8 @@
     display: flex;
     align-items: center;
     gap: 4px;
+    position: relative;
+    z-index: 10;
   }
   .bp-icon-btn {
     width: 28px;
@@ -7877,6 +8172,16 @@
     border-color: rgba(255, 255, 255, 0.2);
     background: rgba(255, 255, 255, 0.08);
   }
+  .bp-clear-btn:hover {
+    color: #ef4444 !important;
+    border-color: rgba(239, 68, 68, 0.35) !important;
+    background: rgba(239, 68, 68, 0.1) !important;
+  }
+  .bp-close-btn:hover {
+    color: #ef4444 !important;
+    border-color: rgba(239, 68, 68, 0.35) !important;
+    background: rgba(239, 68, 68, 0.1) !important;
+  }
   .bp-muted {
     color: #ef4444 !important;
     border-color: rgba(239, 68, 68, 0.35) !important;
@@ -7889,6 +8194,10 @@
     text-align: center;
     color: #475569;
     font-size: 13px;
+    flex: 1;
+    display: flex;
+    align-items: center;
+    justify-content: center;
   }
 
   /* Panel notification list */
@@ -8482,9 +8791,14 @@
       top: 56px;
       left: 8px;
       right: 8px;
-      width: auto;
+      width: auto !important;
+      height: auto !important;
       max-height: 70vh;
       border-radius: 18px;
+    }
+    .bp-resize-edge,
+    .bp-resize-corner {
+      display: none !important;
     }
     .bp-sender {
       font-size: 11px;
@@ -9168,6 +9482,10 @@
       transform: none !important;
       z-index: 250 !important;
       border-radius: 16px !important;
+    }
+    .bp-resize-edge,
+    .bp-resize-corner {
+      display: none !important;
     }
     .notif-stack {
       top: auto !important;
