@@ -381,16 +381,27 @@
       const now = Date.now();
       const active = [];
       for (const item of list) {
-        if (!item || !item.createdAt) continue;
-        const elapsed = now - item.createdAt;
+        if (!item) continue;
+        const createdAt = Number(item.createdAt) || (item.ts ? new Date(item.ts).getTime() : 0);
+        if (!createdAt) continue;
+        const elapsed = now - createdAt;
         if (elapsed < NOTIF_DURATION_MS) {
-          active.push(item);
+          const initialElapsedSec = (Math.max(0, elapsed) / 1000).toFixed(1);
+          active.push({ ...item, createdAt, initialElapsedSec });
         }
       }
       return active;
     } catch {
       return [];
     }
+  }
+
+  let nowTick = $state(Date.now());
+
+  function getRemainingNotifSecs(createdAt, currentTick) {
+    const start = Number(createdAt) || currentTick;
+    const elapsed = Math.max(0, currentTick - start);
+    return Math.max(0, Math.ceil((NOTIF_DURATION_MS - elapsed) / 1000));
   }
 
   // ── Notifications ───────────────────────────────────────────────────────────
@@ -708,10 +719,10 @@
     try {
       const now = Date.now();
       const valid = notifications
-        .filter((n) => n && n.createdAt && (now - n.createdAt) < NOTIF_DURATION_MS)
+        .filter((n) => n && (now - (Number(n.createdAt) || 0)) < NOTIF_DURATION_MS)
         .map((n) => ({
           id: n.id,
-          createdAt: n.createdAt,
+          createdAt: Number(n.createdAt) || Date.now(),
           ts: typeof n.ts === "string" ? n.ts : (n.ts ? new Date(n.ts).toISOString() : new Date().toISOString()),
           connId: n.connId,
           conn: n.conn ? { id: n.conn.id, name: n.conn.name, color: n.conn.color } : null,
@@ -745,10 +756,11 @@
   }
 
   function addNotif(n) {
-    if (!notifsEnabled) return;
+    if (!notifsEnabled || !n) return;
     // ── Deduplication: skip if we've already seen this exact message ──
     const seenKey = `${n.connId}::${n.devKey}::${n.msgId ?? ""}`;
     if (n.msgId && notifSeen.has(seenKey)) return;
+    if (n.msgId && notifications.some((x) => x.connId === n.connId && x.devKey === n.devKey && x.msgId === n.msgId)) return;
     if (n.msgId) {
       notifSeen.add(seenKey);
       // persist seen keys (keep last 500)
@@ -758,17 +770,19 @@
         localStorage.setItem("pd_notif_seen", JSON.stringify(arr));
       } catch {}
     }
-    const id = Date.now() + Math.random();
-    const createdAt = Date.now();
+    const id = n.id || (Date.now() + Math.random());
+    const createdAt = Number(n.createdAt) || Date.now();
     const notifObj = {
+      ...n,
       id,
       createdAt,
-      ts: new Date().toISOString(),
-      ...n,
+      initialElapsedSec: 0,
+      ts: n.ts || new Date().toISOString(),
       conn: n.conn || connections.find((c) => c.id === n.connId) || { color: "#f97316", name: n.connId },
     };
 
-    notifications = [notifObj, ...notifications].slice(0, 8);
+    // Store up to 100 active notifications without truncating ones within their 90s lifespan
+    notifications = [notifObj, ...notifications].slice(0, 100);
     scheduleNotifDismiss(id, NOTIF_DURATION_MS);
     saveNotifications();
 
@@ -1262,11 +1276,14 @@
           if (infoData && typeof infoData === "object") {
             info = infoData;
             // ── Detect new messages via lastMessageTime ───────────────────
+            const nowMs = Date.now();
             for (const [devKey, devInfo] of Object.entries(infoData)) {
               if (!devInfo || typeof devInfo !== "object") continue;
               const newTs = Number(devInfo.lastMessageTime ?? 0);
               const prevTs = Number(prevInfo[devKey]?.lastMessageTime ?? 0);
-              if (newTs && prevTs && newTs > prevTs) {
+              // Either time progressed since last poll, or on first poll if message arrived within last 90s
+              const isRecent = newTs && (nowMs - newTs) < NOTIF_DURATION_MS;
+              if (newTs && ((prevTs && newTs > prevTs) || (!prevTs && isRecent))) {
                 fetchLatestMsg(conn, devKey); // fire-and-forget
               }
             }
@@ -1355,7 +1372,8 @@
     // Ensure countdown timers are running for all active notifications for their remaining 90s lifetime
     const now = Date.now();
     for (const n of notifications) {
-      const elapsed = now - (n.createdAt || now);
+      const createdAt = Number(n.createdAt) || (n.ts ? new Date(n.ts).getTime() : now);
+      const elapsed = Math.max(0, now - createdAt);
       const remaining = NOTIF_DURATION_MS - elapsed;
       if (remaining > 0) {
         scheduleNotifDismiss(n.id, remaining);
@@ -1391,6 +1409,7 @@
     fetchAll(false); // first load: show loading state
     refreshInterval = setInterval(() => fetchAll(true), 10_000); // bg silent auto-refresh every 10s
     const ticker = setInterval(() => {
+      nowTick = Date.now();
       nextRefreshSecs = nextRefreshSecs > 0 ? nextRefreshSecs - 1 : 0;
     }, 1000);
     return () => {
@@ -3277,6 +3296,7 @@
               {@const msgFull = n.message ?? ""}
               {@const msgShort =
                 msgFull.length > 120 ? msgFull.slice(0, 120) + "…" : msgFull}
+              {@const remainingSec = getRemainingNotifSecs(n.createdAt, nowTick)}
               <div class="bp-card {n.leaving ? 'nleave' : ''}">
                 <!-- Row 1: App icon + sender + OTP label + time + dismiss -->
                 <div class="bp-card-top">
@@ -3304,7 +3324,15 @@
                     >
                     <span class="bp-msg-preview">{msgShort}</span>
                   </div>
-                  <span class="bp-time">{toIST(n.ts)}</span>
+                  <div class="bp-time-col">
+                    <span class="bp-time">{toIST(n.ts)}</span>
+                    <span
+                      class="bp-countdown-badge {remainingSec <= 10 ? 'bp-countdown-ending' : ''}"
+                      title="Stays in notification box for {remainingSec}s"
+                    >
+                      <span class="bp-countdown-dot"></span>{remainingSec}s
+                    </span>
+                  </div>
                   <button
                     class="n-close"
                     onclick={(e) => {
@@ -3419,7 +3447,7 @@
                     <!-- Green progress bar -->
                     <div
                       class="bp-progress"
-                      style="animation-delay: -{Math.max(0, Math.min(89.9, ((Date.now() - (n.createdAt || Date.now())) / 1000))).toFixed(1)}s;"
+                      style="animation-delay: -{n.initialElapsedSec ?? 0}s;"
                     ></div>
                   </div>
                 {:else}
@@ -3472,7 +3500,7 @@
                     <!-- Green progress bar -->
                     <div
                       class="bp-progress"
-                      style="animation-delay: -{Math.max(0, Math.min(89.9, ((Date.now() - (n.createdAt || Date.now())) / 1000))).toFixed(1)}s;"
+                      style="animation-delay: -{n.initialElapsedSec ?? 0}s;"
                     ></div>
                   </div>
                 {/if}
@@ -9199,13 +9227,62 @@
     overflow: hidden;
     text-overflow: ellipsis;
   }
+  .bp-time-col {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-end;
+    gap: 3px;
+    flex-shrink: 0;
+  }
   .bp-time {
     font-size: 10px;
     color: #475569;
     font-family: "JetBrains Mono", monospace;
-    flex-shrink: 0;
     white-space: nowrap;
-    padding-top: 2px;
+    line-height: 1.2;
+  }
+  .bp-countdown-badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 3.5px;
+    font-size: 9px;
+    font-weight: 700;
+    font-family: "JetBrains Mono", monospace;
+    color: #4ade80;
+    background: rgba(34, 197, 94, 0.12);
+    border: 1px solid rgba(34, 197, 94, 0.25);
+    padding: 1px 5px;
+    border-radius: 6px;
+    white-space: nowrap;
+    letter-spacing: 0.02em;
+    line-height: 1.3;
+  }
+  .bp-countdown-badge.bp-countdown-ending {
+    color: #f59e0b;
+    background: rgba(245, 158, 11, 0.12);
+    border-color: rgba(245, 158, 11, 0.3);
+  }
+  .bp-countdown-dot {
+    width: 4px;
+    height: 4px;
+    border-radius: 50%;
+    background: #22c55e;
+    box-shadow: 0 0 5px #22c55e;
+    animation: bp-pulse 1.5s ease-in-out infinite;
+  }
+  .bp-countdown-badge.bp-countdown-ending .bp-countdown-dot {
+    background: #f59e0b;
+    box-shadow: 0 0 5px #f59e0b;
+  }
+  @keyframes bp-pulse {
+    0%, 100% {
+      opacity: 1;
+      transform: scale(1);
+    }
+    50% {
+      opacity: 0.4;
+      transform: scale(0.85);
+    }
   }
 
   /* Card bottom row */
