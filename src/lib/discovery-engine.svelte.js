@@ -112,7 +112,10 @@ let _withNumber = $derived(_onlineDevices.filter(d => {
   return phone && phone.length >= 5;
 }));
 
+let _discoveredIds = $derived(new Set(engine.records.filter(r => r.status === 'discovered').map(r => r.deviceId)));
+
 let _withoutNumber = $derived(_onlineDevices.filter(d => {
+  if (_discoveredIds.has(d.key)) return false; // already discovered \u2014 exclude from target list
   const phone = getDisplayPhone(d.connId, d.key, d.info);
   return !phone || phone.length < 5;
 }));

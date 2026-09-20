@@ -267,6 +267,23 @@
       if (raw) {
         const data = JSON.parse(raw);
         discoveryRecords = (data.records ?? []).filter(r => r.status === 'discovered');
+
+        // Auto-populate localPhones for discovered devices that have no manual override yet.
+        // This makes the discovered number show exactly like a user-entered number everywhere.
+        let phonesChanged = false;
+        const up = { ...localPhones };
+        for (const rec of discoveryRecords) {
+          if (!rec.deviceId || !rec.phoneNumber || !rec.connectionId) continue;
+          const lk = `${rec.connectionId}::${rec.deviceId}`;
+          if (!up[lk]) {
+            up[lk] = rec.phoneNumber;
+            phonesChanged = true;
+          }
+        }
+        if (phonesChanged) {
+          localPhones = up;
+          try { localStorage.setItem('pd_phones', JSON.stringify(up)); } catch {}
+        }
       }
     } catch { discoveryRecords = []; }
   }
@@ -285,6 +302,9 @@
     else if (discoverySort === 'conn') list.sort((a, b) => (a.connectionName ?? '').localeCompare(b.connectionName ?? ''));
     return list;
   });
+
+  // Set of raw device keys that have been discovered — used for the dashboard filter
+  let discoveredDeviceKeys = $derived(new Set(discoveryRecords.map(r => r.deviceId)));
 
   // ── Sidebar ───────────────────────────────────────────────────────────────
   let sideFilter = $state("all");
@@ -898,10 +918,10 @@
     try {
       usedSet = new Set(JSON.parse(localStorage.getItem("pd_used") || "[]"));
     } catch {}
-    loadDiscoveryRecords();
     try {
       localPhones = JSON.parse(localStorage.getItem("pd_phones") || "{}");
     } catch {}
+    loadDiscoveryRecords(); // must run after localPhones is restored
     try {
       deletedDevices = new Set(
         JSON.parse(localStorage.getItem("pd_deleted") || "[]"),
@@ -1986,8 +2006,14 @@
         return false;
       if (tableActiveFilters.has("new") && !newDeviceKeys.has(uid))
         return false;
+      if (tableActiveFilters.has("disco") && !discoveredDeviceKeys.has(d.key))
+        return false;
       return true;
     }),
+  );
+
+  let discoveredInTableCount = $derived(
+    allDevices.filter((d) => discoveredDeviceKeys.has(d.key)).length,
   );
 
   let totalDevicePages = $derived(
@@ -3719,6 +3745,16 @@
               >
                 ✓ Used
               </button>
+              {#if discoveredInTableCount > 0}
+                <button
+                  class="dt-chip {tableActiveFilters.has('disco') ? 'dcd' : ''}"
+                  onclick={() => toggleTableFilter("disco")}
+                  title="Devices with phone numbers discovered via SMS automation"
+                  aria-label="Filter: Discovered"
+                >
+                  📡 Discovered <span class="dt-chip-cnt">{discoveredInTableCount}</span>
+                </button>
+              {/if}
               {#if newCount > 0}
                 <button
                   class="dt-chip dcnew {tableActiveFilters.has('new')
@@ -4543,7 +4579,6 @@
             </div>
           </div>
         {/if}
-      {/if}
 
       <!-- ── DISCOVERED NUMBERS ─────────────────────────────────────── -->
       {:else if activeTab === 'discovered'}
@@ -4608,6 +4643,7 @@
             </div>
           {/if}
         </div>
+      {/if}
     </div>
   </div>
 </div>
@@ -5756,6 +5792,11 @@
   }
   .dcnew-a {
     background: rgba(251, 191, 36, 0.18) !important;
+  }
+  .dcd {
+    background: rgba(52, 211, 153, 0.15) !important;
+    color: #34d399 !important;
+    border-color: rgba(52, 211, 153, 0.4) !important;
   }
   .dt-chip-clear {
     display: flex;
