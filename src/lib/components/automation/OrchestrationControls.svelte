@@ -5,6 +5,7 @@
   let {
     candidatesCount = 0,
     registryCount = 0,
+    registryStats = { total: 0, successful: 0, expired: 0, suspended: 0, rateLimited: 0, alreadyRegistered: 0, failed: 0 },
     onstart,
     onpause,
     onresume,
@@ -45,19 +46,25 @@
       </button>
     {:else}
       <button
-        class="btn btn-primary btn-large {!autoEngine.preflightPassed ? 'btn-disabled' : ''}"
+        class="btn btn-primary btn-large"
         onclick={onstart}
-        disabled={!autoEngine.preflightPassed}
-        title={!autoEngine.preflightPassed ? 'Run Pre-Flight Check first to unlock Start' : 'Start Automation'}
+        disabled={autoEngine.workerStarting || autoEngine.preflightRunning}
+        title="Start Automation (Auto-runs preflight & connects Python worker)"
       >
-        ▶ Start Automation
+        {#if autoEngine.workerStarting}
+          ⏳ Starting Worker...
+        {:else if autoEngine.preflightRunning}
+          ⏳ Checking...
+        {:else}
+          ▶ Start Automation
+        {/if}
       </button>
     {/if}
 
     <button
       class="btn btn-secondary"
       onclick={onpreflight}
-      disabled={autoEngine.preflightRunning || autoEngine.status === 'RUNNING'}
+      disabled={autoEngine.preflightRunning || autoEngine.status === 'RUNNING' || autoEngine.workerStarting}
     >
       {autoEngine.preflightRunning ? '⏳ Checking...' : '⚡ Run Pre-Flight Test'}
     </button>
@@ -65,7 +72,7 @@
     <button
       class="btn btn-secondary"
       onclick={onstep}
-      disabled={autoEngine.status === 'RUNNING' || autoEngine.jobState !== 'IDLE'}
+      disabled={autoEngine.status === 'RUNNING' || autoEngine.jobState !== 'IDLE' || autoEngine.workerStarting}
       title="Test a single device without continuous loop"
     >
       ⏭ Step Next Device
@@ -76,36 +83,59 @@
     </button>
   </div>
 
-  {#if !autoEngine.preflightPassed && autoEngine.status !== 'RUNNING'}
+  {#if !autoEngine.preflightPassed && autoEngine.status !== 'RUNNING' && !autoEngine.workerStarting}
     <div class="preflight-alert">
       <span class="alert-icon">ℹ</span>
       <div>
-        <strong>Pre-flight test required:</strong> Click "Run Pre-Flight Test" above to verify database connectivity, online device availability, and configuration before starting.
+        <strong>Ready to start:</strong> Click "Start Automation" to auto-run preflight checks, connect the Python worker, and begin processing. Or click "Run Pre-Flight Test" to test manually first.
       </div>
     </div>
   {/if}
 
-  <!-- Inline Metrics Strip -->
-  <div class="metrics-grid metrics-inline">
+  <!-- Inline Metrics Strip (Complete Status Breakdown) -->
+  <div class="metrics-grid metrics-inline metrics-strip-all">
     <div class="metric-item">
-      <span class="metric-num">{autoEngine.stats.totalProcessed}</span>
-      <span class="metric-lbl">Processed</span>
+      <span class="metric-num">{registryStats.total || autoEngine.stats.totalProcessed}</span>
+      <span class="metric-lbl">Total Processed</span>
     </div>
     <div class="metric-item text-success">
-      <span class="metric-num">{autoEngine.stats.success}</span>
-      <span class="metric-lbl">Success</span>
+      <span class="metric-num">{registryStats.successful || autoEngine.stats.success}</span>
+      <span class="metric-lbl">✓ Successful</span>
     </div>
     <div class="metric-item text-danger">
-      <span class="metric-num">{autoEngine.stats.timeout}</span>
-      <span class="metric-lbl">Timeout</span>
+      <span class="metric-num">{registryStats.suspended}</span>
+      <span class="metric-lbl">⛔ Suspended</span>
+    </div>
+    <div class="metric-item text-purple">
+      <span class="metric-num">{registryStats.rateLimited}</span>
+      <span class="metric-lbl">⏳ Rate Limited</span>
+    </div>
+    <div class="metric-item text-warning">
+      <span class="metric-num">{registryStats.expired || autoEngine.stats.timeout}</span>
+      <span class="metric-lbl">⏱ Expired</span>
+    </div>
+    <div class="metric-item text-rose">
+      <span class="metric-num">{registryStats.failed}</span>
+      <span class="metric-lbl">✗ Failed</span>
     </div>
     <div class="metric-item text-cyan">
       <span class="metric-num">{candidatesCount}</span>
-      <span class="metric-lbl">Pool</span>
+      <span class="metric-lbl">📡 Pool</span>
     </div>
     <div class="metric-item text-purple">
-      <span class="metric-num">{registryCount}</span>
-      <span class="metric-lbl">Registry</span>
+      <span class="metric-num">{registryStats.alreadyRegistered ?? 0}</span>
+      <span class="metric-lbl">🔄 Already Reg</span>
+    </div>
+    <div class="metric-item text-amber">
+      <span class="metric-num mono text-sm" style="font-size: 15px; margin-top: 4px;">
+        {#if autoEngine.status === 'RUNNING'}
+          <span class="pulse-dot dot-online" style="display: inline-block; width: 8px; height: 8px; margin-right: 4px;"></span>
+          {autoEngine.jobState}
+        {:else}
+          {autoEngine.status}
+        {/if}
+      </span>
+      <span class="metric-lbl">Process State</span>
     </div>
   </div>
 </div>

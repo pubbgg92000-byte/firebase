@@ -357,10 +357,6 @@
   }
 
   async function handleStart() {
-    if (!autoEngine.preflightPassed) {
-      toast('Pre-flight test must pass before starting.', 'warn');
-      return;
-    }
     const ok = await startAutomation();
     if (ok) toast('Automation orchestrator started', 'success');
   }
@@ -671,6 +667,21 @@
   }
 
   onMount(async () => {
+    // Ensure worker config is updated with all active panels from localStorage
+    try {
+      const saved = JSON.parse(localStorage.getItem('pd_connections') || '[]');
+      const activeUrls = (Array.isArray(saved) ? saved : [])
+        .filter(c => c && c.enabled !== false && c.url && !c.deactivated && !c.url.includes('newpanel-4412c'))
+        .map(c => c.url.replace(/\/+$/, ''));
+      if (activeUrls.length > 0) {
+        fetch('/api/worker-config', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ firebase_databases: activeUrls })
+        }).catch(() => {});
+      }
+    } catch {}
+
     await loadConfig();
     refreshRegistryView();
     syncWorkerStatus();
@@ -682,11 +693,16 @@
       window.addEventListener('storage', handleStorageEvent);
     }
 
+    let pollTick = 0;
     pollInterval = setInterval(() => {
+      pollTick++;
       refreshRegistryView();
       syncWorkerStatus();
       checkWorkerStatus();
       syncDashboardNotifs();
+      if (pollTick % 4 === 0) {
+        handleSyncRegistry(true);
+      }
     }, 2000);
   });
 
@@ -781,6 +797,7 @@
         <OrchestrationControls
           candidatesCount={allCandidatesList.length}
           registryCount={registryRecords.length}
+          {registryStats}
           onstart={handleStart}
           onpause={handlePause}
           onresume={handleResume}

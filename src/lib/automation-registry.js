@@ -123,7 +123,7 @@ export function isAlreadyProcessed(phone) {
   const rec = inMemoryStore[key];
   if (!rec) return false;
   const st = String(rec.status || '').toLowerCase();
-  return ['successful', 'success', 'expired', 'suspended', 'rate_limited', 'invalid_number', 'invalid_otp', 'failed'].includes(st);
+  return ['successful', 'success', 'expired', 'suspended', 'rate_limited', 'invalid_number', 'invalid_otp', 'already_registered', 'failed'].includes(st);
 }
 
 export function getRecord(phone) {
@@ -146,6 +146,7 @@ export function markNumber(phone, status, deviceMetadata = {}) {
   else if (normStatus.includes('suspend')) finalStatus = 'suspended';
   else if (normStatus.includes('expire') || normStatus.includes('timeout')) finalStatus = 'expired';
   else if (normStatus.includes('rate') || normStatus.includes('attempt')) finalStatus = 'rate_limited';
+  else if (normStatus.includes('already_registered') || normStatus.includes('already registered')) finalStatus = 'already_registered';
   else if (normStatus.includes('invalid_num')) finalStatus = 'invalid_number';
   else if (normStatus.includes('invalid')) finalStatus = 'invalid_otp';
 
@@ -209,7 +210,8 @@ export function getStats() {
     expired: items.filter(i => i.status === 'expired').length,
     suspended: items.filter(i => i.status === 'suspended').length,
     rateLimited: items.filter(i => i.status === 'rate_limited').length,
-    failed: items.filter(i => !['successful', 'success', 'expired', 'suspended', 'rate_limited'].includes(i.status)).length
+    alreadyRegistered: items.filter(i => i.status === 'already_registered').length,
+    failed: items.filter(i => !['successful', 'success', 'expired', 'suspended', 'rate_limited', 'already_registered'].includes(i.status)).length
   };
 }
 
@@ -232,12 +234,14 @@ export async function syncFromFirebase(connections) {
   let synced = 0;
 
   for (const conn of connections) {
-    if (!conn || !conn.url || conn.enabled === false) continue;
+    if (!conn || !conn.url || conn.enabled === false || conn.deactivated) continue;
     try {
       const res = await apiFetch(conn, 'automation/numbers', 'GET');
-      if (res && typeof res === 'object' && !Array.isArray(res)) {
-        for (const [phone, data] of Object.entries(res)) {
-          const key = normalizeKey(phone);
+      const raw = res?.data;
+      if (raw && typeof raw === 'object' && !Array.isArray(raw)) {
+        for (const [phone, data] of Object.entries(raw)) {
+          if (!data || typeof data !== 'object') continue;
+          const key = normalizeKey(phone || data.phone);
           if (!key) continue;
           if (!inMemoryStore[key] || new Date(data.updatedAt || 0) > new Date(inMemoryStore[key].updatedAt || 0)) {
             inMemoryStore[key] = {
@@ -255,9 +259,40 @@ export async function syncFromFirebase(connections) {
         }
       }
     } catch (e) {
+      if (String(e.message).includes('deactivated') || String(e.message).includes('423')) {
+        conn.deactivated = true;
+      }
       console.warn(`[AutomationRegistry] Could not sync from ${conn.name || conn.url}:`, e.message);
     }
   }
+
+  // Also check local worker disk registry if running locally
+  try {
+    const pRes = await fetch('/api/worker-process?numbers=1');
+    if (pRes.ok) {
+      const pData = await pRes.json();
+      if (pData?.processedNumbers && typeof pData.processedNumbers === 'object') {
+        for (const [phone, data] of Object.entries(pData.processedNumbers)) {
+          if (!data || typeof data !== 'object') continue;
+          const key = normalizeKey(phone || data.phone);
+          if (!key) continue;
+          if (!inMemoryStore[key] || new Date(data.timestamp || 0) > new Date(inMemoryStore[key].updatedAt || 0)) {
+            inMemoryStore[key] = {
+              phone: key,
+              status: data.status || 'successful',
+              reason: data.reason || '',
+              deviceId: data.device_id || data.deviceId || '',
+              database: data.database || '',
+              completedAt: data.timestamp || new Date().toISOString(),
+              updatedAt: data.timestamp || new Date().toISOString(),
+              attempts: data.attempts || 1
+            };
+            synced += 1;
+          }
+        }
+      }
+    }
+  } catch {}
 
   if (synced > 0) {
     saveRegistry();

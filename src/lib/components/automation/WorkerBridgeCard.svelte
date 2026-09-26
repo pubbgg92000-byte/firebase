@@ -15,6 +15,15 @@
     ontoggleworker,
     onsendbotcommand
   } = $props();
+
+  let isWorkerActive = $derived(
+    workerRunning ||
+    (!!autoEngine.workerStatus.status &&
+      autoEngine.workerStatus.status !== 'unknown' &&
+      autoEngine.workerStatus.status !== 'stopped' &&
+      !!autoEngine.workerStatus.lastUpdate &&
+      Date.now() - new Date(autoEngine.workerStatus.lastUpdate).getTime() < 120_000)
+  );
 </script>
 
 <!-- ═══ ROW 2: Telegram Worker Bridge + Active Job (Full Width) ═══ -->
@@ -24,8 +33,12 @@
       <div class="flex items-center gap-2">
         <h2 class="card-title">Telegram Worker Bridge</h2>
         {#if workerRunning}
-          <span class="worker-inline-badge running" title="Python worker process is running (PID: {workerPid})">
+          <span class="worker-inline-badge running" title="Python worker process is running locally (PID: {workerPid})">
             ● PID: {workerPid}
+          </span>
+        {:else if isWorkerActive}
+          <span class="worker-inline-badge running" title="Python worker is active via Firebase bridge ({autoEngine.workerStatus.status})">
+            ● Online ({autoEngine.workerStatus.status})
           </span>
         {:else}
           <span class="worker-inline-badge stopped" title="Python worker process is offline">
@@ -85,7 +98,7 @@
         <div class="stat-box">
           <span class="stat-label">Worker Status</span>
           <span class="stat-value status-text-{autoEngine.workerStatus.status || 'unknown'}">
-            {autoEngine.workerStatus.status || (workerRunning ? 'idle' : 'Offline / Stopped')}
+            {autoEngine.workerStatus.status || (isWorkerActive ? 'idle' : 'Offline / Stopped')}
           </span>
         </div>
         <div class="stat-box highlight-stat">

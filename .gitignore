@@ -40,3 +40,6 @@ _python_worker_ref/worker_config.json
 _python_worker_ref/processed_numbers.json
 _python_worker_ref/processed_success.json
 _python_worker_ref/firebase-full.json
+
+.vercel
+.env*

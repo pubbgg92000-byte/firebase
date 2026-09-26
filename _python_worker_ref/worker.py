@@ -177,9 +177,12 @@ def is_number_already_processed(phone):
     if number in processed_numbers:
         rec = processed_numbers[number]
         st = str(rec.get("status", "")).lower()
-        if st in {"successful", "success", "suspended", "expired", "invalid_number", "invalid_otp", "failed"}:
-            return True
-        if st == "rate_limited":
+        # All final states — never retry automatically
+        if st in {
+            "successful", "success", "suspended", "expired",
+            "invalid_number", "invalid_otp", "failed",
+            "rate_limited", "already_registered",
+        }:
             return True
 
     return False
@@ -200,6 +203,8 @@ def record_processed_number(phone, status, reason="", device=None, attempts=1):
         norm_status = "expired"
     elif "rate" in st or "attempt" in st:
         norm_status = "rate_limited"
+    elif "already_registered" in st or "already registered" in st:
+        norm_status = "already_registered"
     elif "invalid_num" in st:
         norm_status = "invalid_number"
     elif "invalid" in st:
@@ -239,7 +244,8 @@ def record_processed_number(phone, status, reason="", device=None, attempts=1):
         save_processed_success()
 
     # Sync to Firebase so web UI retrieves it across refreshes
-    db_target = database or (FIREBASE_DATABASES[0] if FIREBASE_DATABASES else None)
+    dbs = list(get_firebase_databases())
+    db_target = database or (dbs[0] if dbs else None)
     if db_target:
         try:
             from firebase import firebase_update
@@ -306,7 +312,7 @@ device_registry = {}
 firebase_registry = {}
 registry_lock = asyncio.Lock()
 registry_refresh_task = None
-REGISTRY_REFRESH_SECONDS = 10
+REGISTRY_REFRESH_SECONDS = 120  # 2 minutes: light background device check across all Firebase DBs
 last_registry_refresh = 0.0
 registry_refresh_in_progress = False
 
@@ -329,6 +335,7 @@ login_click_in_progress = False
 login_clicked_for_job = None
 
 message_handler_lock = asyncio.Lock()
+number_submit_lock = asyncio.Lock()
 
 pending_finish_after_cancel = False
 pending_finish_status = ""
@@ -339,6 +346,13 @@ latest_bot_message_text = ""
 last_start_sent_at = 0.0
 last_telegram_activity = time.monotonic()
 START_RETRY_SECONDS = 3
+telegram_flood_wait_until = 0.0
+
+def get_flood_wait_remaining():
+    global telegram_flood_wait_until
+    if time.time() < telegram_flood_wait_until:
+        return max(0, int(telegram_flood_wait_until - time.time()))
+    return 0
 
 
 # ============================================================
@@ -382,9 +396,12 @@ _AUTH_DB = None
 def _get_auth_db():
     """Return the first reachable Firebase database URL for auth signalling."""
     global _AUTH_DB
-    if _AUTH_DB:
-        return _AUTH_DB
     databases = get_firebase_databases()
+    if not databases:
+        _AUTH_DB = None
+        return None
+    if _AUTH_DB and _AUTH_DB in databases:
+        return _AUTH_DB
     for db in databases:
         try:
             import requests as _req
@@ -413,6 +430,8 @@ def sync_worker_status_all(status, job=None, last_error=""):
     target_dbs = set()
     if active and active.get("database"):
         target_dbs.add(active["database"])
+    if active and active.get("device_database"):
+        target_dbs.add(active["device_database"])
     if auth_db:
         target_dbs.add(auth_db)
     if not target_dbs:
@@ -738,10 +757,16 @@ async def stuck_watchdog_loop():
         try:
             await asyncio.sleep(10)
 
-            # Only check if worker is in an active non-idle state
-            if state not in {"IDLE", "CANCELLED"}:
-                elapsed = time.monotonic() - last_telegram_activity
-                if elapsed > 70:
+            # NEVER attempt recovery during FloodWait — sending messages would extend the penalty
+            if get_flood_wait_remaining() > 0:
+                continue
+
+            # Skip check for IDLE, CANCELLED, WAITING_FOR_OTP (has its own timer), and FLOOD_WAIT
+            if state in {"IDLE", "CANCELLED", "WAITING_FOR_OTP", "FLOOD_WAIT"}:
+                continue
+
+            elapsed = time.monotonic() - last_telegram_activity
+            if elapsed > 70:
                     print()
                     print("=" * 60)
                     print(f"[{now()}] [WATCHDOG] STUCK DETECTED in state '{state}' ({elapsed:.0f}s idle)")
@@ -808,6 +833,14 @@ def normalize_phone(value):
     return re.sub(r"\D", "", str(value or ""))
 
 
+def normalize_to_10_digits(value):
+    """Normalize any phone string to the last 10 digits for reliable cross-matching."""
+    digits = re.sub(r"\D", "", str(value or ""))
+    if len(digits) >= 10:
+        return digits[-10:]
+    return digits
+
+
 def extract_local_10_digit_number(value):
     """
     Normalize an Indian-style test number.
@@ -839,13 +872,6 @@ def response_paths():
 
     Checks the primary device AND all other devices in the registry that
     share the same phone number (cross-device matching).
-
-    Firebase SMS / Notification structures:
-        <device_id>/<message_id>/{message,sender,dateTime,type}
-        messages/<device_id>/<message_id>/{...}
-        notifications/<device_id>/...
-        notification/<device_id>/...
-        sms/<device_id>/...
     """
     if not current_job:
         return []
@@ -855,33 +881,33 @@ def response_paths():
         return []
 
     paths = [
-        # Primary device paths
         f"messages/{device_id}",
         device_id,
         f"notifications/{device_id}",
         f"notification/{device_id}",
         f"sms/{device_id}",
         f"automation/notifications/{device_id}",
+        f"automation/testResponses/{device_id}",
         f"automation/responses/{device_id}",
     ]
 
-    # Cross-device: find all devices sharing the same phone number
-    target_phone = normalize_phone(
-        current_job.get("device_phone") or current_job.get("number", "")
-    )
-    if target_phone:
+    target_phone = str(current_job.get("device_phone") or current_job.get("number", "")).strip()
+    target_10 = normalize_to_10_digits(target_phone)
+
+    if target_10:
         for key, dev in device_registry.items():
             other_id = dev.get("device_id", "")
             if not other_id or other_id == device_id:
                 continue
-            other_phone = normalize_phone(dev.get("phone", ""))
-            if other_phone == target_phone:
+            other_phone = normalize_to_10_digits(dev.get("phone", ""))
+            if other_phone == target_10:
                 paths.append(f"messages/{other_id}")
                 paths.append(other_id)
                 paths.append(f"notifications/{other_id}")
                 paths.append(f"notification/{other_id}")
                 paths.append(f"sms/{other_id}")
                 paths.append(f"automation/notifications/{other_id}")
+                paths.append(f"automation/testResponses/{other_id}")
 
     return list(dict.fromkeys(paths))
 
@@ -889,46 +915,65 @@ def response_paths():
 def response_paths_with_db():
     """
     Return (database, path) tuples for polling — handles cross-database
-    matching where the same number may appear in different Firebase projects.
+    matching where the same number or device ID may appear in different Firebase projects.
     """
     if not current_job:
         return []
 
     device_id = str(current_job.get("device_id", "")).strip()
-    primary_db = current_job.get("device_database", "")
-    if not device_id or not primary_db:
-        return []
+    primary_db = str(current_job.get("device_database", "")).strip()
+    queue_db = str(current_job.get("database", "")).strip()
 
-    results = [
-        (primary_db, f"messages/{device_id}"),
-        (primary_db, device_id),
-        (primary_db, f"notifications/{device_id}"),
-        (primary_db, f"notification/{device_id}"),
-        (primary_db, f"sms/{device_id}"),
-        (primary_db, f"automation/notifications/{device_id}"),
-        (primary_db, f"automation/responses/{device_id}"),
-    ]
+    target_phone = str(current_job.get("device_phone") or current_job.get("number", "")).strip()
+    target_10 = normalize_to_10_digits(target_phone)
 
-    # Cross-device: all devices sharing the same phone number across ALL databases
-    target_phone = normalize_phone(
-        current_job.get("device_phone") or current_job.get("number", "")
-    )
-    if target_phone:
-        for key, dev in device_registry.items():
-            other_id = dev.get("device_id", "")
-            other_db = dev.get("database", "")
-            if not other_id:
-                continue
-            if other_id == device_id and other_db == primary_db:
-                continue
-            other_phone = normalize_phone(dev.get("phone", ""))
-            if other_phone == target_phone and other_db:
-                results.append((other_db, f"messages/{other_id}"))
-                results.append((other_db, other_id))
-                results.append((other_db, f"notifications/{other_id}"))
-                results.append((other_db, f"notification/{other_id}"))
-                results.append((other_db, f"sms/{other_id}"))
-                results.append((other_db, f"automation/notifications/{other_id}"))
+    # Collect all (db_url, dev_id) pairs to monitor
+    device_targets = []
+
+    if primary_db and device_id:
+        device_targets.append((primary_db, device_id))
+    if queue_db and queue_db != primary_db and device_id:
+        device_targets.append((queue_db, device_id))
+
+    # Also check job raw data for explicit database
+    raw_job = current_job.get("job")
+    if isinstance(raw_job, dict):
+        raw_db = str(raw_job.get("database") or raw_job.get("device_database") or "").strip()
+        raw_dev = str(raw_job.get("deviceId") or raw_job.get("device_id") or device_id).strip()
+        if raw_db and raw_dev:
+            device_targets.append((raw_db, raw_dev))
+
+    # Cross-match against device registry:
+    # 1. Any registry entry with matching device_id
+    # 2. Any registry entry with matching 10-digit phone
+    for key, dev in device_registry.items():
+        dev_id = str(dev.get("device_id", "")).strip()
+        dev_db = str(dev.get("database", "")).strip()
+        if not dev_id or not dev_db:
+            continue
+
+        dev_phone = str(dev.get("phone", "")).strip()
+        dev_10 = normalize_to_10_digits(dev_phone)
+
+        is_same_dev = bool(device_id and dev_id == device_id)
+        is_same_phone = bool(target_10 and dev_10 and dev_10 == target_10)
+
+        if is_same_dev or is_same_phone:
+            device_targets.append((dev_db, dev_id))
+
+    # De-duplicate (db_url, dev_id) pairs
+    unique_targets = list(dict.fromkeys(device_targets))
+
+    # For each target, generate all possible SMS/notification paths
+    results = []
+    for db_url, dev_id in unique_targets:
+        results.append((db_url, f"messages/{dev_id}"))
+        results.append((db_url, f"notifications/{dev_id}"))
+        results.append((db_url, f"notification/{dev_id}"))
+        results.append((db_url, f"sms/{dev_id}"))
+        results.append((db_url, f"automation/notifications/{dev_id}"))
+        results.append((db_url, f"automation/testResponses/{dev_id}"))
+        results.append((db_url, dev_id))
 
     return list(dict.fromkeys(results))
 
@@ -1052,8 +1097,9 @@ def swiggy_messages_from_response(value):
         # Match target keyword ("swiggy") or general OTP markers
         has_keyword = keyword in msg_lower or keyword in sender_lower
         has_otp_marker = bool(
-            re.search(r"\b(?:otp|verification|one.?time|code|password)\b", msg_lower)
+            re.search(r"\b(?:otp|verif|one.?time|code|token|pin|passcode|authoriz|confirm|secret|password)\b", msg_lower)
             or re.search(r"\b(?:otp|swiggy)\b", sender_lower)
+            or extract_otp_code(message)
         )
 
         if not has_keyword and not has_otp_marker:
@@ -1154,9 +1200,9 @@ async def poll_device_response(job_id):
         print("=" * 60)
         print("Primary device:", device_id)
         print("Primary Firebase:", current_job.get("device_database"))
-        print("Polling interval: 2 seconds")
+        print("Polling interval: 2 seconds (targeted active device only)")
         print("Keyword:", RESPONSE_KEYWORD)
-        print(f"Monitoring {len(paths_with_db)} paths across all matching devices")
+        print(f"Monitoring targeted paths: {paths_with_db}")
         print("=" * 60)
 
         submitted_at_ms = int(current_job.get("number_submitted_at", 0) * 1000)
@@ -1164,7 +1210,7 @@ async def poll_device_response(job_id):
         while (
             current_job
             and current_job.get("id") == job_id
-            and state == "WAITING_FOR_OTP"
+            and state in {"NUMBER_SUBMITTED", "WAITING_FOR_OTP_REQUEST", "WAITING_FOR_OTP"}
         ):
             # Re-fetch paths each cycle in case device_registry changed
             paths_with_db = response_paths_with_db()
@@ -1189,9 +1235,9 @@ async def poll_device_response(job_id):
                     raw_sig = (db_url, path, raw_id_str)
 
                     # Check 1: was this message ID NOT in the pre-submit baseline?
-                    is_new_by_baseline = (
-                        sig not in test_response_baseline_signatures
-                        and raw_sig not in test_response_baseline_signatures
+                    is_in_baseline = (
+                        sig in test_response_baseline_signatures
+                        or raw_sig in test_response_baseline_signatures
                     )
 
                     # Check 2: timestamp freshness check (epoch milliseconds)
@@ -1200,14 +1246,13 @@ async def poll_device_response(job_id):
                     if raw_id and str(raw_id).isdigit() and len(str(raw_id)) >= 12:
                         msg_time = int(str(raw_id))
                         now_ms = time.time() * 1000
-                        # If arrived after number submission (with 10s grace period)
-                        if submitted_at_ms > 0 and msg_time >= (submitted_at_ms - 10000):
+                        # If arrived after number submission (with 5s grace period)
+                        if submitted_at_ms > 0 and msg_time >= (submitted_at_ms - 5000):
                             is_fresh_by_time = True
-                        # Or arrived in the last 120 seconds
-                        elif (now_ms - msg_time) < 120000:
+                        elif not test_response_baseline_signatures and (now_ms - msg_time) < 120000:
                             is_fresh_by_time = True
 
-                    if is_new_by_baseline or is_fresh_by_time:
+                    if (not is_in_baseline) or is_fresh_by_time:
                         candidate_messages.append(item)
 
                 if not candidate_messages:
@@ -1327,8 +1372,8 @@ async def poll_device_response(job_id):
 def start_response_poll(job_id):
     global response_poll_task
 
-    if response_poll_task:
-        response_poll_task.cancel()
+    if response_poll_task and not response_poll_task.done():
+        return
 
     response_poll_task = asyncio.create_task(
         poll_device_response(job_id)
@@ -1376,26 +1421,17 @@ async def otp_timeout_worker(job_id):
             and state == "WAITING_FOR_OTP"
         ):
             phone = current_job.get("device_phone") or current_job.get("number")
-            retries = current_job.get("otp_retries", 0)
-
-            if retries < 1:
-                current_job["otp_retries"] = 1
-                print()
-                print("=" * 60)
-                print(f"[{now()}] OTP TIMEOUT (60s) for {phone} - RETRYING ONCE (Attempt 2 of 2)")
-                print("=" * 60)
-                await restart_current_job_login("OTP timeout - retrying once")
-            else:
-                print()
-                print("=" * 60)
-                print(f"[{now()}] OTP TIMEOUT (60s) after retry for {phone} - MAX RETRIES REACHED")
-                print("Marking as EXPIRED and advancing to next number...")
-                print("=" * 60)
-                await request_cancel_and_finish(
-                    "expired",
-                    "OTP response timeout (max retries reached)",
-                    "OTP timeout",
-                )
+            print()
+            print("=" * 60)
+            print(f"[{now()}] OTP TIMEOUT ({OTP_TIMEOUT_SECONDS}s) for {phone}")
+            print("Marking as EXPIRED, resetting conversation, and advancing to next number...")
+            print("=" * 60)
+            await stop_response_poll()
+            await request_cancel_and_finish(
+                "expired",
+                f"OTP response timeout ({OTP_TIMEOUT_SECONDS}s)",
+                "OTP timeout",
+            )
 
     except asyncio.CancelledError:
 
@@ -1503,6 +1539,12 @@ async def cancel_current_conversation(
 
     cancel_in_progress = True
 
+    # Don't send /cancel during FloodWait
+    if get_flood_wait_remaining() > 0:
+        print(f"[{now()}] Skipping /cancel — FloodWait active ({get_flood_wait_remaining()}s remaining)")
+        cancel_in_progress = False
+        return
+
     print()
     print("=" * 60)
     print("CANCELLING CURRENT CONVERSATION")
@@ -1524,13 +1566,22 @@ async def cancel_current_conversation(
             f"[{now()}] /cancel sent"
         )
 
-        await asyncio.sleep(2)
+        await asyncio.sleep(0.5)
 
     except Exception as e:
-
-        print(
-            f"[{now()}] Cancel error: {e}"
-        )
+        err_str = str(e)
+        if "wait of" in err_str.lower() or "flood" in err_str.lower():
+            m = re.search(r"wait of (\d+) seconds", err_str)
+            sec = int(m.group(1)) if m else 300
+            global telegram_flood_wait_until
+            telegram_flood_wait_until = time.time() + sec
+            msg = f"Telegram FloodWait: {sec}s ({sec // 60}m {sec % 60}s) wait required"
+            print(f"[{now()}] ⚠️ {msg}")
+            sync_worker_status_all("telegram_flood_wait", current_job, msg)
+        else:
+            print(
+                f"[{now()}] Cancel error: {e}"
+            )
 
     finally:
 
@@ -1655,71 +1706,152 @@ async def get_latest_bot_message():
 
 
 def find_login_button(message):
-    """Return (row, column) for Login via OTP, or None."""
+    """Return (row, column) for 'Login via OTP' button, strictly avoiding 'Multi Login'."""
     buttons = getattr(message, "buttons", None)
     if not buttons:
         return None
 
+    # Print all available menu buttons for visibility
+    all_btns = []
+    for r, row in enumerate(buttons):
+        for c, btn in enumerate(row):
+            txt = getattr(btn, "text", "") or ""
+            if txt:
+                all_btns.append(f"[{r},{c}] '{txt}'")
+    if all_btns:
+        print(f"[{now()}] Telegram Bot Menu Buttons: {', '.join(all_btns)}")
+
+    # PASS 1: Explicit match for "login via otp", "login with otp", "login otp", "otp login" (STRICTLY EXCLUDING "multi")
     for row_index, row in enumerate(buttons):
         for button_index, button in enumerate(row):
-            if not getattr(button, "text", None):
+            t = (getattr(button, "text", None) or "").lower().strip()
+            if not t or "multi" in t:
                 continue
-            if "login via otp" in button.text.lower():
+            if "login via otp" in t or "login with otp" in t or "login otp" in t or "otp login" in t:
+                print(f"[{now()}] Selected button: '{button.text}' at [{row_index},{button_index}] (Match: Login via OTP)")
                 return row_index, button_index
 
+    # PASS 2: Match containing both "login" and "otp" anywhere (STRICTLY EXCLUDING "multi")
+    for row_index, row in enumerate(buttons):
+        for button_index, button in enumerate(row):
+            t = (getattr(button, "text", None) or "").lower().strip()
+            if not t or "multi" in t:
+                continue
+            if "login" in t and "otp" in t:
+                print(f"[{now()}] Selected button: '{button.text}' at [{row_index},{button_index}] (Match: login+otp)")
+                return row_index, button_index
+
+    # PASS 3: Match "via otp" or "with otp" (STRICTLY EXCLUDING "multi")
+    for row_index, row in enumerate(buttons):
+        for button_index, button in enumerate(row):
+            t = (getattr(button, "text", None) or "").lower().strip()
+            if not t or "multi" in t:
+                continue
+            if "via otp" in t or "with otp" in t or t == "otp":
+                print(f"[{now()}] Selected button: '{button.text}' at [{row_index},{button_index}] (Match: via otp)")
+                return row_index, button_index
+
+    # PASS 4: Standalone "login" or "sign in" (STRICTLY EXCLUDING "multi")
+    for row_index, row in enumerate(buttons):
+        for button_index, button in enumerate(row):
+            t = (getattr(button, "text", None) or "").lower().strip()
+            if not t or "multi" in t:
+                continue
+            if "login" in t or "sign in" in t:
+                print(f"[{now()}] Selected button: '{button.text}' at [{row_index},{button_index}] (Match: fallback login)")
+                return row_index, button_index
+
+    print(f"[{now()}] No 'Login via OTP' button found among menu buttons.")
     return None
 
 
 async def submit_selected_test_number():
-    """Submit the selected device number to the controlled test bot."""
-    if not current_job:
-        return False
+    """Submit the selected device number to the controlled test bot exactly once."""
+    global current_job
 
-    raw_phone = current_job.get("device_phone", "")
+    async with number_submit_lock:
+        if not current_job:
+            return False
 
-    try:
-        test_number = extract_local_10_digit_number(raw_phone)
-    except ValueError as e:
-        print(f"[{now()}] Device number error: {e}")
-        await request_cancel_and_finish(
-            "failed",
-            str(e),
-            "Invalid selected device number",
-        )
-        return False
+        if current_job.get("number_submitted"):
+            print(f"[{now()}] Number already submitted for job {current_job.get('id')}. Skipping duplicate send.")
+            return True
 
-    current_job["test_number"] = test_number
+        raw_phone = current_job.get("device_phone", "") or current_job.get("number", "")
 
-    set_state("WAITING_FOR_NUMBER")
+        try:
+            test_number = extract_local_10_digit_number(raw_phone)
+        except ValueError as e:
+            print(f"[{now()}] Device number error: {e}")
+            await request_cancel_and_finish(
+                "invalid_number",
+                str(e),
+                "Invalid selected device number",
+            )
+            return False
 
-    sync_worker_status_all("waiting_for_number", current_job)
-    try:
-        update_job_status(
-            current_job,
-            "waiting_for_number",
-        )
-    except Exception:
-        pass
+        current_job["test_number"] = test_number
+        current_job["number_submitted"] = True
+        current_job["number_submitted_at"] = time.time()
+        current_job["submitted_otps"] = set()
 
-    print()
-    print("NUMBER REQUEST RECEIVED / RESUMED")
-    print("Selected device:", current_job["device_id"])
-    print("Selected Firebase:", current_job["device_database"])
-    print("Selected test number:", test_number)
+        sync_worker_status_all("submitting_number", current_job)
 
-    # Capture baseline BEFORE submitting the number so incoming OTP is never swallowed
-    try:
-        capture_response_baseline()
-    except Exception as e:
-        print(f"[{now()}] Pre-submit baseline capture error: {e}")
+        print()
+        print("=" * 60)
+        print("SUBMITTING 10-DIGIT NUMBER TO BOT")
+        print("Job ID:", current_job.get("id"))
+        print("Device ID:", current_job.get("device_id"))
+        print("Selected Firebase:", current_job.get("device_database"))
+        print("Test number:", test_number)
+        print("=" * 60)
 
-    current_job["number_submitted_at"] = time.time()
-    current_job["submitted_otps"] = set()
+        # Capture baseline BEFORE submitting the number so incoming OTP is never swallowed
+        try:
+            capture_response_baseline()
+        except Exception as e:
+            print(f"[{now()}] Pre-submit baseline capture error: {e}")
 
-    await client.send_message(BOT_USERNAME, test_number)
-    print(f"[{now()}] Number submitted to bot.")
-
-    return True
+        try:
+            await client.send_message(BOT_USERNAME, test_number)
+            set_state("NUMBER_SUBMITTED")
+            sync_worker_status_all("number_submitted", current_job)
+            try:
+                update_job_status(
+                    current_job,
+                    "number_submitted",
+                )
+            except Exception:
+                pass
+            print(f"[{now()}] Number {test_number} submitted to bot.")
+            start_response_poll(current_job["id"])
+            return True
+        except Exception as e:
+            err_str = str(e)
+            if "wait of" in err_str.lower() or "flood" in err_str.lower():
+                m = re.search(r"wait of (\d+) seconds", err_str)
+                sec = int(m.group(1)) if m else 300
+                global telegram_flood_wait_until
+                telegram_flood_wait_until = time.time() + sec
+                msg = f"Telegram FloodWait: {sec}s ({sec // 60}m {sec % 60}s) wait required"
+                print(f"[{now()}] ⚠️ {msg}")
+                sync_worker_status_all("telegram_flood_wait", current_job, msg)
+                # DO NOT mark candidate number as failed in registry! Return job to queued
+                try:
+                    update_job_status(current_job, "queued", msg)
+                except Exception:
+                    pass
+                current_job = None
+                set_state("FLOOD_WAIT")
+                return False
+            else:
+                print(f"[{now()}] Failed to submit number: {e}")
+                await request_cancel_and_finish(
+                    "failed",
+                    f"Number submission failed: {e}",
+                    "Number submission failed",
+                )
+                return False
 
 
 async def click_login_button_from_message(message):
@@ -1748,11 +1880,14 @@ async def click_login_button_from_message(message):
 
     try:
         row_index, button_index = button_position
+        btn_text = ""
+        try:
+            btn_text = message.buttons[row_index][button_index].text
+        except Exception:
+            pass
 
         print()
-        print("CLICKING LOGIN VIA OTP")
-        print("Row:", row_index)
-        print("Column:", button_index)
+        print(f"[{now()}] CLICKING '{btn_text}' [Row {row_index}, Col {button_index}]")
 
         await message.click(row_index, button_index)
 
@@ -1768,10 +1903,23 @@ async def click_login_button_from_message(message):
         except Exception:
             pass
 
-        print("Login via OTP clicked successfully.")
+        print(f"[{now()}] Button '{btn_text}' clicked successfully.")
         return True
 
     except Exception as e:
+        err_str = str(e)
+        # If button click also triggers FloodWait, record it and retry later
+        if "wait of" in err_str.lower() or "flood" in err_str.lower():
+            m = re.search(r"wait of (\d+) seconds", err_str)
+            sec = int(m.group(1)) if m else 300
+            global telegram_flood_wait_until
+            telegram_flood_wait_until = time.time() + sec
+            msg = f"FloodWait on button click: {sec}s ({sec // 60}m {sec % 60}s)"
+            print(f"[{now()}] ⚠️ {msg}")
+            sync_worker_status_all("telegram_flood_wait", current_job, msg)
+            set_state("FLOOD_WAIT")
+            return False
+
         print("Failed to click Login via OTP:", e)
         await request_cancel_and_finish(
             "failed",
@@ -1785,47 +1933,26 @@ async def click_login_button_from_message(message):
 
 
 async def prepare_telegram_flow_for_job():
-    """Resume an existing Telegram UI if possible; otherwise reset it."""
-    global pending_restart_after_cancel
+    """Start Telegram flow for the new job: send /start and wait for menu."""
+    global login_clicked_for_job
+    global login_click_in_progress
 
     if not current_job:
         return
 
-    latest = await get_latest_bot_message()
+    # Reset job-specific flow flags
+    login_clicked_for_job = None
+    login_click_in_progress = False
 
-    if latest:
-        text = (latest.raw_text or "").strip()
-        lower = text.lower()
+    print()
+    print("=" * 60)
+    print(f"[{now()}] STARTING TELEGRAM FLOW FOR JOB {current_job.get('id')}")
+    print(f"Phone: {current_job.get('number')}")
+    print("Sending /start to Telegram bot...")
+    print("=" * 60)
 
-        print()
-        print("LATEST TELEGRAM UI CHECK")
-        safe_print(text or "<no text>")
-
-        # If the previous conversation is already waiting for the number,
-        # do not send /start and do not click anything again.
-        if "enter the 10-digit" in lower:
-            await submit_selected_test_number()
-            return
-
-        # If the menu is already present, click Login directly.
-        if "welcome to" in lower and getattr(latest, "buttons", None):
-            if find_login_button(latest) is not None:
-                await click_login_button_from_message(latest)
-                return
-
-        # Already cancelled: start a fresh menu flow.
-        if "conversation cancelled" in lower:
-            set_state("WAITING_FOR_MENU")
-            await send_start_if_needed(force=True)
-            return
-
-    # Anything else can represent a stale/pending conversation. Reset it
-    # first, then let the cancellation handler start /start.
-    print(f"[{now()}] Telegram is not in the expected UI state.")
-    print(f"[{now()}] Sending /cancel, then /start after cancellation.")
-
-    pending_restart_after_cancel = True
-    await cancel_current_conversation("Reset stale Telegram conversation")
+    set_state("WAITING_FOR_MENU")
+    await send_start_if_needed(force=True)
 
 
 # ============================================================
@@ -1847,11 +1974,23 @@ async def start_next_job():
             print("A job is already running:", current_job["id"])
             return
 
+        rem_flood = get_flood_wait_remaining()
+        if rem_flood > 0:
+            # Only log and sync once when entering flood wait (not every iteration)
+            if state != "FLOOD_WAIT":
+                msg = f"Telegram FloodWait: {rem_flood}s ({rem_flood // 60}m {rem_flood % 60}s) remaining. Waiting..."
+                print(f"[{now()}] ⚠️ {msg}")
+                set_state("FLOOD_WAIT")
+                sync_worker_status_all("telegram_flood_wait", None, msg)
+            # Sleep for the remaining flood wait (capped at 60s chunks so we stay responsive to cancellation)
+            sleep_time = min(rem_flood + 2, 60)
+            await asyncio.sleep(sleep_time)
+            return
+
         # 1. First priority: Check for queued jobs dispatched from the frontend UI
         auth_db = _get_auth_db()
         queued_item = get_next_queued_job(auth_db)
         if queued_item:
-            database = queued_item["database"]
             job_id = queued_item["jobId"]
             job_data = queued_item.get("job", {})
             device_id = str(job_data.get("deviceId", job_data.get("device_id", ""))).strip()
@@ -1864,15 +2003,36 @@ async def start_next_job():
                 update_job_status(queued_item, "failed", str(e))
                 return
 
+            # Resolve actual device database:
+            # 1. Directly from the job payload (frontend sends database: conn.url)
+            target_device_db = (
+                str(job_data.get("database") or job_data.get("device_database") or "").strip()
+            )
+            # 2. If not specified or equals auth_db, search device_registry by device_id or phone
+            if not target_device_db or target_device_db == auth_db:
+                target_10 = normalize_to_10_digits(phone_val)
+                for k, dev in device_registry.items():
+                    if device_id and dev.get("device_id") == device_id and dev.get("database"):
+                        target_device_db = dev["database"]
+                        break
+                    if target_10 and normalize_to_10_digits(dev.get("phone", "")) == target_10 and dev.get("database"):
+                        target_device_db = dev["database"]
+                        break
+
+            if not target_device_db:
+                target_device_db = queued_item.get("database") or auth_db
+
+            queue_db = queued_item.get("database") or auth_db
+
             current_job = {
                 "id": job_id,
                 "jobId": job_id,
                 "name": job_data.get("name", args.name),
                 "number": local_number,
                 "device_id": device_id,
-                "device_database": database,
+                "device_database": target_device_db,
                 "device_phone": phone_val,
-                "database": database,
+                "database": queue_db,
                 "source": "frontend-queue",
                 "job": job_data,
                 "otp_retries": 0,
@@ -1888,7 +2048,8 @@ async def start_next_job():
             print("Job ID:", job_id)
             print("Device ID:", device_id)
             print("10-digit test number:", local_number)
-            print("Database:", database)
+            print("Target Device DB:", target_device_db)
+            print("Queue DB:", queue_db)
             print("=" * 60)
 
             update_job_status(
@@ -2065,6 +2226,12 @@ async def finish_and_start_next(
 
 async def send_start_if_needed(force=False):
     global last_start_sent_at
+    global telegram_flood_wait_until
+
+    rem_flood = get_flood_wait_remaining()
+    if rem_flood > 0:
+        print(f"[{now()}] Suppressing /start due to active FloodWait ({rem_flood}s remaining)")
+        return False
 
     loop = asyncio.get_running_loop()
     now_ts = loop.time()
@@ -2080,79 +2247,52 @@ async def send_start_if_needed(force=False):
         )
         return False
 
-    await client.send_message(
-        BOT_USERNAME,
-        "/start",
-    )
-
-    last_start_sent_at = now_ts
-
-    print(
-        f"[{now()}] /start sent"
-    )
-
-    return True
+    try:
+        await client.send_message(
+            BOT_USERNAME,
+            "/start",
+        )
+        last_start_sent_at = now_ts
+        print(
+            f"[{now()}] /start sent"
+        )
+        return True
+    except Exception as e:
+        err_str = str(e)
+        if "wait of" in err_str.lower() or "flood" in err_str.lower():
+            m = re.search(r"wait of (\d+) seconds", err_str)
+            sec = int(m.group(1)) if m else 300
+            telegram_flood_wait_until = time.time() + sec
+            msg = f"Telegram FloodWait: {sec}s ({sec // 60}m {sec % 60}s) wait required"
+            print(f"[{now()}] ⚠️ {msg}")
+            sync_worker_status_all("telegram_flood_wait", current_job, msg)
+        else:
+            print(f"[{now()}] Error sending /start: {e}")
+        return False
 
 
 async def restart_current_job_login(reason=""):
-    """Reset conversation and restart login for the current job (e.g. for retry once)."""
-    global login_clicked_for_job
-    global login_click_in_progress
-    global pending_restart_after_cancel
-    global last_telegram_activity
-
+    """Reset conversation and finish current job to advance to the next number."""
     if not current_job:
         return
 
-    job_id = current_job["id"]
-    phone = current_job.get("number")
-
     print()
     print("=" * 60)
-    print("RESTARTING LOGIN PROCESS FOR CURRENT NUMBER")
+    print(f"[{now()}] ABORTING CURRENT NUMBER AND ADVANCING TO NEXT")
     print(f"Reason: {reason}")
-    print(f"Job: {job_id}")
-    print(f"Phone: {phone}")
+    print(f"Job: {current_job.get('id')}")
+    print(f"Phone: {current_job.get('number')}")
     print("=" * 60)
 
-    # 1. Stop active timers and polling
     await stop_otp_timer()
     await stop_verification_timer()
     await stop_response_poll()
 
-    # 2. Reset flags
-    login_clicked_for_job = None
-    login_click_in_progress = False
-
-    # 3. Set pending restart flag so cancellation confirmation triggers /start
-    pending_restart_after_cancel = True
-    last_telegram_activity = time.monotonic()
-
-    # 4. Set state to CANCELLING and worker status to retrying
-    set_state("CANCELLING")
-    sync_worker_status_all(
-        "retrying",
-        current_job,
+    await request_cancel_and_finish(
+        "failed",
+        reason or "Job aborted",
+        reason or "Abort and advance to next number",
     )
-
-    # 5. Send /cancel to reset Telegram conversation cleanly
-    try:
-        await client.send_message(BOT_USERNAME, "/cancel")
-        print(f"[{now()}] /cancel sent to reset conversation.")
-    except Exception as e:
-        print(f"[{now()}] Error sending /cancel: {e}")
-
-    # 6. Fallback: Wait up to 3 seconds for cancellation confirmation from bot.
-    # If bot doesn't reply (e.g. was already cancelled or silent), force /start directly.
-    await asyncio.sleep(3)
-    if pending_restart_after_cancel and current_job and state in {"CANCELLING", "CANCELLED"}:
-        print(f"[{now()}] Cancellation confirmation fallback: sending /start directly...")
-        pending_restart_after_cancel = False
-        set_state("WAITING_FOR_MENU")
-        try:
-            await send_start_if_needed(force=True)
-        except Exception as e:
-            print(f"[{now()}] Error sending fallback /start: {e}")
 
 
 async def request_cancel_and_finish(
@@ -2180,11 +2320,12 @@ async def request_cancel_and_finish(
     except Exception as e:
         print(f"[{now()}] Error sending cancel: {e}")
 
-    # Fallback timeout: If the bot does not respond with cancellation confirmation within 3 seconds,
+    # Fallback timeout: If the bot does not respond with cancellation confirmation within 4 seconds,
     # finish the job immediately so the worker is never stuck.
-    await asyncio.sleep(3)
+    await asyncio.sleep(4)
     if pending_finish_after_cancel and current_job:
-        print(f"[{now()}] Cancel confirmation not received from bot within 3s. Force finishing job...")
+        print(f"[{now()}] Cancel confirmation not received from bot within 4s. Force finishing job...")
+        pending_finish_after_cancel = False
         await finish_and_start_next(status, error or "Timeout waiting for cancel confirmation")
 
 
@@ -2197,6 +2338,11 @@ async def request_cancel_and_finish(
         chats=BOT_USERNAME
     )
 )
+@client.on(
+    events.MessageEdited(
+        chats=BOT_USERNAME
+    )
+)
 async def message_handler(event):
 
     global current_job
@@ -2206,6 +2352,7 @@ async def message_handler(event):
     global pending_finish_status
     global pending_finish_error
     global pending_restart_after_cancel
+    global last_telegram_activity
 
     async with message_handler_lock:
 
@@ -2220,6 +2367,9 @@ async def message_handler(event):
             return
 
         lower = text.lower()
+
+        # Update last activity timestamp on any message received from the bot
+        last_telegram_activity = time.monotonic()
 
         print()
         print("-" * 60)
@@ -2245,8 +2395,6 @@ async def message_handler(event):
             print()
             print("CANCELLATION CONFIRMED")
 
-            set_state("CANCELLED")
-
             if pending_finish_after_cancel and current_job:
 
                 status = pending_finish_status or "failed"
@@ -2256,6 +2404,7 @@ async def message_handler(event):
                 pending_finish_status = ""
                 pending_finish_error = ""
 
+                set_state("CANCELLED")
                 await finish_and_start_next(
                     status,
                     error,
@@ -2265,13 +2414,27 @@ async def message_handler(event):
 
             if pending_restart_after_cancel and current_job:
                 pending_restart_after_cancel = False
-                print(f"[{now()}] Cancellation confirmed. Restarting /start for the same device.")
+                status = pending_finish_status or "failed"
+                error = pending_finish_error or "Conversation cancelled"
+                set_state("CANCELLED")
+                await finish_and_start_next(status, error)
+                return
+
+            if state in {"STARTING", "WAITING_FOR_MENU", "CANCELLING"}:
+                print(f"[{now()}] Conversation reset confirmed. Sending /start to bring up menu...")
                 set_state("WAITING_FOR_MENU")
                 await send_start_if_needed(force=True)
                 return
 
-            # If cancelled without pending flags, finish active job or reset to idle
+            # If cancelled without pending flags:
+            # If in active flow states, this is a stale echo from an earlier /cancel.
+            # Do NOT abort the active job!
+            if current_job and state in {"WAITING_FOR_OTP", "VERIFYING", "WAITING_FOR_NUMBER", "NUMBER_SUBMITTED", "WAITING_FOR_OTP_REQUEST"}:
+                print(f"[{now()}] Ignoring delayed cancellation echo while job {current_job.get('id')} is actively in state {state}.")
+                return
+
             if current_job:
+                set_state("CANCELLED")
                 await finish_and_start_next(
                     "failed",
                     "Conversation cancelled",
@@ -2295,10 +2458,11 @@ async def message_handler(event):
         # --------------------------------------------------------
         # MAIN MENU
         # --------------------------------------------------------
-        if (
-            "welcome to" in lower
-            and event.message.buttons
-        ):
+        is_menu = (
+            ("welcome" in lower or "swiggy" in lower or "portal" in lower or "menu" in lower)
+            and getattr(event.message, "buttons", None)
+        )
+        if is_menu and state in {"STARTING", "WAITING_FOR_MENU", "MENU_RECEIVED"}:
 
             print()
             print("MAIN MENU RECEIVED")
@@ -2316,7 +2480,7 @@ async def message_handler(event):
                 set_state("WAITING_FOR_MENU")
 
                 try:
-                    await send_start_if_needed()
+                    await send_start_if_needed(force=True)
                 except Exception as e:
                     print(
                         f"[{now()}] Failed to resend /start: {e}"
@@ -2328,20 +2492,85 @@ async def message_handler(event):
             return
 
         # --------------------------------------------------------
-        # NUMBER REQUEST
+        # NUMBER PROMPT REQUEST
         # --------------------------------------------------------
-        if "enter the 10-digit" in lower:
+        is_number_prompt = (
+            "10-digit" in lower
+            or "10 digit" in lower
+            or "mobile number" in lower
+            or "phone number" in lower
+            or "enter your mobile" in lower
+            or "send your mobile" in lower
+            or "enter the number" in lower
+        ) and not (
+            "otp sent" in lower
+            or "6-digit" in lower
+            or "6 digit" in lower
+            or "suspended" in lower
+            or "attempts exceeded" in lower
+            or "please send the mobile number again" in lower
+            or "already registered" in lower
+            or "only allows logging in new accounts" in lower
+            or "enter another" in lower
+            or "invalid" in lower
+            or "request failed" in lower
+        )
 
+        if is_number_prompt and state == "WAITING_FOR_NUMBER":
+            if current_job.get("number_submitted"):
+                print(f"[{now()}] Number prompt detected but number already submitted for job {job_id}. Skipping.")
+                return
             await submit_selected_test_number()
             return
 
         # --------------------------------------------------------
-        # OTP REQUEST
+        # OTP REQUEST IN PROGRESS ("Requesting OTP from Swiggy...")
         # --------------------------------------------------------
-        if (
+        is_requesting_otp = (
+            "requesting otp from swiggy" in lower
+            or "requesting otp" in lower
+            or ("requesting" in lower and "otp" in lower)
+        ) and not (
+            "failed" in lower
+            or "error" in lower
+            or "suspended" in lower
+            or "invalid" in lower
+            or "otp sent" in lower
+            or "enter the 6-digit" in lower
+        )
+
+        if is_requesting_otp and state in {"NUMBER_SUBMITTED", "WAITING_FOR_NUMBER"}:
+            print()
+            print(f"[{now()}] OTP REQUEST IN PROGRESS: Bot is requesting OTP from Swiggy for {current_job.get('number')}...")
+            set_state("WAITING_FOR_OTP_REQUEST")
+            sync_worker_status_all("waiting_for_otp_request", current_job)
+            # Do NOT start OTP timer or Firebase response poll yet!
+            return
+
+        # --------------------------------------------------------
+        # OTP SENT CONFIRMATION ("OTP Sent successfully!")
+        # --------------------------------------------------------
+        is_otp_sent = (
             "otp sent successfully" in lower
-            or "enter the 6-digit otp" in lower
-        ):
+            or "otp sent" in lower
+            or "enter the 6-digit" in lower
+            or "enter the 6 digit" in lower
+            or "6-digit otp" in lower
+            or "6 digit otp" in lower
+            or "enter the otp" in lower
+            or "enter otp" in lower
+            or "verification code" in lower
+        ) and not (
+            "requesting" in lower
+            or "invalid otp" in lower
+            or "invalid code" in lower
+            or "expired" in lower
+            or "suspended" in lower
+            or "failed" in lower
+            or "attempts exceeded" in lower
+        )
+
+        if is_otp_sent and state in {"NUMBER_SUBMITTED", "WAITING_FOR_OTP_REQUEST"}:
 
             set_state("WAITING_FOR_OTP")
 
@@ -2358,10 +2587,10 @@ async def message_handler(event):
                 pass
 
             print()
-            print("OTP REQUEST RECEIVED")
-            print(
-                f"Starting {OTP_TIMEOUT_SECONDS}s timeout."
-            )
+            print("=" * 60)
+            print("OTP SENT SUCCESSFULLY BY BOT")
+            print(f"[{now()}] Starting {OTP_TIMEOUT_SECONDS}s timeout and Firebase response polling.")
+            print("=" * 60)
 
             # Baseline is captured before number submission. Fallback only if missing.
             if not current_job.get("number_submitted_at"):
@@ -2380,7 +2609,7 @@ async def message_handler(event):
         # --------------------------------------------------------
         # VERIFYING
         # --------------------------------------------------------
-        if "verifying" in lower:
+        if "verifying" in lower and not ("failed" in lower or "error" in lower or "invalid" in lower):
 
             await stop_otp_timer()
             await stop_response_poll()
@@ -2403,7 +2632,9 @@ async def message_handler(event):
             or "successfully linked" in lower
         ):
 
+            await stop_otp_timer()
             await stop_verification_timer()
+            await stop_response_poll()
 
             print()
             print("=" * 60)
@@ -2455,9 +2686,18 @@ async def message_handler(event):
             classification = "invalid_otp"
 
         elif (
+            "already registered" in lower
+            or "only allows logging in new accounts" in lower
+            or "already exists" in lower
+            or "is already registered" in lower
+        ):
+            classification = "already_registered"
+
+        elif (
             "invalid number format" in lower
             or "invalid phone" in lower
             or "invalid mobile" in lower
+            or ("valid 10-digit mobile number" in lower and "cancel" in lower)
         ):
             classification = "invalid_number"
 
@@ -2471,19 +2711,24 @@ async def message_handler(event):
                 "something went wrong",
                 "error occurred",
                 "please send the mobile number again",
+                "enter another 10-digit mobile number",
+                "send /cancel to stop",
+                "send /cancel to abort",
             ]
         ):
             classification = "failed"
 
         flow_states = {
             "WAITING_FOR_NUMBER",
+            "NUMBER_SUBMITTED",
+            "WAITING_FOR_OTP_REQUEST",
             "WAITING_FOR_OTP",
             "VERIFYING",
         }
 
         stale_menu_error = (
             state in {"STARTING", "WAITING_FOR_MENU", "MENU_RECEIVED"}
-            and "invalid number format" in lower
+            and classification in {"invalid_number", "suspended", "failed"}
         )
 
         if classification and (state in flow_states or stale_menu_error):
@@ -2498,39 +2743,9 @@ async def message_handler(event):
             await stop_verification_timer()
             await stop_response_poll()
 
-            # Handle OTP expiration / invalid OTP retry once:
-            if classification in {"expired", "invalid_otp"}:
-                retries = current_job.get("otp_retries", 0)
-                if retries < 1:
-                    current_job["otp_retries"] = 1
-                    print()
-                    print("=" * 60)
-                    print(f"[{now()}] BOT REPORTED {classification.upper()} for {current_job.get('number')} - RETRYING ONCE (Attempt 2 of 2)")
-                    print("=" * 60)
-                    await restart_current_job_login(f"{classification} - retrying once")
-                    return
-                else:
-                    print()
-                    print("=" * 60)
-                    print(f"[{now()}] BOT REPORTED {classification.upper()} for {current_job.get('number')} - MAX RETRIES REACHED")
-                    print("Marking as EXPIRED and advancing to next number...")
-                    print("=" * 60)
-                    await request_cancel_and_finish(
-                        "expired",
-                        text,
-                        f"{classification} after retry",
-                    )
-                    return
-
-            # Stale number format in menu
-            if stale_menu_error:
-                pending_restart_after_cancel = True
-                await cancel_current_conversation(
-                    "Stale Telegram number-entry state"
-                )
-                return
-
-            # For suspended, rate_limited, invalid_number, or generic failure:
+            # For ALL number-level errors, suspended accounts, and invalid numbers:
+            # DO NOT retry the same number.
+            # Reset conversation via /cancel -> wait for confirmation -> /start -> menu -> Login via OTP -> NEXT number
             await request_cancel_and_finish(
                 classification,
                 text,
@@ -2670,7 +2885,22 @@ async def ui_control_loop():
         except Exception as _ctrl_err:
             pass
 
-        await asyncio.sleep(0.5)
+        # Adaptive polling: faster during active job, slower when idle
+        await asyncio.sleep(2.0 if current_job else 5.0)
+
+
+async def worker_heartbeat_loop():
+    """Periodically publish worker heartbeat to Firebase so the UI knows the worker is online."""
+    while True:
+        try:
+            status = state.lower() if state else "idle"
+            sync_worker_status_all(status, current_job)
+        except asyncio.CancelledError:
+            break
+        except Exception:
+            pass
+        # Heartbeat every 30s to reduce Firebase writes; state changes are pushed instantly by sync_worker_status_all
+        await asyncio.sleep(30)
 
 
 # ============================================================
@@ -2710,6 +2940,7 @@ async def worker_loop():
     dashboard_task = asyncio.create_task(dashboard_loop())
     watchdog_task = asyncio.create_task(stuck_watchdog_loop())
     control_task = asyncio.create_task(ui_control_loop())
+    heartbeat_task = asyncio.create_task(worker_heartbeat_loop())
 
     try:
         while True:
@@ -2743,12 +2974,14 @@ async def worker_loop():
         dashboard_task.cancel()
         watchdog_task.cancel()
         control_task.cancel()
+        heartbeat_task.cancel()
 
         await asyncio.gather(
             registry_task,
             dashboard_task,
             watchdog_task,
             control_task,
+            heartbeat_task,
             return_exceptions=True,
         )
 

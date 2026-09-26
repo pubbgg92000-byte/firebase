@@ -1,4 +1,5 @@
 import json
+import os
 import re
 import requests
 from datetime import datetime
@@ -41,9 +42,12 @@ AUTO_STOP_WHEN_EMPTY = CONFIG.get(
 
 
 if not FIREBASE_DATABASES:
-    raise ValueError(
-        "No Firebase databases configured in worker_config.json"
-    )
+    env_db = os.getenv("FIREBASE_DATABASE_URL", "").strip()
+    if env_db:
+        FIREBASE_DATABASES = [env_db]
+    else:
+        print("⚠️ Warning: No Firebase databases configured in worker_config.json or .env.")
+        print("Please add your Firebase database URL in the Web UI or worker_config.json.")
 
 
 print("=" * 60)
@@ -86,8 +90,11 @@ def firebase_request(
         timeout=15,
     )
 
-    print(f"{method} URL:", url)
-    print("HTTP:", response.status_code)
+    # Only log errors or important state writes (jobs, numbers, auth) to keep logs clean
+    if response.status_code >= 400:
+        print(f"[{method}] {url} -> HTTP {response.status_code}")
+    elif method in ("PUT", "PATCH", "DELETE") and ("jobs" in path or "numbers" in path or "auth" in path):
+        print(f"[{method}] {path} -> HTTP {response.status_code}")
 
     response.raise_for_status()
 
@@ -182,6 +189,10 @@ def _fetch_db_queued_jobs(database):
 
 
 def get_all_queued_jobs(preferred_db=None):
+    all_dbs = get_firebase_databases()
+    if not preferred_db and all_dbs:
+        preferred_db = all_dbs[0]
+
     # 1. Check preferred DB (auth_db / primary DB) first for instant response (<200ms)
     if preferred_db:
         quick = _fetch_db_queued_jobs(preferred_db)
@@ -193,8 +204,8 @@ def get_all_queued_jobs(preferred_db=None):
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
     combined = []
-    max_workers = min(15, max(2, len(FIREBASE_DATABASES)))
-    dbs_to_check = [d for d in FIREBASE_DATABASES if not preferred_db or d != preferred_db]
+    max_workers = min(15, max(2, len(all_dbs)))
+    dbs_to_check = [d for d in all_dbs if not preferred_db or d != preferred_db]
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = [
@@ -229,9 +240,15 @@ def update_job_status(
     status,
     error="",
 ):
+    if not isinstance(job_info, dict):
+        return None
 
-    database = job_info["database"]
-    job_id = job_info["jobId"]
+    database = job_info.get("database")
+    device_database = job_info.get("device_database")
+    job_id = job_info.get("jobId") or job_info.get("id")
+
+    if not job_id:
+        return None
 
     data = {
         "status": status,
@@ -241,11 +258,29 @@ def update_job_status(
         ),
     }
 
-    return firebase_update(
-        database,
-        f"automation/jobs/{job_id}",
-        data,
-    )
+    res = None
+    if database:
+        try:
+            res = firebase_update(
+                database,
+                f"automation/jobs/{job_id}",
+                data,
+            )
+        except Exception:
+            pass
+
+    if device_database and device_database != database:
+        try:
+            firebase_update(
+                device_database,
+                f"automation/jobs/{job_id}",
+                data,
+            )
+        except Exception:
+            pass
+
+    return res
+
 
 
 def update_worker_status(
@@ -533,7 +568,7 @@ def get_all_devices():
     print("=" * 60)
 
     for index, database in enumerate(
-        FIREBASE_DATABASES,
+        get_firebase_databases(),
         start=1,
     ):
 
@@ -646,6 +681,19 @@ def get_next_available_device(
 # ============================================================
 
 def get_firebase_databases():
+    global FIREBASE_DATABASES
+    try:
+        cfg = load_config()
+        dbs = cfg.get("firebase_databases", [])
+        if dbs:
+            FIREBASE_DATABASES = list(dbs)
+            return list(dbs)
+    except Exception:
+        pass
+    env_db = os.getenv("FIREBASE_DATABASE_URL", "").strip()
+    if env_db:
+        FIREBASE_DATABASES = [env_db]
+        return [env_db]
     return list(FIREBASE_DATABASES)
 
 

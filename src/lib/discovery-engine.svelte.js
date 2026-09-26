@@ -226,6 +226,7 @@ function resetTomorrowIfNewDay() {
 
 async function fetchConn(conn) {
   if (!conn.enabled) return;
+  if (engine.db[conn.id]?.deactivated) return;
   engine.db[conn.id] = { ...engine.db[conn.id], loading: true, error: null };
   try {
     const { data: keysData } = await apiFetch(conn, conn.path, 'GET', undefined, { shallow: 'true' });
@@ -237,9 +238,16 @@ async function fetchConn(conn) {
         if (infoData && typeof infoData === 'object') info = infoData;
       } catch {}
     }
-    engine.db[conn.id] = { loading: false, error: null, keys, info, ts: new Date().toISOString() };
+    engine.db[conn.id] = { loading: false, error: null, deactivated: false, keys, info, ts: new Date().toISOString() };
   } catch (e) {
-    engine.db[conn.id] = { ...engine.db[conn.id], loading: false, error: e.message, ts: new Date().toISOString() };
+    const isDeact = String(e.message).includes('deactivated') || String(e.message).includes('423') || String(e.message).includes('Locked');
+    engine.db[conn.id] = {
+      ...engine.db[conn.id],
+      loading: false,
+      error: isDeact ? 'Database deactivated in Firebase' : e.message,
+      deactivated: isDeact,
+      ts: new Date().toISOString()
+    };
   }
 }
 
@@ -693,7 +701,7 @@ export function initEngine() {
   try {
     const saved = JSON.parse(localStorage.getItem('pd_connections') || 'null');
     if (Array.isArray(saved) && saved.length) {
-      engine.connections = saved;
+      engine.connections = saved.filter(c => !c.url?.includes('newpanel-4412c'));
     }
   } catch {}
 

@@ -286,8 +286,22 @@
     {/if}
 
     {#if autoEngine.telegramAuth.error}
-      <div class="tg-error-banner">
-        <strong>⚠ Auth Error:</strong> {autoEngine.telegramAuth.error}
+      <div class="tg-error-banner" style="display:flex; justify-content:space-between; align-items:flex-start; gap:8px;">
+        <div>
+          <strong>⚠ Auth Error:</strong> {autoEngine.telegramAuth.error}
+        </div>
+        <button
+          type="button"
+          style="background:none; border:none; color:inherit; font-size:16px; cursor:pointer; padding:0 4px; line-height:1; opacity:0.8;"
+          onclick={() => { autoEngine.telegramAuth.error = null; }}
+          title="Dismiss"
+        >×</button>
+      </div>
+    {/if}
+
+    {#if discoveryEngine.connections.length === 0}
+      <div class="tg-error-banner" style="margin-bottom:12px; background:rgba(234,179,8,0.12); border-color:rgba(234,179,8,0.3); color:#fde047;">
+        <strong>Notice:</strong> No Firebase databases are currently configured. Please add an active Firebase database on the Dashboard before connecting Telegram.
       </div>
     {/if}
 

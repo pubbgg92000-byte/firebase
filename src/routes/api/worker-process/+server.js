@@ -1,6 +1,7 @@
 import { json } from '@sveltejs/kit';
 import { spawn, exec } from 'node:child_process';
 import path from 'node:path';
+import fs from 'node:fs';
 
 /** @type {import('node:child_process').ChildProcess | null} */
 let workerProcess = null;
@@ -68,10 +69,22 @@ function stopWorkerProcess() {
   });
 }
 
-function startWorkerProcess() {
+async function startWorkerProcess() {
+  if (process.env.VERCEL) {
+    return {
+      ok: false,
+      running: false,
+      error: 'Vercel serverless environment detected. The Python Telegram worker must run on your local machine or a VPS where Python and Telethon are installed.'
+    };
+  }
+
   if (isWorkerRunning()) {
     return { ok: true, running: true, pid: workerProcess?.pid, message: 'Worker is already running' };
   }
+
+  // Kill any orphaned zombie worker.py processes from previous runs to release SQLite lock
+  await killZombieWorkers();
+  await new Promise(r => setTimeout(r, 400));
 
   const cwd = getWorkerCwd();
   addWorkerLog('🚀 Starting Python Telegram Worker (worker.py)...');
@@ -109,12 +122,31 @@ function startWorkerProcess() {
 }
 
 /** @type {import('./$types').RequestHandler} */
-export async function GET() {
+export async function GET({ url }) {
+  const includeNumbers = url.searchParams.get('numbers') === '1';
+  let processedNumbers = null;
+  let numbersCount = 0;
+  try {
+    const pPath = path.resolve(getWorkerCwd(), 'processed_numbers.json');
+    if (fs.existsSync(pPath)) {
+      const raw = fs.readFileSync(pPath, 'utf8');
+      const data = JSON.parse(raw);
+      if (data && typeof data === 'object') {
+        numbersCount = Object.keys(data).length;
+        if (includeNumbers) {
+          processedNumbers = data;
+        }
+      }
+    }
+  } catch {}
+
   return json({
     ok: true,
     running: isWorkerRunning(),
     pid: workerProcess?.pid || null,
-    logs: recentLogs.slice(-150)
+    logs: recentLogs.slice(-150),
+    numbersCount,
+    processedNumbers
   });
 }
 
@@ -125,7 +157,7 @@ export async function POST({ request }) {
     const action = String(body.action || 'status').toLowerCase();
 
     if (action === 'start') {
-      const res = startWorkerProcess();
+      const res = await startWorkerProcess();
       return json(res);
     } else if (action === 'stop') {
       await stopWorkerProcess();
@@ -135,7 +167,7 @@ export async function POST({ request }) {
       addWorkerLog('🔄 Restarting Python worker...');
       await stopWorkerProcess();
       await new Promise(r => setTimeout(r, 600));
-      const res = startWorkerProcess();
+      const res = await startWorkerProcess();
       return json(res);
     } else if (action === 'clear-logs') {
       recentLogs = [];

@@ -111,6 +111,8 @@
                   <span class="badge badge-danger">⛔ Suspended</span>
                 {:else if rec.status === 'rate_limited'}
                   <span class="badge badge-purple">⏳ Rate Limited</span>
+                {:else if rec.status === 'already_registered'}
+                  <span class="badge badge-purple" style="background: rgba(168, 85, 247, 0.15); color: #c084fc; border: 1px solid rgba(168, 85, 247, 0.3);">⚠️ Already Reg</span>
                 {:else if rec.status === 'invalid_number'}
                   <span class="badge badge-secondary">❌ Invalid Num</span>
                 {:else if rec.status === 'invalid_otp'}
