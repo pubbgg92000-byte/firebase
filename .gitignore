@@ -22,3 +22,21 @@ Thumbs.db
 vite.config.js.timestamp-*
 vite.config.ts.timestamp-*
 .env*
+
+# Python Bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyc
+_python_worker_ref/__pycache__/
+
+# Telegram Sessions & Credentials
+*.session
+*.session-journal
+_python_worker_ref/worker_config.json
+!_python_worker_ref/worker_config.example.json
+
+# Phone Number Harvests & Dumps
+_python_worker_ref/processed_numbers.json
+_python_worker_ref/processed_success.json
+_python_worker_ref/firebase-full.json

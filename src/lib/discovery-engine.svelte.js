@@ -28,18 +28,8 @@ function nowIST() {
 }
 
 // ── Default Connections ─────────────────────────────────────────────────────
-const DEFAULT_CONNECTIONS = [
-  { id: 'c0', name: 'gunpawdar', url: 'https://gunpawdar-default-rtdb.asia-southeast1.firebasedatabase.app', token: '', path: 'messages', infoPath: 'clients', color: '#f97316', enabled: true },
-  { id: 'c1', name: 'surajkiwife', url: 'https://surajkiwife-9b0e2-default-rtdb.firebaseio.com', token: '', path: 'messages', infoPath: 'clients', color: '#38bdf8', enabled: true },
-  { id: 'c2', name: 'ranu', url: 'https://ranu-e604c-default-rtdb.firebaseio.com', token: '', path: 'messages', infoPath: 'clients', color: '#a78bfa', enabled: true },
-  { id: 'c3', name: 'rambhai', url: 'https://rambhai-2c356-default-rtdb.firebaseio.com', token: '', path: 'messages', infoPath: 'clients', color: '#34d399', enabled: true },
-  { id: 'c4', name: 'ramesh', url: 'https://ramesh-67a2b-default-rtdb.firebaseio.com', token: '', path: 'messages', infoPath: 'clients', color: '#fb7185', enabled: true },
-  { id: 'c5', name: 'krisna574', url: 'https://krisna574-ffef3-default-rtdb.firebaseio.com', token: '', path: 'messages', infoPath: 'clients', color: '#fbbf24', enabled: true },
-  { id: 'c6', name: 'navin', url: 'https://navin-9fb56-default-rtdb.firebaseio.com', token: '', path: 'messages', infoPath: 'clients', color: '#06b6d4', enabled: true },
-  { id: 'c7', name: 'palms', url: 'https://palms-568c7-default-rtdb.firebaseio.com', token: '', path: 'messages', infoPath: 'clients', color: '#ec4899', enabled: true },
-  { id: 'c8', name: 'rajkumar', url: 'https://rajkumar-a67fb-default-rtdb.firebaseio.com', token: '', path: 'messages', infoPath: 'clients', color: '#84cc16', enabled: true },
-  { id: 'c9', name: 'newpanel', url: 'https://newpanel-4412c-default-rtdb.firebaseio.com', token: '', path: 'messages', infoPath: 'clients', color: '#c084fc', enabled: true },
-];
+const DEFAULT_CONNECTIONS = [];
+
 
 // ═══════════════════════════════════════════════════════════════════════════
 // REACTIVE STATE (module-level singleton — survives SPA navigation)
@@ -703,11 +693,7 @@ export function initEngine() {
   try {
     const saved = JSON.parse(localStorage.getItem('pd_connections') || 'null');
     if (Array.isArray(saved) && saved.length) {
-      const defaultIds = new Set(engine.connections.map(c => c.id));
-      const extras = saved.filter(c => !defaultIds.has(c.id));
-      engine.connections = engine.connections
-        .map(c => { const s = saved.find(x => x.id === c.id); return s ? { ...c, enabled: s.enabled } : c; })
-        .concat(extras);
+      engine.connections = saved;
     }
   } catch {}
 
