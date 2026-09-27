@@ -181,12 +181,39 @@
   function extractOTPFromText(text) {
     if (!text) return null;
     const str = String(text);
+
+    // 1. Keyword-anchored patterns (highest confidence)
+    const kwPatterns = [
+      /(?:otp|code|pin|passcode|token|verification|secret|password|auth|login\s+code)\s*(?:is|:|-|=|\.)?\s*([0-9]{4,8})\b/i,
+      /\b([0-9]{4,8})\b\s*(?:is\s+(?:your\s+)?(?:otp|code|pin|passcode|token|verification|secret))/i,
+      /(?:G-|c-|code\s*[:\-])\s*([0-9]{4,8})\b/i,
+      /(?:otp|code|verification|verif)\s*(?:is|:|-|=|\.)?\s*([0-9]{3}[-\s][0-9]{3})\b/i,
+    ];
+
+    for (const pat of kwPatterns) {
+      const m = str.match(pat);
+      if (m && m[1]) {
+        const cleaned = m[1].replace(/[-\s]/g, "");
+        if (cleaned.length >= 4 && cleaned.length <= 8) return cleaned;
+      }
+    }
+
+    // Formatted 6-digit code (e.g. 123-456)
+    const hyphenMatch = str.match(/\b([0-9]{3})[-]([0-9]{3})\b/);
+    if (hyphenMatch) {
+      return `${hyphenMatch[1]}${hyphenMatch[2]}`;
+    }
+
+    // 2. Standalone number fallback
     const nums = str.match(/\b(\d{4,8})\b/g);
     if (!nums) return null;
+
     return (
-      nums.find(m => m.length === 6) ||
-      nums.find(m => m.length === 4) ||
-      nums.find(m => m.length === 8) ||
+      nums.find((m) => m.length === 6) ||
+      nums.find((m) => m.length === 4) ||
+      nums.find((m) => m.length === 8) ||
+      nums.find((m) => m.length === 5) ||
+      nums.find((m) => m.length === 7) ||
       nums[0]
     );
   }

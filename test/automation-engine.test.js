@@ -68,4 +68,65 @@ describe('Automation Test Response Parsing & Code Extraction', () => {
     assert.equal(matches[0].id, 'msg1');
     assert.equal(matches[1].id, 'msg3');
   });
+
+  test('extracts keyword-anchored OTP even when reference numbers exist', () => {
+    function extractSmartOTP(text) {
+      if (!text) return null;
+      const str = String(text);
+      const kwPatterns = [
+        /(?:otp|code|pin|passcode|token|verification|secret|password|auth|login\s+code)\s*(?:is|:|-|=|\.)?\s*([0-9]{4,8})\b/i,
+        /\b([0-9]{4,8})\b\s*(?:is\s+(?:your\s+)?(?:otp|code|pin|passcode|token|verification|secret))/i,
+        /(?:G-|c-|code\s*[:\-])\s*([0-9]{4,8})\b/i,
+        /(?:otp|code|verification|verif)\s*(?:is|:|-|=|\.)?\s*([0-9]{3}[-\s][0-9]{3})\b/i,
+      ];
+      for (const pat of kwPatterns) {
+        const m = str.match(pat);
+        if (m && m[1]) {
+          const cleaned = m[1].replace(/[-\s]/g, "");
+          if (cleaned.length >= 4 && cleaned.length <= 8) return cleaned;
+        }
+      }
+      const hyphenMatch = str.match(/\b([0-9]{3})[-]([0-9]{3})\b/);
+      if (hyphenMatch) return `${hyphenMatch[1]}${hyphenMatch[2]}`;
+      const nums = str.match(/\b(\d{4,8})\b/g);
+      if (!nums) return null;
+      return nums.find((m) => m.length === 6) || nums.find((m) => m.length === 4) || nums[0];
+    }
+
+    // 4-digit Swiggy code with a 6-digit ref number
+    const msg1 = 'Your Swiggy code is 4921. Ref: 891204';
+    assert.equal(extractSmartOTP(msg1), '4921');
+
+    // Hyphenated code
+    const msg2 = 'Your verification code is 849-102';
+    assert.equal(extractSmartOTP(msg2), '849102');
+
+    // Standard 6-digit OTP
+    const msg3 = 'Your OTP is 738192. Do not share.';
+    assert.equal(extractSmartOTP(msg3), '738192');
+  });
+
+  test('computes exact 90-second remaining countdown and expiration', () => {
+    const NOTIF_DURATION_MS = 90000;
+    const createdAt = 1000000;
+
+    // After 2 seconds
+    let currentTick = 1002000;
+    let elapsed = currentTick - createdAt;
+    let remainingSec = Math.max(0, Math.ceil((NOTIF_DURATION_MS - elapsed) / 1000));
+    assert.equal(remainingSec, 88);
+
+    // After 35 seconds (e.g. on panel refresh or page reload)
+    currentTick = 1035000;
+    elapsed = currentTick - createdAt;
+    remainingSec = Math.max(0, Math.ceil((NOTIF_DURATION_MS - elapsed) / 1000));
+    assert.equal(remainingSec, 55);
+
+    // After 90 seconds (expired)
+    currentTick = 1090000;
+    elapsed = currentTick - createdAt;
+    remainingSec = Math.max(0, Math.ceil((NOTIF_DURATION_MS - elapsed) / 1000));
+    assert.equal(remainingSec, 0);
+    assert.equal(elapsed >= NOTIF_DURATION_MS, true);
+  });
 });

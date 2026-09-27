@@ -378,7 +378,7 @@ async function pollForMatch(receiverDevice, targetDeviceId, startTime) {
   if (!conn) return null;
 
   try {
-    const { data } = await apiFetch(conn, `${conn.path}/${receiverDevice.key}`, 'GET', undefined, { orderBy: '"$key"', limitToLast: '15' });
+    const { data } = await apiFetch(conn, `${conn.path}/${receiverDevice.key}`, 'GET', undefined, { orderBy: '"$key"', limitToLast: '50' });
     if (!data || typeof data !== 'object') return null;
 
     for (const [msgId, msg] of Object.entries(data)) {
@@ -614,10 +614,10 @@ let _elapsedTimer = null;
 
 function startTimers() {
   stopTimers();
-  // Refresh devices every 15s while running
+  // Refresh devices every 10s while running
   _refreshTimer = setInterval(() => {
     if (engine.status === 'RUNNING') fetchAllDevices();
-  }, 15000);
+  }, 10000);
   // Elapsed seconds counter
   _elapsedTimer = setInterval(() => {
     if (engine.status === 'RUNNING' && engine.startedAt) {

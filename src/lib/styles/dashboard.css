@@ -583,29 +583,76 @@
     display: flex;
     align-items: center;
     justify-content: space-between;
-    padding: 0 20px;
+    padding: 0 16px;
     height: 44px;
     background: #0e1420;
     border-bottom: 1px solid rgba(255, 255, 255, 0.07);
     flex-shrink: 0;
-    gap: 10px;
+    gap: 12px;
+    overflow: hidden;
+    position: relative;
+    z-index: 20;
   }
   .tb-l {
     display: flex;
     align-items: center;
-    gap: 10px;
+    gap: 8px;
     min-width: 0;
+    flex: 1 1 auto;
+    overflow: hidden;
+    white-space: nowrap;
+  }
+  .tb-loading-pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 11px;
+    font-weight: 600;
+    padding: 3px 9px;
+    border-radius: 14px;
+    background: rgba(255, 255, 255, 0.05);
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    max-width: 220px;
+    overflow: hidden;
+    white-space: nowrap;
+    flex-shrink: 0;
+  }
+  .tb-loading-name {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    max-width: 140px;
+  }
+  .tb-loading-multi {
+    color: #38bdf8;
+    background: rgba(56, 189, 248, 0.1);
+    border-color: rgba(56, 189, 248, 0.3);
+  }
+  .tb-loading-text {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .tb-spin {
+    display: inline-block;
+    animation: spin 0.9s linear infinite;
+    font-size: 11px;
+    line-height: 1;
   }
   .refresh-cd {
     font-size: 11px;
-    color: #334155;
+    color: #64748b;
     font-family: "JetBrains Mono", monospace;
+    white-space: nowrap;
+    flex-shrink: 0;
   }
   .bg-refresh {
     display: flex;
     align-items: center;
     gap: 5px;
     color: #34d399;
+    white-space: nowrap;
+    flex-shrink: 0;
   }
   .bg-dot {
     width: 6px;
@@ -615,6 +662,7 @@
     display: inline-block;
     animation: bg-pulse 1.2s ease-in-out infinite;
     box-shadow: 0 0 6px rgba(52, 211, 153, 0.7);
+    flex-shrink: 0;
   }
   @keyframes bg-pulse {
     0%,
@@ -632,6 +680,7 @@
     align-items: center;
     gap: 8px;
     flex-shrink: 0;
+    margin-left: auto;
   }
   .tbstat {
     font-size: 12px;
@@ -2336,16 +2385,28 @@
       padding: 0 10px;
       height: 48px;
       gap: 6px;
+      overflow: hidden;
+      position: relative;
     }
     .tb-l {
       gap: 6px;
       min-width: 0;
-      flex: 1;
+      flex: 1 1 auto;
       overflow: hidden;
+      white-space: nowrap;
+    }
+    .tb-loading-pill {
+      max-width: 140px;
+      padding: 2px 7px;
+      font-size: 10px;
+    }
+    .tb-loading-name {
+      max-width: 80px;
     }
     .tb-r {
       gap: 5px;
       flex-shrink: 0;
+      margin-left: auto;
     }
 
     /* Hide stat text pills on mobile — already featured in overview */
@@ -4486,19 +4547,11 @@
     position: absolute;
     bottom: -7px;
     left: 0;
-    right: 0;
     height: 2px;
-    background: linear-gradient(90deg, #22c55e, transparent);
+    background: linear-gradient(90deg, #22c55e, #10b981);
     border-radius: 0 0 10px 10px;
-    animation: bp-shrink 90s linear both;
-  }
-  @keyframes bp-shrink {
-    from {
-      width: 100%;
-    }
-    to {
-      width: 0%;
-    }
+    transition: width 1s linear;
+    pointer-events: none;
   }
 
   /* Verif chip */

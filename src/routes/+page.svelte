@@ -148,13 +148,13 @@
   // path: where device keys live (root of messages)
   let connections = $state([]);
 
-  const FULL_REFRESH_INTERVAL_SECS = 120; // 2 minutes for all databases combined
+  const FULL_REFRESH_INTERVAL_SECS = 10; // 10 seconds for all databases combined
   const SELECTED_PANEL_INTERVAL_SECS = 10; // 10 seconds for active selected panel only
 
   let refreshInterval = $state(null);
   let selectedPanelInterval = $state(null);
   let lastRefresh = $state(null);
-  let nextRefreshSecs = $state(120);
+  let nextRefreshSecs = $state(10);
   let panelRefreshSecs = $state(10);
   let addOpen = $state(false);
   let form = $state({
@@ -490,8 +490,7 @@
         if (!createdAt) continue;
         const elapsed = now - createdAt;
         if (elapsed < NOTIF_DURATION_MS) {
-          const initialElapsedSec = (Math.max(0, elapsed) / 1000).toFixed(1);
-          active.push({ ...item, createdAt, initialElapsedSec });
+          active.push({ ...item, createdAt });
         }
       }
       return active;
@@ -500,13 +499,16 @@
     }
   }
 
-  let nowTick = $state(Date.now());
-
-  function getRemainingNotifSecs(createdAt, currentTick) {
-    const start = Number(createdAt) || currentTick;
-    const elapsed = Math.max(0, currentTick - start);
-    return Math.max(0, Math.ceil((NOTIF_DURATION_MS - elapsed) / 1000));
+  function getStoredNotifSeen() {
+    if (typeof localStorage === "undefined") return new Set();
+    try {
+      return new Set(JSON.parse(localStorage.getItem("pd_notif_seen") || "[]"));
+    } catch {
+      return new Set();
+    }
   }
+
+  let nowTick = $state(Date.now());
 
   // ── Notifications ───────────────────────────────────────────────────────────
   let notifications = $state(getStoredNotifications());
@@ -514,7 +516,7 @@
   let notifExpanded = $state(false); // show all vs 2 newest
   let showBellPanel = $state(getStoredBellPanelOpen()); // floating bell dropdown open (persisted)
   let expandedNotifs = $state(new Set()); // IDs of expanded cards
-  let notifSeen = new Set(); // non-reactive: 'connId::devKey::msgId' dedupe
+  let notifSeen = getStoredNotifSeen(); // non-reactive: 'connId::devKey::msgId' dedupe (immediately restored)
 
   $effect(() => {
     if (typeof localStorage !== "undefined") {
@@ -779,8 +781,34 @@
 
   function extractOTP(text) {
     if (!text) return null;
-    const nums = String(text).match(/\b(\d{4,8})\b/g);
+    const str = String(text);
+
+    // 1. Direct keyword-anchored patterns (highest confidence - avoids matching reference IDs or order IDs)
+    const kwPatterns = [
+      /(?:otp|code|pin|passcode|token|verification|secret|password|auth|login\s+code)\s*(?:is|:|-|=|\.)?\s*([0-9]{4,8})\b/i,
+      /\b([0-9]{4,8})\b\s*(?:is\s+(?:your\s+)?(?:otp|code|pin|passcode|token|verification|secret))/i,
+      /(?:G-|c-|code\s*[:\-])\s*([0-9]{4,8})\b/i,
+      /(?:otp|code|verification|verif)\s*(?:is|:|-|=|\.)?\s*([0-9]{3}[-\s][0-9]{3})\b/i,
+    ];
+
+    for (const pat of kwPatterns) {
+      const m = str.match(pat);
+      if (m && m[1]) {
+        const cleaned = m[1].replace(/[-\s]/g, "");
+        if (cleaned.length >= 4 && cleaned.length <= 8) return cleaned;
+      }
+    }
+
+    // Formatted 6-digit code (e.g. 123-456)
+    const hyphenMatch = str.match(/\b([0-9]{3})[-]([0-9]{3})\b/);
+    if (hyphenMatch) {
+      return `${hyphenMatch[1]}${hyphenMatch[2]}`;
+    }
+
+    // 2. Standalone number fallback
+    const nums = str.match(/\b(\d{4,8})\b/g);
     if (!nums) return null;
+
     return (
       nums.find((m) => m.length === 6) ||
       nums.find((m) => m.length === 4) ||
@@ -795,7 +823,7 @@
   function isVerificationMsg(text) {
     if (!text) return false;
     const t = String(text).toLowerCase();
-    return /\botp\b|verif|one.?time|\bcode\b|\btoken\b|\bpin\b|passcode|authoriz|\bconfirm\b|\bsecret\b/.test(
+    return /\botp\b|verif|one.?time|\bcode\b|\btoken\b|\bpin\b|passcode|authoriz|\bconfirm\b|\bsecret\b|security\s+code|login\s+code/.test(
       t,
     );
   }
@@ -849,13 +877,7 @@
     }
     const t = setTimeout(() => {
       notifTimers.delete(id);
-      notifications = notifications.map((x) =>
-        x.id === id ? { ...x, leaving: true } : x,
-      );
-      setTimeout(() => {
-        notifications = notifications.filter((x) => x.id !== id);
-        saveNotifications();
-      }, 350);
+      dismissNotif(id);
     }, Math.max(150, remainingMs));
     notifTimers.set(id, t);
   }
@@ -866,6 +888,8 @@
     const seenKey = `${n.connId}::${n.devKey}::${n.msgId ?? ""}`;
     if (n.msgId && notifSeen.has(seenKey)) return;
     if (n.msgId && notifications.some((x) => x.connId === n.connId && x.devKey === n.devKey && x.msgId === n.msgId)) return;
+    // Also protect against resetting timer during panel refreshes: if active card exists for same message/OTP on device, skip
+    if (notifications.some((x) => x.connId === n.connId && x.devKey === n.devKey && ((n.otp && x.otp === n.otp) || (n.message && x.message === n.message)))) return;
     if (n.msgId) {
       notifSeen.add(seenKey);
       // persist seen keys (keep last 500)
@@ -881,7 +905,6 @@
       ...n,
       id,
       createdAt,
-      initialElapsedSec: 0,
       ts: n.ts || new Date().toISOString(),
       conn: n.conn || connections.find((c) => c.id === n.connId) || { color: "#f97316", name: n.connId },
     };
@@ -904,6 +927,8 @@
       clearTimeout(notifTimers.get(id));
       notifTimers.delete(id);
     }
+    const target = notifications.find((n) => n.id === id);
+    if (!target || target.leaving) return;
     notifications = notifications.map((n) =>
       n.id === id ? { ...n, leaving: true } : n,
     );
@@ -1344,26 +1369,30 @@
         `${conn.path}/${devKey}`,
         "GET",
         undefined,
-        { orderBy: '"$key"', limitToLast: "1" },
+        { orderBy: '"$key"', limitToLast: "50" },
       );
       if (!data || typeof data !== "object") return;
-      const msg = Object.values(data)[0];
-      if (!msg || typeof msg !== "object") return;
-      const text = msg.message ?? msg.body ?? msg.text ?? "";
-      const otp = extractOTP(text);
-      // Only notify for OTP / verification messages
-      if (!otp && !isVerificationMsg(text)) return;
-      const sender = msg.sender ?? msg.from ?? "?";
-      addNotif({
-        connId: conn.id,
-        conn,
-        devKey,
-        sender,
-        message: text,
-        otp,
-        about: extractAbout(sender, text),
-        msgId: Object.keys(data)[0],
-      });
+      const entries = Object.entries(data).slice(-50);
+      for (const [msgId, msg] of entries) {
+        if (!msg || typeof msg !== "object") continue;
+        const text = msg.message ?? msg.body ?? msg.text ?? "";
+        const otp = extractOTP(text);
+        // Only notify for OTP / verification messages
+        if (!otp && !isVerificationMsg(text)) continue;
+        const sender = msg.sender ?? msg.from ?? "?";
+        const msgTs = msg.dateTime || msg.timestamp || msg.date || msg.time || new Date().toISOString();
+        addNotif({
+          connId: conn.id,
+          conn,
+          devKey,
+          sender,
+          message: text,
+          otp,
+          about: extractAbout(sender, text),
+          msgId,
+          ts: msgTs,
+        });
+      }
     } catch {}
   }
 
@@ -1423,8 +1452,10 @@
             const nowMs = Date.now();
             for (const [devKey, devInfo] of Object.entries(infoData)) {
               if (!devInfo || typeof devInfo !== "object") continue;
-              const newTs = Number(devInfo.lastMessageTime ?? 0);
-              const prevTs = Number(prevInfo[devKey]?.lastMessageTime ?? 0);
+              const rawNewTs = devInfo.lastMessageTime ?? devInfo.lastSeen ?? 0;
+              const rawPrevTs = prevInfo[devKey]?.lastMessageTime ?? prevInfo[devKey]?.lastSeen ?? 0;
+              const newTs = Number(rawNewTs) < 1e11 ? Number(rawNewTs) * 1000 : Number(rawNewTs);
+              const prevTs = Number(rawPrevTs) < 1e11 ? Number(rawPrevTs) * 1000 : Number(rawPrevTs);
               // Either time progressed since last poll, or on first poll if message arrived within last 90s
               const isRecent = newTs && (nowMs - newTs) < NOTIF_DURATION_MS;
               if (newTs && ((prevTs && newTs > prevTs) || (!prevTs && isRecent))) {
@@ -1472,6 +1503,46 @@
     bgRefreshing = false;
     lastRefresh = new Date();
     nextRefreshSecs = FULL_REFRESH_INTERVAL_SECS;
+
+    // Fast-catch OTP for active device view during full polling cycle
+    if (selectedConnId && selectedKey && activeTab === 'device') {
+      const activeConn = connections.find((c) => c.id === selectedConnId);
+      if (activeConn && activeConn.enabled && !db[activeConn.id]?.deactivated) {
+        try {
+          const { data } = await apiFetch(
+            activeConn,
+            `${activeConn.path}/${selectedKey}`,
+            "GET",
+            undefined,
+            { orderBy: '"$key"', limitToLast: "50" },
+          );
+          if (data && typeof data === 'object') {
+            msgs = data;
+            const entries = Object.entries(data).slice(-50);
+            for (const [msgId, msg] of entries) {
+              if (!msg || typeof msg !== "object") continue;
+              const text = msg.message ?? msg.body ?? msg.text ?? "";
+              const otp = extractOTP(text);
+              if (!otp && !isVerificationMsg(text)) continue;
+              const sender = msg.sender ?? msg.from ?? "?";
+              const msgTs = msg.dateTime || msg.timestamp || msg.date || msg.time || new Date().toISOString();
+              addNotif({
+                connId: activeConn.id,
+                conn: activeConn,
+                devKey: selectedKey,
+                sender,
+                message: text,
+                otp,
+                about: extractAbout(sender, text),
+                msgId,
+                ts: msgTs,
+              });
+            }
+          }
+        } catch {}
+      }
+    }
+
     // After first load, capture baseline device keys so subsequent fetches can detect "new"
     if (!silent && baselineDeviceKeys.size === 0) {
       for (const c of connections) {
@@ -1482,7 +1553,7 @@
     }
   }
 
-  // Refresh ONLY the single currently-selected panel every 10 seconds to drastically reduce network load
+  // Refresh active selected panel every 10 seconds and catch any new OTPs
   async function refreshSelectedPanel() {
     if (!selectedConnId) return;
     const conn = connections.find((c) => c.id === selectedConnId);
@@ -1499,6 +1570,26 @@
         );
         if (data && typeof data === 'object') {
           msgs = data;
+          const entries = Object.entries(data).slice(-50);
+          for (const [msgId, msg] of entries) {
+            if (!msg || typeof msg !== "object") continue;
+            const text = msg.message ?? msg.body ?? msg.text ?? "";
+            const otp = extractOTP(text);
+            if (!otp && !isVerificationMsg(text)) continue;
+            const sender = msg.sender ?? msg.from ?? "?";
+            const msgTs = msg.dateTime || msg.timestamp || msg.date || msg.time || new Date().toISOString();
+            addNotif({
+              connId: conn.id,
+              conn,
+              devKey: selectedKey,
+              sender,
+              message: text,
+              otp,
+              about: extractAbout(sender, text),
+              msgId,
+              ts: msgTs,
+            });
+          }
         }
       } catch {}
     }
@@ -1588,6 +1679,19 @@
       nowTick = Date.now();
       nextRefreshSecs = nextRefreshSecs > 0 ? nextRefreshSecs - 1 : 0;
       panelRefreshSecs = panelRefreshSecs > 0 ? panelRefreshSecs - 1 : 0;
+
+      // Auto-expire notifications after exactly 90 seconds
+      if (notifications.length > 0) {
+        const curTime = Date.now();
+        const expired = notifications.filter(
+          (n) => !n.leaving && curTime - (Number(n.createdAt) || (n.ts ? new Date(n.ts).getTime() : curTime)) >= NOTIF_DURATION_MS,
+        );
+        if (expired.length > 0) {
+          for (const exp of expired) {
+            dismissNotif(exp.id);
+          }
+        }
+      }
     }, 1000);
 
     return () => {
@@ -2420,6 +2524,9 @@
     ).length,
   );
   let newCount = $derived(newDeviceKeys.size);
+  let loadingConnections = $derived(
+    connections.filter((c) => db[c.id]?.loading),
+  );
 
   // Filtered device list — AND logic across all active filters
   let filteredTableDevices = $derived(
@@ -2545,7 +2652,8 @@
           }
           return true;
         })
-        .sort(([a], [b]) => Number(b) - Number(a)); // newest first
+        .sort(([a], [b]) => Number(b) - Number(a)) // newest first
+        .slice(0, 50); // last 50 messages max
     })(),
   );
 
@@ -2553,22 +2661,45 @@
   let notifSearchQuery = $state("");
 
   let filteredNotifications = $derived.by(() => {
+    const tick = nowTick; // Reactive clock dependency: forces re-calculation every 1 second
     const q = notifSearchQuery.trim().toLowerCase();
-    if (!q) return notifications;
-    return notifications.filter((n) => {
+    const sourceList = notifications.filter((n) => {
+      if (!n) return false;
+      const createdAt = Number(n.createdAt) || (n.ts ? new Date(n.ts).getTime() : tick);
+      // Immediately filter out notifications that exceeded 90s
+      if (tick - createdAt >= NOTIF_DURATION_MS) return false;
+
+      if (!q) return true;
       const msg = String(n.message ?? "").toLowerCase();
       const sender = String(n.sender ?? "").toLowerCase();
       const about = String(n.about ?? "").toLowerCase();
+      return msg.includes(q) || sender.includes(q) || about.includes(q);
+    });
 
-      // Only match against the SMS message body, sender, or detected service
-      // Do NOT match against the phone number, device ID, or connection name
-      return (
-        msg.includes(q) ||
-        sender.includes(q) ||
-        about.includes(q)
-      );
+    return sourceList.map((n) => {
+      const createdAt = Number(n.createdAt) || (n.ts ? new Date(n.ts).getTime() : tick);
+      const elapsedMs = Math.max(0, tick - createdAt);
+      const remainingSec = Math.max(0, Math.ceil((NOTIF_DURATION_MS - elapsedMs) / 1000));
+      const elapsedPct = Math.min(100, Math.max(0, (elapsedMs / NOTIF_DURATION_MS) * 100));
+      return {
+        ...n,
+        remainingSec,
+        elapsedPct,
+      };
     });
   });
+
+  function getNotifRemainingSec(createdAt, ts, tick) {
+    const c = Number(createdAt) || (ts ? new Date(ts).getTime() : tick);
+    const elapsedMs = Math.max(0, tick - c);
+    return Math.max(0, Math.ceil((NOTIF_DURATION_MS - elapsedMs) / 1000));
+  }
+
+  function getNotifElapsedPct(createdAt, ts, tick) {
+    const c = Number(createdAt) || (ts ? new Date(ts).getTime() : tick);
+    const elapsedMs = Math.max(0, tick - c);
+    return Math.min(100, Math.max(0, (elapsedMs / NOTIF_DURATION_MS) * 100));
+  }
 </script>
 
 <svelte:window
@@ -2976,33 +3107,38 @@
             <line x1="3" y1="18" x2="21" y2="18" />
           </svg>
         </button>
-        {#each connections as c}
-          {#if db[c.id]?.loading}
+        <!-- Loading / Syncing indicator -->
+        {#if loadingConnections.length > 0}
+          {#if loadingConnections.length === 1}
             <span
-              style="font-size:11px;color:{c.color};display:flex;align-items:center;gap:3px"
+              class="tb-loading-pill"
+              style="color:{loadingConnections[0].color || '#38bdf8'}"
+              title="Syncing {loadingConnections[0].name}"
             >
-              <span
-                style="animation:spin 0.9s linear infinite;display:inline-block"
-                >↻</span
-              >
-              {c.name}
+              <span class="tb-spin">↻</span>
+              <span class="tb-loading-name">{loadingConnections[0].name}</span>
+            </span>
+          {:else}
+            <!-- When all / multiple firebases refresh together, group them into a single sleek pill so they never overlap other sections -->
+            <span
+              class="tb-loading-pill tb-loading-multi"
+              title="Syncing {loadingConnections.length} Firebase databases: {loadingConnections.map((c) => c.name).join(', ')}"
+            >
+              <span class="bg-dot"></span>
+              <span class="tb-spin">↻</span>
+              <span class="tb-loading-text">Syncing {loadingConnections.length} Firebases</span>
             </span>
           {/if}
-        {/each}
-        {#if bgRefreshing}
-          <span class="refresh-cd bg-refresh" title="Syncing in background…">
+        {:else if bgRefreshing}
+          <span class="refresh-cd bg-refresh" title="Syncing all databases…">
             <span class="bg-dot"></span> syncing…
           </span>
-        {:else if !connections.some((c) => db[c.id]?.loading)}
+        {:else}
           <span
             class="refresh-cd"
-            title={selectedConnId ? `Selected panel refreshes in ${panelRefreshSecs}s | All databases full sync in ${nextRefreshSecs}s` : `All databases full sync in ${nextRefreshSecs}s`}
+            title="All databases sync every {FULL_REFRESH_INTERVAL_SECS}s"
           >
-            {#if selectedConnId}
-              ↻ {panelRefreshSecs}s <span style="font-size:10px;opacity:0.65;">(all: {nextRefreshSecs}s)</span>
-            {:else}
-              ↻ {nextRefreshSecs}s
-            {/if}
+            ↻ {nextRefreshSecs}s
           </span>
         {/if}
       </div>
@@ -3388,7 +3524,8 @@
               {@const msgFull = n.message ?? ""}
               {@const msgShort =
                 msgFull.length > 120 ? msgFull.slice(0, 120) + "…" : msgFull}
-              {@const remainingSec = getRemainingNotifSecs(n.createdAt, nowTick)}
+              {@const cardRemSec = getNotifRemainingSec(n.createdAt, n.ts, nowTick)}
+              {@const cardElapsedPct = getNotifElapsedPct(n.createdAt, n.ts, nowTick)}
               <div class="bp-card {n.leaving ? 'nleave' : ''}">
                 <!-- Row 1: App icon + sender + OTP label + time + dismiss -->
                 <div class="bp-card-top">
@@ -3419,10 +3556,10 @@
                   <div class="bp-time-col">
                     <span class="bp-time">{toIST(n.ts)}</span>
                     <span
-                      class="bp-countdown-badge {remainingSec <= 10 ? 'bp-countdown-ending' : ''}"
-                      title="Stays in notification box for {remainingSec}s"
+                      class="bp-countdown-badge {cardRemSec <= 10 ? 'bp-countdown-ending' : ''}"
+                      title="Stays in notification box for {cardRemSec}s"
                     >
-                      <span class="bp-countdown-dot"></span>{remainingSec}s
+                      <span class="bp-countdown-dot"></span>{cardRemSec}s
                     </span>
                   </div>
                   <button
@@ -3539,7 +3676,7 @@
                     <!-- Green progress bar -->
                     <div
                       class="bp-progress"
-                      style="animation-delay: -{n.initialElapsedSec ?? 0}s;"
+                      style="width: {Math.max(0, 100 - cardElapsedPct)}%;"
                     ></div>
                   </div>
                 {:else}
@@ -3592,7 +3729,7 @@
                     <!-- Green progress bar -->
                     <div
                       class="bp-progress"
-                      style="animation-delay: -{n.initialElapsedSec ?? 0}s;"
+                      style="width: {Math.max(0, 100 - cardElapsedPct)}%;"
                     ></div>
                   </div>
                 {/if}
