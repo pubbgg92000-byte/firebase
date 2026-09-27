@@ -718,13 +718,12 @@ export function initEngine() {
   // Persist on unload
   window.addEventListener('beforeunload', persistState);
 
-  // Initial device load
-  fetchAllDevices();
-
   // Auto-resume if was running
   if (wasRunning) {
     addLog('🔄 Auto-resuming discovery after page reload…', 'info');
-    startDiscoveryInternal();
+    fetchAllDevices().then(() => {
+      startDiscoveryInternal();
+    }).catch(() => {});
   }
 }
 

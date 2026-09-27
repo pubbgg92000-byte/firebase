@@ -153,6 +153,7 @@
 
   let refreshInterval = $state(null);
   let selectedPanelInterval = $state(null);
+  let isUnmounted = false;
   let lastRefresh = $state(null);
   let nextRefreshSecs = $state(10);
   let panelRefreshSecs = $state(10);
@@ -1421,7 +1422,7 @@
 
   // ── Fetch: shallow key list + device info ─────────────────────────────────
   async function fetchConn(conn, silent = false) {
-    if (!conn.enabled) return;
+    if (isUnmounted || !conn.enabled) return;
     if (silent && db[conn.id]?.deactivated) return;
     // Silent = keep existing data visible while fetching; only show loading on first fetch
     const hasData =
@@ -1438,6 +1439,7 @@
         undefined,
         { shallow: "true" },
       );
+      if (isUnmounted) return;
       const keys = keysData && typeof keysData === "object" ? keysData : {};
 
       // 2. Get device info (status/battery/phone) from infoPath if available
@@ -1466,6 +1468,8 @@
         } catch {}
       }
 
+      if (isUnmounted) return;
+
       // Detect new device keys (not present at baseline / first load)
       const prevKeys = new Set(Object.keys(db[conn.id]?.keys ?? {}));
       for (const k of Object.keys(keys)) {
@@ -1480,6 +1484,7 @@
         [conn.id]: { loading: false, error: null, deactivated: false, keys, info, ts: new Date() },
       };
     } catch (e) {
+      if (isUnmounted) return;
       const isDeact = String(e.message).includes('deactivated') || String(e.message).includes('423') || String(e.message).includes('Locked');
       db = {
         ...db,
@@ -1496,10 +1501,12 @@
   }
 
   async function fetchAll(silent = false) {
+    if (isUnmounted) return;
     bgRefreshing = true;
     await Promise.allSettled(
       connections.filter((c) => c.enabled).map((c) => fetchConn(c, silent)),
     );
+    if (isUnmounted) return;
     bgRefreshing = false;
     lastRefresh = new Date();
     nextRefreshSecs = FULL_REFRESH_INTERVAL_SECS;
@@ -1695,6 +1702,7 @@
     }, 1000);
 
     return () => {
+      isUnmounted = true;
       clearInterval(refreshInterval);
       if (selectedPanelInterval) clearInterval(selectedPanelInterval);
       clearInterval(ticker);
@@ -3148,6 +3156,7 @@
         <span class="tbstat tf">{offlineCount} offline</span>
         <a
           href="/discovery"
+          data-sveltekit-reload
           class="ico-btn"
           title="Device Number Discovery"
           aria-label="Device Number Discovery"
@@ -3155,6 +3164,7 @@
         >📡</a>
         <a
           href="/automation"
+          data-sveltekit-reload
           class="ico-btn"
           title="Automation Orchestrator"
           aria-label="Automation Orchestrator"
@@ -5777,7 +5787,7 @@
           {#if filteredDiscovery.length === 0}
             <div class="disc-empty">
               {#if discoveryRecords.length === 0}
-                No discovered numbers yet. Go to <a href="/discovery">Discovery</a> to start.
+                No discovered numbers yet. Go to <a href="/discovery" data-sveltekit-reload>Discovery</a> to start.
               {:else}
                 No results match "{discoverySearch}"
               {/if}

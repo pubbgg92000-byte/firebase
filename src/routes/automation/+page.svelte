@@ -749,9 +749,9 @@
   <!-- Top Navigation & Header -->
   <header class="auto-header">
     <div class="header-left">
-      <a href="/" class="nav-back-link" title="Back to Main Panel">← Dashboard</a>
+      <a href="/" data-sveltekit-reload class="nav-back-link" title="Back to Main Panel">← Dashboard</a>
       <span class="nav-sep">/</span>
-      <a href="/discovery" class="nav-sub-link">Discovery 📡</a>
+      <a href="/discovery" data-sveltekit-reload class="nav-sub-link">Discovery 📡</a>
       <span class="nav-sep">/</span>
       <h1 class="page-title">
         <span class="title-icon">🤖</span>

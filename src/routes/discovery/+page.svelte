@@ -247,6 +247,9 @@
 
   onMount(() => {
     initEngine();
+    if (engine.connections.length > 0 && Object.keys(engine.db).length === 0) {
+      fetchAllDevices();
+    }
   });
 
   // ── Derived UI helpers ──────────────────────────────────────────────────
@@ -330,7 +333,7 @@
   <!-- Header -->
   <header class="disco-header">
     <div class="dh-left">
-      <a href="/" class="dh-back" title="Back to Dashboard">
+      <a href="/" data-sveltekit-reload class="dh-back" title="Back to Dashboard">
         <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M19 12H5M12 5l-7 7 7 7"/></svg>
       </a>
       <div class="dh-title">
@@ -445,6 +448,9 @@
       <button class="dbtn dbtn-import" onclick={() => { showImportModal = true; importSummary = null; }} title="Import numbers from JSON or ZIP">
         ➕ Import
       </button>
+      <a href="/automation" data-sveltekit-reload class="dbtn dbtn-ghost" title="Open Automation Orchestrator" style="text-decoration:none">
+        🤖 Automation
+      </a>
       {#if engine.records.filter(r => r.status === 'discovered').length > 0}
         <button class="dbtn dbtn-cloud" onclick={handlePostAll} disabled={isBatchPosting} title="Post all discovered numbers to their matching Firebase RTDB">
           {#if isBatchPosting}

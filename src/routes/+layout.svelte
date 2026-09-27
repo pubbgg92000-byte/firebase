@@ -1,5 +1,6 @@
 <script>
 	import favicon from '$lib/assets/favicon.svg';
+	import '../app.css';
 	import { onMount } from 'svelte';
 
 	let { children } = $props();
@@ -23,11 +24,13 @@
 	<link rel="icon" href={favicon} />
 </svelte:head>
 
-{@render children()}
+<div data-sveltekit-reload>
+	{@render children()}
+</div>
 
 <!-- Background discovery indicator — visible on all pages when engine is running -->
 {#if eng?.status === 'RUNNING'}
-	<a href="/discovery" class="disco-bg-pill" title="Discovery running in background — click to view">
+	<a href="/discovery" data-sveltekit-reload class="disco-bg-pill" title="Discovery running in background — click to view">
 		<span class="disco-bg-dot"></span>
 		📡 Discovery Running
 	</a>
@@ -35,7 +38,7 @@
 
 <!-- Background automation indicator — visible on all pages when automation is running -->
 {#if autoEng?.status === 'RUNNING'}
-	<a href="/automation" class="auto-bg-pill" title="Automation running in background — click to view">
+	<a href="/automation" data-sveltekit-reload class="auto-bg-pill" title="Automation running in background — click to view">
 		<span class="auto-bg-dot"></span>
 		🤖 Automation Running
 	</a>
