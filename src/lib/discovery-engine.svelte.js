@@ -6,8 +6,9 @@
  * Uses Svelte 5 runes ($state, $derived) in a .svelte.js module.
  */
 
-import { apiFetch } from '$lib/firebase.js';
+import { apiFetch, patchDevicePhone } from '$lib/firebase.js';
 import { isOnline, fmtPhone, extractNumber } from '$lib/device-helpers.js';
+import JSZip from 'jszip';
 
 // ── Constants ───────────────────────────────────────────────────────────────
 const ENGINE_KEY = 'device-number-discovery:engine';
@@ -863,27 +864,617 @@ export function clearRecords() {
 
 export function downloadJson() {
   if (!isBrowser) return;
+  const discovered = engine.records.filter(r => r.status === 'discovered');
+  const mapping = {};
+  for (const r of discovered) {
+    if (r.deviceId && r.phoneNumber) {
+      mapping[r.deviceId] = r.phoneNumber;
+    }
+  }
+
   const data = {
     version: 2,
     exportTimestamp: new Date().toISOString(),
     records: engine.records,
+    devicePhoneMap: mapping,
     tryTomorrow: engine.tryTomorrow,
     dailyAttempts: engine.dailyAttempts,
     summary: {
-      totalDiscovered: engine.records.filter(r => r.status === 'discovered').length,
+      totalDiscovered: discovered.length,
       totalFailed: engine.failedTargets.length,
       totalTryTomorrow: engine.tryTomorrow.length,
+      totalSyncedToFirebase: discovered.filter(r => r.syncedToFirebase).length,
     },
   };
   const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
   const url = URL.createObjectURL(blob);
   const a = document.createElement('a');
   a.href = url;
-  a.download = `device-number-discovery-${today()}.json`;
+  a.download = `discovered-numbers-${today()}.json`;
   a.click();
   URL.revokeObjectURL(url);
-  addLog(`📥 Exported ${engine.records.length} records`, 'info');
+  addLog(`📥 Exported ${discovered.length} records as JSON`, 'info');
 }
+
+export async function downloadZip() {
+  if (!isBrowser) return;
+  const discovered = engine.records.filter(r => r.status === 'discovered');
+  const mapping = {};
+  for (const r of discovered) {
+    if (r.deviceId && r.phoneNumber) {
+      mapping[r.deviceId] = r.phoneNumber;
+    }
+  }
+
+  const jsonData = {
+    version: 2,
+    exportTimestamp: new Date().toISOString(),
+    records: engine.records,
+    devicePhoneMap: mapping,
+    tryTomorrow: engine.tryTomorrow,
+    dailyAttempts: engine.dailyAttempts,
+    summary: {
+      totalDiscovered: discovered.length,
+      totalFailed: engine.failedTargets.length,
+      totalTryTomorrow: engine.tryTomorrow.length,
+      totalSyncedToFirebase: discovered.filter(r => r.syncedToFirebase).length,
+    },
+  };
+
+  // CSV format
+  const csvRows = [
+    ['Device ID', 'Phone Number', 'Database / Connection', 'Discovery Method', 'Discovered At', 'Synced To Firebase'].join(',')
+  ];
+  for (const r of discovered) {
+    csvRows.push([
+      `"${r.deviceId || ''}"`,
+      `"${r.phoneNumber || ''}"`,
+      `"${(r.connectionName || '').replace(/"/g, '""')}"`,
+      `"${r.discoveryMethod || ''}"`,
+      `"${r.discoveredAt || ''}"`,
+      r.syncedToFirebase ? 'Yes' : 'No'
+    ].join(','));
+  }
+
+  // Plaintext format
+  const txtLines = [
+    `# Discovered Numbers Export - ${new Date().toISOString()}`,
+    `# Total Discovered: ${discovered.length}`,
+    '------------------------------------------------------------'
+  ];
+  for (const r of discovered) {
+    txtLines.push(`${r.deviceId} -> ${r.phoneNumber} [${r.connectionName || 'Unknown DB'}] (${r.discoveryMethod || 'discovered'})`);
+  }
+
+  const zip = new JSZip();
+  zip.file('discovered_numbers.json', JSON.stringify(jsonData, null, 2));
+  zip.file('device_phone_mapping.json', JSON.stringify(mapping, null, 2));
+  zip.file('discovered_numbers.csv', csvRows.join('\r\n'));
+  zip.file('discovered_numbers.txt', txtLines.join('\r\n'));
+
+  const blob = await zip.generateAsync({ type: 'blob' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = `discovered-numbers-${today()}.zip`;
+  a.click();
+  URL.revokeObjectURL(url);
+  addLog(`📦 Exported ${discovered.length} records as ZIP`, 'info');
+}
+
+/**
+ * Locate a device ID across all active Firebase connections in memory.
+ * Checks both keys and info dictionaries.
+ */
+export function findDeviceInAllFirebase(deviceId) {
+  if (!deviceId) return null;
+  const devKey = String(deviceId).trim();
+
+  // 1. Search in-memory engine.db
+  for (const conn of engine.connections) {
+    if (!conn.enabled) continue;
+    const dbEntry = engine.db[conn.id];
+    if (dbEntry?.keys && dbEntry.keys[devKey] !== undefined) {
+      return { connId: conn.id, conn, inKeys: true, inInfo: !!dbEntry?.info?.[devKey] };
+    }
+    if (dbEntry?.info && dbEntry.info[devKey] !== undefined) {
+      return { connId: conn.id, conn, inKeys: false, inInfo: true };
+    }
+  }
+
+  // 2. Also check if localPhones already has it
+  for (const [k, ph] of Object.entries(engine.localPhones)) {
+    const [connId, dKey] = k.split('::');
+    if (dKey === devKey) {
+      const conn = engine.connections.find(c => c.id === connId);
+      if (conn) return { connId: conn.id, conn, inLocal: true };
+    }
+  }
+
+  return null;
+}
+
+/**
+ * Universal parser for JSON, CSV, or plaintext device-phone pairs.
+ */
+export function parseNumbersFromTextOrJson(raw) {
+  if (!raw) return [];
+  const items = [];
+
+  // Try JSON first
+  try {
+    const data = typeof raw === 'string' ? JSON.parse(raw) : raw;
+    if (data && typeof data === 'object') {
+      // 1. If { records: [ ... ] }
+      if (Array.isArray(data.records)) {
+        for (const r of data.records) {
+          if (r && typeof r === 'object') {
+            const devId = r.deviceId || r.device_id || r.id;
+            const ph = r.phoneNumber || r.phone || r.mobNo || r.number;
+            if (devId && ph) {
+              items.push({
+                deviceId: String(devId).trim(),
+                phoneNumber: String(ph).trim(),
+                connectionId: r.connectionId || '',
+                connectionName: r.connectionName || '',
+                discoveryMethod: r.discoveryMethod || 'import',
+                discoveredAt: r.discoveredAt || new Date().toISOString(),
+                syncedToFirebase: !!r.syncedToFirebase
+              });
+            }
+          }
+        }
+        if (items.length) return items;
+      }
+
+      // 2. If Array [ ... ]
+      if (Array.isArray(data)) {
+        for (const r of data) {
+          if (r && typeof r === 'object') {
+            const devId = r.deviceId || r.device_id || r.id;
+            const ph = r.phoneNumber || r.phone || r.mobNo || r.number;
+            if (devId && ph) {
+              items.push({
+                deviceId: String(devId).trim(),
+                phoneNumber: String(ph).trim(),
+                connectionId: r.connectionId || '',
+                connectionName: r.connectionName || '',
+                discoveryMethod: r.discoveryMethod || 'import',
+                discoveredAt: r.discoveredAt || new Date().toISOString(),
+                syncedToFirebase: !!r.syncedToFirebase
+              });
+            }
+          }
+        }
+        if (items.length) return items;
+      }
+
+      // 3. If devicePhoneMap or processed_numbers format: { [key]: value }
+      for (const [k, v] of Object.entries(data)) {
+        if (!v) continue;
+        if (typeof v === 'string') {
+          const kStr = k.trim();
+          const vStr = v.trim();
+          const kIsHex = /^[0-9a-fA-F]{12,32}$/.test(kStr);
+          const vIsHex = /^[0-9a-fA-F]{12,32}$/.test(vStr);
+          if (kIsHex && !vIsHex) {
+            items.push({ deviceId: kStr, phoneNumber: vStr });
+          } else if (vIsHex && !kIsHex) {
+            items.push({ deviceId: vStr, phoneNumber: kStr });
+          } else {
+            items.push({ deviceId: kStr, phoneNumber: vStr });
+          }
+        } else if (typeof v === 'object') {
+          // Like Python processed_numbers
+          const devId = v.device_id || v.deviceId || v.id || (k.length > 10 && !/^\+?\d+$/.test(k) ? k : null);
+          const ph = v.phone || v.phoneNumber || v.mobNo || v.number || (/^\+?\d+$/.test(k) ? k : null);
+          if (devId && ph) {
+            items.push({
+              deviceId: String(devId).trim(),
+              phoneNumber: String(ph).trim(),
+              database: v.database || '',
+              discoveryMethod: 'import',
+              discoveredAt: v.timestamp || new Date().toISOString()
+            });
+          }
+        }
+      }
+      if (items.length) return items;
+    }
+  } catch {}
+
+  // Parse as CSV / plain text lines
+  if (typeof raw === 'string') {
+    const lines = raw.split(/\r?\n/);
+    for (const line of lines) {
+      const l = line.trim();
+      if (!l || l.startsWith('#') || l.startsWith('//')) continue;
+      if (l.toLowerCase().includes('device') && l.toLowerCase().includes('phone')) continue;
+
+      let parts = [];
+      if (l.includes('->')) parts = l.split('->');
+      else if (l.includes('\t')) parts = l.split('\t');
+      else if (l.includes(',')) parts = l.split(',');
+      else if (l.includes('|')) parts = l.split('|');
+      else if (l.includes(':')) parts = l.split(':');
+      else parts = l.split(/\s+/);
+
+      if (parts.length >= 2) {
+        const p1 = parts[0].trim().replace(/^["']|["']$/g, '');
+        const p2 = parts[1].trim().replace(/^["']|["']$/g, '');
+        if (p1 && p2) {
+          const p1IsHex = /^[0-9a-fA-F]{12,32}$/.test(p1);
+          const p2IsHex = /^[0-9a-fA-F]{12,32}$/.test(p2);
+          if (p1IsHex && !p2IsHex) {
+            items.push({ deviceId: p1, phoneNumber: p2 });
+          } else if (p2IsHex && !p1IsHex) {
+            items.push({ deviceId: p2, phoneNumber: p1 });
+          } else {
+            items.push({ deviceId: p1, phoneNumber: p2 });
+          }
+        }
+      }
+    }
+  }
+
+  return items;
+}
+
+/**
+ * Import a list of device-phone items into the discovery engine.
+ * Automatically checks all Firebase connections for device IDs and assigns numbers to devices.
+ */
+export async function importNumbersList(itemList, { autoPostToFirebase = false } = {}) {
+  if (!Array.isArray(itemList) || itemList.length === 0) {
+    return { total: 0, validCount: 0, newCount: 0, updatedCount: 0, matchedCount: 0, postedCount: 0, matchedList: [] };
+  }
+
+  let validCount = 0;
+  let newCount = 0;
+  let updatedCount = 0;
+  let matchedCount = 0;
+  let postedCount = 0;
+  const matchedList = [];
+
+  const existingMap = new Map();
+  for (const r of engine.records) {
+    if (r.deviceId) existingMap.set(r.deviceId, r);
+  }
+
+  const updatedPhones = { ...engine.localPhones };
+  let phonesModified = false;
+
+  for (const item of itemList) {
+    const rawDevId = String(item.deviceId || item.device_id || '').trim();
+    const rawPhone = String(item.phoneNumber || item.phone || '').trim();
+    const cleanNum = extractNumber(rawPhone) || rawPhone.replace(/\D/g, '');
+
+    if (!rawDevId || rawDevId.length < 4 || !cleanNum || cleanNum.length < 5) {
+      continue;
+    }
+
+    validCount++;
+
+    // 1. Look for device across all Firebase connections
+    const fbMatch = findDeviceInAllFirebase(rawDevId);
+    let connId = item.connectionId || '';
+    let connName = item.connectionName || '';
+
+    if (fbMatch) {
+      matchedCount++;
+      connId = fbMatch.connId;
+      connName = fbMatch.conn.name;
+      matchedList.push({ deviceId: rawDevId, phoneNumber: cleanNum, connName, connId });
+
+      // Automatically add that number to that device in localPhones
+      const phoneKey = `${connId}::${rawDevId}`;
+      updatedPhones[phoneKey] = cleanNum;
+      phonesModified = true;
+
+      // Update in-memory db info if present
+      if (engine.db[connId]?.info?.[rawDevId]) {
+        engine.db[connId].info[rawDevId] = {
+          ...engine.db[connId].info[rawDevId],
+          mobNo: cleanNum,
+          phone: cleanNum,
+          phoneNumber: cleanNum
+        };
+      }
+    } else if (item.database) {
+      const c = engine.connections.find(cn => cn.url.includes(item.database) || item.database.includes(cn.url));
+      if (c) {
+        connId = c.id;
+        connName = c.name;
+        const phoneKey = `${connId}::${rawDevId}`;
+        updatedPhones[phoneKey] = cleanNum;
+        phonesModified = true;
+      }
+    }
+
+    // 2. If autoPostToFirebase requested and we have a connection
+    let syncedToFirebase = !!item.syncedToFirebase;
+    let syncedAt = item.syncedAt || null;
+    let syncedConn = item.syncedConn || null;
+
+    if (autoPostToFirebase && connId) {
+      const conn = engine.connections.find(c => c.id === connId);
+      if (conn) {
+        try {
+          await patchDevicePhone(conn, rawDevId, cleanNum);
+          syncedToFirebase = true;
+          syncedAt = new Date().toISOString();
+          syncedConn = conn.name;
+          postedCount++;
+        } catch {}
+      }
+    }
+
+    // 3. Add or update record in engine.records
+    const existing = existingMap.get(rawDevId);
+    if (existing) {
+      updatedCount++;
+      existing.phoneNumber = cleanNum;
+      if (connId) existing.connectionId = connId;
+      if (connName) existing.connectionName = connName;
+      if (syncedToFirebase) {
+        existing.syncedToFirebase = true;
+        existing.syncedAt = syncedAt;
+        existing.syncedConn = syncedConn;
+      }
+    } else {
+      newCount++;
+      const newRec = {
+        deviceId: rawDevId,
+        phoneNumber: cleanNum,
+        status: 'discovered',
+        discoveryMethod: item.discoveryMethod || 'import',
+        messageBody: item.messageBody || '',
+        senderDeviceId: rawDevId,
+        receiverDeviceId: 'imported',
+        receiverPhoneNumber: '',
+        attemptCount: item.attemptCount || 0,
+        discoveredAt: item.discoveredAt || new Date().toISOString(),
+        connectionId: connId,
+        connectionName: connName,
+        syncedToFirebase,
+        syncedAt,
+        syncedConn
+      };
+      engine.records = [...engine.records, newRec];
+      existingMap.set(rawDevId, newRec);
+    }
+
+    // Clear from failed or tomorrow queues since number is now discovered
+    engine.failedTargets = engine.failedTargets.filter(k => k !== rawDevId);
+    engine.tryTomorrow = engine.tryTomorrow.filter(k => k !== rawDevId);
+    engine.skippedTargets = engine.skippedTargets.filter(k => k !== rawDevId);
+  }
+
+  if (phonesModified) {
+    engine.localPhones = updatedPhones;
+    if (isBrowser) {
+      try {
+        localStorage.setItem('pd_phones', JSON.stringify(updatedPhones));
+      } catch {}
+    }
+  }
+
+  persistState();
+
+  const msg = `📥 Imported ${validCount} numbers (${newCount} new, ${updatedCount} updated, ${matchedCount} matched in Firebase${postedCount ? `, ${postedCount} posted to RTDB` : ''})`;
+  addLog(msg, 'success');
+
+  return {
+    total: itemList.length,
+    validCount,
+    newCount,
+    updatedCount,
+    matchedCount,
+    postedCount,
+    matchedList
+  };
+}
+
+/**
+ * Import device numbers from a File object (.json or .zip or .csv/.txt).
+ */
+export async function importNumbersFromFile(file, options = {}) {
+  if (!file) throw new Error('No file provided');
+  const fileName = file.name.toLowerCase();
+
+  let items = [];
+
+  if (fileName.endsWith('.zip')) {
+    const zip = await JSZip.loadAsync(file);
+    for (const [relPath, zipEntry] of Object.entries(zip.files)) {
+      if (zipEntry.dir) continue;
+      const lower = relPath.toLowerCase();
+      if (lower.endsWith('.json') || lower.endsWith('.csv') || lower.endsWith('.txt')) {
+        const text = await zipEntry.async('string');
+        const parsed = parseNumbersFromTextOrJson(text);
+        items = [...items, ...parsed];
+      }
+    }
+  } else if (fileName.endsWith('.json')) {
+    const text = await file.text();
+    items = parseNumbersFromTextOrJson(text);
+  } else {
+    // csv, txt or any plain text
+    const text = await file.text();
+    items = parseNumbersFromTextOrJson(text);
+  }
+
+  return await importNumbersList(items, options);
+}
+
+/**
+ * Import device numbers from raw text (pasted JSON, CSV, or lines).
+ */
+export async function importNumbersRaw(rawText, options = {}) {
+  const items = parseNumbersFromTextOrJson(rawText);
+  return await importNumbersList(items, options);
+}
+
+/**
+ * Post/PATCH a single discovered phone number to its Firebase RTDB database.
+ */
+export async function postRecordToFirebase(deviceId, phoneNumber, targetConnId = null) {
+  if (!deviceId || !phoneNumber) {
+    throw new Error('Device ID and phone number required');
+  }
+  const cleanPhone = String(phoneNumber).trim();
+  const cleanId = String(deviceId).trim();
+
+  // Find target connection
+  let conn = null;
+  if (targetConnId) {
+    conn = engine.connections.find(c => c.id === targetConnId && c.enabled);
+  }
+  if (!conn) {
+    const match = findDeviceInAllFirebase(cleanId);
+    if (match) conn = match.conn;
+  }
+  if (!conn) {
+    for (const c of engine.connections) {
+      if (!c.enabled) continue;
+      if (engine.db[c.id]?.keys?.[cleanId] || engine.db[c.id]?.info?.[cleanId]) {
+        conn = c;
+        break;
+      }
+    }
+  }
+
+  if (!conn) {
+    const enabledConns = engine.connections.filter(c => c.enabled);
+    if (enabledConns.length === 1) {
+      conn = enabledConns[0];
+    }
+  }
+
+  if (!conn) {
+    throw new Error(`Device ${cleanId.slice(0, 12)}… not found in any active Firebase connection`);
+  }
+
+  // Execute PATCH to Firebase RTDB
+  await patchDevicePhone(conn, cleanId, cleanPhone);
+
+  // Update in-memory db info
+  if (!engine.db[conn.id]) engine.db[conn.id] = { keys: {}, info: {} };
+  if (!engine.db[conn.id].info) engine.db[conn.id].info = {};
+  engine.db[conn.id].info[cleanId] = {
+    ...(engine.db[conn.id].info[cleanId] || {}),
+    mobNo: cleanPhone,
+    phone: cleanPhone,
+    phoneNumber: cleanPhone,
+    mobile: cleanPhone,
+    number: cleanPhone
+  };
+
+  // Update localPhones
+  const phoneKey = `${conn.id}::${cleanId}`;
+  engine.localPhones = { ...engine.localPhones, [phoneKey]: cleanPhone };
+  if (isBrowser) {
+    try {
+      localStorage.setItem('pd_phones', JSON.stringify(engine.localPhones));
+    } catch {}
+  }
+
+  // Update record status in engine.records
+  const now = new Date().toISOString();
+  engine.records = engine.records.map(r => {
+    if (r.deviceId === cleanId) {
+      return {
+        ...r,
+        connectionId: conn.id,
+        connectionName: conn.name,
+        syncedToFirebase: true,
+        syncedAt: now,
+        syncedConn: conn.name
+      };
+    }
+    return r;
+  });
+
+  persistState();
+  addLog(`☁️ Posted ${cleanPhone} to Firebase (${conn.name}) for ${cleanId.slice(0, 10)}…`, 'success');
+  return { success: true, connName: conn.name, connId: conn.id };
+}
+
+/**
+ * Batch post all discovered numbers to their matching Firebase RTDB databases.
+ */
+export async function postAllRecordsToFirebase(onProgress = null) {
+  const discovered = engine.records.filter(r => r.status === 'discovered' && r.phoneNumber && r.deviceId);
+  if (discovered.length === 0) {
+    return { total: 0, successCount: 0, failedCount: 0, errors: [] };
+  }
+
+  let successCount = 0;
+  let failedCount = 0;
+  const errors = [];
+
+  for (let i = 0; i < discovered.length; i++) {
+    const rec = discovered[i];
+    try {
+      const res = await postRecordToFirebase(rec.deviceId, rec.phoneNumber, rec.connectionId);
+      successCount++;
+      if (onProgress) onProgress({ current: i + 1, total: discovered.length, record: rec, success: true });
+    } catch (e) {
+      failedCount++;
+      errors.push({ deviceId: rec.deviceId, error: e.message });
+      if (onProgress) onProgress({ current: i + 1, total: discovered.length, record: rec, success: false, error: e.message });
+    }
+    await sleep(80);
+  }
+
+  addLog(`☁️ Batch Firebase update finished: ${successCount} updated, ${failedCount} failed`, successCount > 0 ? 'success' : 'warn');
+  return { total: discovered.length, successCount, failedCount, errors };
+}
+
+/**
+ * Scan all discovered records against all loaded Firebase connections.
+ * If a device ID is found in a Firebase connection, links it and saves to localPhones.
+ */
+export function matchAllRecordsWithFirebase() {
+  let matchedCount = 0;
+  let phonesChanged = false;
+  const up = { ...engine.localPhones };
+
+  engine.records = engine.records.map(rec => {
+    if (!rec.deviceId || !rec.phoneNumber) return rec;
+    const match = findDeviceInAllFirebase(rec.deviceId);
+    if (match) {
+      matchedCount++;
+      const pk = `${match.connId}::${rec.deviceId}`;
+      if (!up[pk] || up[pk] !== rec.phoneNumber) {
+        up[pk] = rec.phoneNumber;
+        phonesChanged = true;
+      }
+      return {
+        ...rec,
+        connectionId: match.connId,
+        connectionName: match.conn.name
+      };
+    }
+    return rec;
+  });
+
+  if (phonesChanged) {
+    engine.localPhones = up;
+    if (isBrowser) {
+      try {
+        localStorage.setItem('pd_phones', JSON.stringify(up));
+      } catch {}
+    }
+  }
+
+  persistState();
+  if (matchedCount > 0) {
+    addLog(`🔗 Matched ${matchedCount} records with active Firebase connections`, 'info');
+  }
+  return matchedCount;
+}
+
 
 export function formatElapsed(secs) {
   const h = Math.floor(secs / 3600);

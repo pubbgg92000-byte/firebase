@@ -134,6 +134,15 @@
     nameFromFbUrl,
     scanFirebaseUrls
   } from "$lib/firebase-extractor.js";
+  import {
+    downloadZip as discoveryDownloadZip,
+    downloadJson as discoveryDownloadJson,
+    importNumbersFromFile as discoveryImportFromFile,
+    importNumbersRaw as discoveryImportRaw,
+    postRecordToFirebase as discoveryPostSingle,
+    postAllRecordsToFirebase as discoveryPostAll
+  } from "$lib/discovery-engine.svelte.js";
+
 
   // ── Connections ──────────────────────────────────────────────────────────
   // path: where device keys live (root of messages)
@@ -259,6 +268,105 @@
 
   // Set of raw device keys that have been discovered — used for the dashboard filter
   let discoveredDeviceKeys = $derived(new Set(discoveryRecords.map(r => r.deviceId)));
+
+  // ── Discovery import & Firebase sync state ───────────────────────────────
+  let showDiscoveryImportModal = $state(false);
+  let discImportTab = $state('file');
+  let discImportFile = $state(null);
+  let discImportPaste = $state('');
+  let discImportAutoPost = $state(false);
+  let discImportLoading = $state(false);
+  let discImportSummary = $state(null);
+
+  let discPostingId = $state('');
+  let discBatchPosting = $state(false);
+  let discBatchProgress = $state({ current: 0, total: 0 });
+
+  async function handleDiscDownloadZip() {
+    try {
+      await discoveryDownloadZip();
+      addToast('ZIP archive exported!', 'success');
+    } catch (e) {
+      addToast(`ZIP export failed: ${e.message}`, 'error');
+    }
+  }
+
+  function handleDiscDownloadJson() {
+    discoveryDownloadJson();
+    addToast('JSON exported!', 'success');
+  }
+
+  async function handleDiscPostSingle(rec) {
+    if (discPostingId) return;
+    discPostingId = rec.deviceId;
+    try {
+      const res = await discoveryPostSingle(rec.deviceId, rec.phoneNumber, rec.connectionId);
+      addToast(`Updated in ${res.connName}!`, 'success');
+      loadDiscoveryRecords();
+    } catch (e) {
+      addToast(`Failed: ${e.message}`, 'error');
+    } finally {
+      discPostingId = '';
+    }
+  }
+
+  async function handleDiscPostAll() {
+    if (discBatchPosting) return;
+    if (!discoveryRecords.length) {
+      addToast('No discovered numbers to post', 'warn');
+      return;
+    }
+    if (!confirm(`Post ${discoveryRecords.length} discovered numbers across Firebase databases?`)) return;
+
+    discBatchPosting = true;
+    discBatchProgress = { current: 0, total: discoveryRecords.length };
+    try {
+      const res = await discoveryPostAll((p) => {
+        discBatchProgress = { current: p.current, total: p.total };
+      });
+      addToast(`Batch finished: ${res.successCount} posted, ${res.failedCount} failed`, res.successCount > 0 ? 'success' : 'error');
+      loadDiscoveryRecords();
+    } catch (e) {
+      addToast(`Batch post failed: ${e.message}`, 'error');
+    } finally {
+      discBatchPosting = false;
+    }
+  }
+
+  async function handleDiscExecuteImport() {
+    discImportLoading = true;
+    discImportSummary = null;
+    try {
+      let res;
+      if (discImportTab === 'file') {
+        if (!discImportFile) {
+          addToast('Please select a JSON or ZIP file', 'error');
+          discImportLoading = false;
+          return;
+        }
+        res = await discoveryImportFromFile(discImportFile, { autoPostToFirebase: discImportAutoPost });
+      } else {
+        if (!discImportPaste.trim()) {
+          addToast('Please paste JSON or device list', 'error');
+          discImportLoading = false;
+          return;
+        }
+        res = await discoveryImportRaw(discImportPaste, { autoPostToFirebase: discImportAutoPost });
+      }
+
+      discImportSummary = res;
+      loadDiscoveryRecords();
+      addToast(`Imported ${res.validCount} numbers (${res.matchedCount} matched in Firebase)`, 'success');
+      if (res.postedCount > 0) {
+        addToast(`Automatically posted ${res.postedCount} numbers to Firebase!`, 'success');
+      }
+    } catch (e) {
+      addToast(`Import failed: ${e.message}`, 'error');
+    } finally {
+      discImportLoading = false;
+    }
+  }
+
 
   // ── Sidebar ───────────────────────────────────────────────────────────────
   let sideFilter = $state("all");
@@ -3933,8 +4041,9 @@
           <div class="rm-body">
             <!-- File upload -->
             <div class="rm-section">
-              <label class="rm-label">Upload .json or .zip file</label>
+              <label class="rm-label" for="rm-file-input">Upload .json or .zip file</label>
               <input
+                id="rm-file-input"
                 type="file"
                 accept=".json,.zip"
                 class="rm-file-input"
@@ -3947,8 +4056,9 @@
 
             <!-- Paste JSON -->
             <div class="rm-section">
-              <label class="rm-label">Paste backup JSON</label>
+              <label class="rm-label" for="rm-paste-area">Paste backup JSON</label>
               <textarea
+                id="rm-paste-area"
                 class="rm-paste"
                 rows="5"
                 placeholder='Paste your backup JSON here...'
@@ -5512,6 +5622,18 @@
                 <option value="conn">By connection</option>
               </select>
               <button class="disc-refresh" onclick={loadDiscoveryRecords} title="Refresh">↻</button>
+              <button class="disc-action-btn" onclick={handleDiscDownloadJson} disabled={discoveryRecords.length === 0} title="Download JSON">📥 JSON</button>
+              <button class="disc-action-btn" onclick={handleDiscDownloadZip} disabled={discoveryRecords.length === 0} title="Download ZIP Archive">📦 ZIP</button>
+              <button class="disc-action-btn disc-act-import" onclick={() => { showDiscoveryImportModal = true; discImportSummary = null; }} title="Import from JSON or ZIP">➕ Import</button>
+              {#if discoveryRecords.length > 0}
+                <button class="disc-action-btn disc-act-cloud" onclick={handleDiscPostAll} disabled={discBatchPosting} title="Post all discovered numbers to Firebase RTDB">
+                  {#if discBatchPosting}
+                    <span class="spin-ring" style="width:11px;height:11px;border-width:1.5px"></span> {discBatchProgress.current}/{discBatchProgress.total}
+                  {:else}
+                    ☁️ Post All
+                  {/if}
+                </button>
+              {/if}
             </div>
           </div>
 
@@ -5531,19 +5653,38 @@
                     <button class="disc-devid" onclick={() => {
                       copyText(rec.deviceId);
                       addToast(rec.deviceId.slice(0, 12) + '… copied', 'success');
-                    }}>{rec.deviceId}</button>
+                    }} title="Click to copy ID">{rec.deviceId}</button>
                     <span class="disc-arrow">→</span>
                     <button class="disc-phone" onclick={() => {
                       copyText(rec.phoneNumber);
                       addToast(rec.phoneNumber + ' copied', 'success');
-                    }}>{rec.phoneNumber}</button>
+                    }} title="Click to copy Phone">{rec.phoneNumber}</button>
+
+                    {#if rec.syncedToFirebase}
+                      <span class="disc-synced-badge" title="Synced to Firebase RTDB">✓ In Firebase</span>
+                    {/if}
+
+                    <button
+                      class="disc-row-post {rec.syncedToFirebase ? 'synced' : ''}"
+                      onclick={() => handleDiscPostSingle(rec)}
+                      disabled={discPostingId === rec.deviceId}
+                      title="Post / update this number in Firebase RTDB"
+                    >
+                      {#if discPostingId === rec.deviceId}
+                        <span class="spin-ring" style="width:10px;height:10px;border-width:1.5px"></span>
+                      {:else if rec.syncedToFirebase}
+                        ↻ Re-Post
+                      {:else}
+                        ☁️ Post to Firebase
+                      {/if}
+                    </button>
                   </div>
                   <div class="disc-row-meta">
                     {#if rec.connectionName}
                       <span class="disc-conn">{rec.connectionName}</span>
                     {/if}
-                    <span class="disc-method {rec.discoveryMethod === 'manual' ? 'disc-method-manual' : 'disc-method-sms'}">
-                      {rec.discoveryMethod === 'manual' ? '✏️ manual' : '📡 sms'}
+                    <span class="disc-method {rec.discoveryMethod === 'import' ? 'disc-method-import' : (rec.discoveryMethod === 'manual' ? 'disc-method-manual' : 'disc-method-sms')}">
+                      {rec.discoveryMethod === 'import' ? '📥 import' : (rec.discoveryMethod === 'manual' ? '✏️ manual' : '📡 sms')}
                     </span>
                     {#if rec.attemptCount > 0}
                       <span class="disc-attempts">{rec.attemptCount}×</span>
@@ -5562,6 +5703,110 @@
     </div>
   </div>
 </div>
+
+<!-- Dashboard Discovery Import Modal (JSON or ZIP) -->
+{#if showDiscoveryImportModal}
+  <div class="restore-overlay" onclick={() => { if (!discImportLoading) showDiscoveryImportModal = false; }} role="presentation">
+    <div class="restore-modal" onclick={(e) => e.stopPropagation()} role="dialog" aria-modal="true">
+      <div class="rm-hdr">
+        <span class="rm-title">📥 Import Discovered Numbers (JSON / ZIP)</span>
+        <button class="rm-close" onclick={() => showDiscoveryImportModal = false} disabled={discImportLoading} aria-label="Close">×</button>
+      </div>
+
+      <div class="rm-body">
+        <div style="display:flex;gap:6px;margin-bottom:12px;border-bottom:1px solid rgba(255,255,255,0.08);padding-bottom:8px">
+          <button
+            class="fc-act-btn {discImportTab === 'file' ? 'fc-act-active' : ''}"
+            style="font-size:12px;padding:6px 12px"
+            onclick={() => { discImportTab = 'file'; discImportSummary = null; }}
+          >
+            📁 File Upload (.json / .zip)
+          </button>
+          <button
+            class="fc-act-btn {discImportTab === 'paste' ? 'fc-act-active' : ''}"
+            style="font-size:12px;padding:6px 12px"
+            onclick={() => { discImportTab = 'paste'; discImportSummary = null; }}
+          >
+            📝 Paste JSON / Text
+          </button>
+        </div>
+
+        {#if discImportTab === 'file'}
+          <div class="rm-section">
+            <label class="rm-label" for="disc-file-input">Select .json or .zip archive</label>
+            <input
+              id="disc-file-input"
+              type="file"
+              accept=".json,.zip,.csv,.txt"
+              class="rm-file-input"
+              onchange={(e) => {
+                discImportFile = e.target.files?.[0] || null;
+                discImportSummary = null;
+              }}
+            />
+          </div>
+        {:else}
+          <div class="rm-section">
+            <label class="rm-label" for="disc-paste-area">Paste JSON, CSV, or Key-Value pairs</label>
+            <textarea
+              id="disc-paste-area"
+              class="rm-paste"
+              rows="6"
+              placeholder={'{\n  "7550c5973bb02b7e": "917610254258"\n}\n-- OR records array / Python worker JSON --'}
+              bind:value={discImportPaste}
+            ></textarea>
+          </div>
+        {/if}
+
+        <label style="display:flex;align-items:flex-start;gap:8px;margin-top:10px;padding:8px 10px;background:rgba(2,132,199,0.1);border:1px solid rgba(2,132,199,0.25);border-radius:6px;cursor:pointer">
+          <input type="checkbox" bind:checked={discImportAutoPost} style="margin-top:3px;accent-color:#0284c7" />
+          <div style="font-size:11.5px;color:#e2e8f0;line-height:1.3">
+            <strong style="color:#7dd3fc">☁️ Automatically POST matched numbers to Firebase RTDB</strong>
+            <div style="font-size:10px;color:#94a3b8;margin-top:2px">If device ID is found in Firebase, immediately writes the phone number to clients path</div>
+          </div>
+        </label>
+
+        {#if discImportSummary}
+          <div style="margin-top:12px;padding:10px;background:rgba(0,0,0,0.35);border:1px solid rgba(255,255,255,0.08);border-radius:6px;font-size:11.5px">
+            <div style="display:flex;flex-wrap:wrap;gap:6px;margin-bottom:6px">
+              <span style="background:rgba(56,189,248,0.2);color:#38bdf8;padding:2px 7px;border-radius:4px;font-weight:700">Valid: {discImportSummary.validCount}</span>
+              <span style="background:rgba(34,197,94,0.2);color:#4ade80;padding:2px 7px;border-radius:4px;font-weight:700">New: {discImportSummary.newCount}</span>
+              <span style="background:rgba(168,85,247,0.2);color:#c084fc;padding:2px 7px;border-radius:4px;font-weight:700">Firebase Matched: {discImportSummary.matchedCount}</span>
+              {#if discImportSummary.postedCount > 0}
+                <span style="background:rgba(14,165,233,0.3);color:#7dd3fc;padding:2px 7px;border-radius:4px;font-weight:700">Posted: {discImportSummary.postedCount}</span>
+              {/if}
+            </div>
+            {#if discImportSummary.matchedList && discImportSummary.matchedList.length > 0}
+              <div style="font-size:10px;color:#94a3b8;margin-top:4px">
+                Matched devices: {discImportSummary.matchedList.slice(0, 6).map(m => `${m.deviceId.slice(0, 8)}… (${m.connName})`).join(', ')}
+                {#if discImportSummary.matchedList.length > 6} (+{discImportSummary.matchedList.length - 6} more){/if}
+              </div>
+            {/if}
+          </div>
+        {/if}
+
+        <div style="display:flex;justify-content:flex-end;gap:8px;margin-top:16px">
+          <button class="fc-act-btn" onclick={() => showDiscoveryImportModal = false} disabled={discImportLoading}>
+            {discImportSummary ? 'Done' : 'Cancel'}
+          </button>
+          <button
+            class="fc-act-btn"
+            style="background:#0284c7;color:#fff;border-color:#38bdf8"
+            onclick={handleDiscExecuteImport}
+            disabled={discImportLoading || (discImportTab === 'file' && !discImportFile) || (discImportTab === 'paste' && !discImportPaste.trim())}
+          >
+            {#if discImportLoading}
+              <span class="spin-ring" style="width:12px;height:12px;border-width:2px"></span> Importing…
+            {:else}
+              🚀 Import & Match Firebase
+            {/if}
+          </button>
+        </div>
+      </div>
+    </div>
+  </div>
+{/if}
+
 
 <!-- Floating Action Button: Add Firebase (Corner FAB) -->
 {#if !addOpen}
@@ -5726,3 +5971,48 @@
     <span class="bn-label">Settings</span>
   </button>
 </nav>
+
+<style>
+  :global(.disc-action-btn) {
+    padding: 6px 10px; font-size: 11px; font-weight: 600;
+    background: rgba(0, 0, 0, 0.3); border: 1px solid rgba(255, 255, 255, 0.08);
+    border-radius: 7px; color: #94a3b8; font-family: inherit; cursor: pointer;
+    transition: all 0.15s; white-space: nowrap; display: inline-flex; align-items: center; gap: 4px;
+  }
+  :global(.disc-action-btn:hover:not(:disabled)) {
+    background: rgba(56, 189, 248, 0.12); color: #38bdf8; border-color: rgba(56, 189, 248, 0.25);
+  }
+  :global(.disc-action-btn:disabled) { opacity: 0.35; cursor: not-allowed; }
+  :global(.disc-act-import) {
+    background: rgba(168, 85, 247, 0.12); color: #c084fc; border-color: rgba(168, 85, 247, 0.25);
+  }
+  :global(.disc-act-import:hover:not(:disabled)) {
+    background: rgba(168, 85, 247, 0.2); color: #d8b4fe; border-color: rgba(168, 85, 247, 0.4);
+  }
+  :global(.disc-act-cloud) {
+    background: linear-gradient(135deg, #0284c7, #0369a1); color: #ffffff; border-color: rgba(56, 189, 248, 0.35);
+    box-shadow: 0 0 10px rgba(14, 165, 233, 0.25);
+  }
+  :global(.disc-act-cloud:hover:not(:disabled)) {
+    box-shadow: 0 0 15px rgba(14, 165, 233, 0.45); transform: translateY(-1px);
+  }
+  :global(.disc-synced-badge) {
+    background: rgba(34, 197, 94, 0.15); color: #4ade80; border: 1px solid rgba(34, 197, 94, 0.3);
+    border-radius: 4px; padding: 1px 6px; font-size: 9px; font-weight: 700;
+    text-transform: uppercase; letter-spacing: 0.03em; white-space: nowrap;
+  }
+  :global(.disc-row-post) {
+    margin-left: auto; background: rgba(14, 165, 233, 0.12); color: #38bdf8;
+    border: 1px solid rgba(14, 165, 233, 0.25); border-radius: 4px; padding: 2px 8px;
+    font-size: 10px; font-weight: 600; cursor: pointer; transition: all 0.15s; white-space: nowrap; font-family: inherit;
+  }
+  :global(.disc-row-post:hover:not(:disabled)) {
+    background: rgba(14, 165, 233, 0.25); color: #7dd3fc;
+  }
+  :global(.disc-row-post:disabled) { opacity: 0.5; cursor: not-allowed; }
+  :global(.disc-row-post.synced) {
+    background: rgba(34, 197, 94, 0.08); color: #86efac; border-color: rgba(34, 197, 94, 0.2);
+  }
+  :global(.disc-method-import) { background: rgba(168, 85, 247, 0.12); color: #c084fc; }
+</style>
+

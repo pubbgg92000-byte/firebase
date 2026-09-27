@@ -10,7 +10,10 @@
     getDisplayPhone, getDiscoveredPhone,
     initEngine, startDiscovery, pauseDiscovery, stopDiscovery,
     retryFailed, retryTomorrow, refreshDevices, setMaxWorkers,
-    clearLog, clearRecords, downloadJson, fetchAllDevices, formatElapsed,
+    clearLog, clearRecords, downloadJson, downloadZip,
+    importNumbersFromFile, importNumbersRaw,
+    postRecordToFirebase, postAllRecordsToFirebase, matchAllRecordsWithFirebase,
+    fetchAllDevices, formatElapsed,
     skipTarget, unskipTarget, unskipAll, manualAssignNumber, sendManualSms,
   } from '$lib/discovery-engine.svelte.js';
   import { extractNumber } from '$lib/device-helpers.js';
@@ -26,6 +29,32 @@
   let processingCount = $derived(_processingCount());
   let progressPct = $derived(_progressPct());
   let skippedCount = $derived(_skippedCount());
+
+  // ── Import modal & Firebase sync state ───────────────────────────────────
+  let showImportModal = $state(false);
+  let importTab = $state('file'); // 'file' | 'paste'
+  let importFile = $state(null);
+  let importPasteText = $state('');
+  let importAutoPost = $state(false);
+  let importLoading = $state(false);
+  let importSummary = $state(null);
+
+  let postingDeviceId = $state('');
+  let isBatchPosting = $state(false);
+  let batchPostingProgress = $state({ current: 0, total: 0 });
+
+  let recordSearch = $state('');
+  let filteredRecords = $derived.by(() => {
+    let list = engine.records.filter(r => r.status === 'discovered');
+    if (!recordSearch.trim()) return list;
+    const q = recordSearch.trim().toLowerCase();
+    return list.filter(r =>
+      r.deviceId?.toLowerCase().includes(q) ||
+      r.phoneNumber?.toLowerCase().includes(q) ||
+      r.connectionName?.toLowerCase().includes(q) ||
+      r.discoveryMethod?.toLowerCase().includes(q)
+    );
+  });
 
   // ── Manual action form state ────────────────────────────────────────────
   let manualDeviceKey = $state('');
@@ -127,10 +156,94 @@
     toast('Records cleared', 'info');
   }
 
-  function handleDownload() {
+  function handleDownloadJson() {
     downloadJson();
     toast('JSON exported', 'success');
   }
+
+  async function handleDownloadZip() {
+    try {
+      await downloadZip();
+      toast('ZIP archive exported', 'success');
+    } catch (e) {
+      toast(`ZIP export failed: ${e.message}`, 'error');
+    }
+  }
+
+  async function handlePostSingle(rec) {
+    if (postingDeviceId) return;
+    postingDeviceId = rec.deviceId;
+    try {
+      const res = await postRecordToFirebase(rec.deviceId, rec.phoneNumber, rec.connectionId);
+      toast(`Updated in ${res.connName}!`, 'success');
+    } catch (e) {
+      toast(`Failed: ${e.message}`, 'error');
+    } finally {
+      postingDeviceId = '';
+    }
+  }
+
+  async function handlePostAll() {
+    if (isBatchPosting) return;
+    const discovered = engine.records.filter(r => r.status === 'discovered' && r.phoneNumber);
+    if (!discovered.length) {
+      toast('No discovered numbers to post', 'warn');
+      return;
+    }
+    if (!confirm(`Post ${discovered.length} discovered numbers across Firebase databases?`)) return;
+
+    isBatchPosting = true;
+    batchPostingProgress = { current: 0, total: discovered.length };
+    try {
+      const res = await postAllRecordsToFirebase((p) => {
+        batchPostingProgress = { current: p.current, total: p.total };
+      });
+      toast(`Finished: ${res.successCount} posted, ${res.failedCount} failed`, res.successCount > 0 ? 'success' : 'error');
+    } catch (e) {
+      toast(`Batch post failed: ${e.message}`, 'error');
+    } finally {
+      isBatchPosting = false;
+    }
+  }
+
+  function handleMatchConnections() {
+    const n = matchAllRecordsWithFirebase();
+    toast(n > 0 ? `Matched ${n} devices with Firebase!` : 'No new matches found', 'info');
+  }
+
+  async function handleExecuteImport() {
+    importLoading = true;
+    importSummary = null;
+    try {
+      let res;
+      if (importTab === 'file') {
+        if (!importFile) {
+          toast('Please select a JSON or ZIP file', 'error');
+          importLoading = false;
+          return;
+        }
+        res = await importNumbersFromFile(importFile, { autoPostToFirebase: importAutoPost });
+      } else {
+        if (!importPasteText.trim()) {
+          toast('Please paste JSON or device list text', 'error');
+          importLoading = false;
+          return;
+        }
+        res = await importNumbersRaw(importPasteText, { autoPostToFirebase: importAutoPost });
+      }
+
+      importSummary = res;
+      toast(`Imported ${res.validCount} numbers (${res.matchedCount} matched in Firebase)`, 'success');
+      if (res.postedCount > 0) {
+        toast(`Automatically posted ${res.postedCount} numbers to Firebase!`, 'success');
+      }
+    } catch (e) {
+      toast(`Import failed: ${e.message}`, 'error');
+    } finally {
+      importLoading = false;
+    }
+  }
+
 
   onMount(() => {
     initEngine();
@@ -323,22 +436,42 @@
       <button class="dbtn dbtn-ghost" onclick={() => refreshDevices().then(() => toast('Refreshed', 'info'))} disabled={engine.devicesLoading}>
         {#if engine.devicesLoading}<span class="dspin"></span>{:else}↻{/if} Refresh
       </button>
-      <button class="dbtn dbtn-ghost" onclick={handleDownload} disabled={engine.records.length === 0}>📥 JSON</button>
-      <button class="dbtn dbtn-ghost dbtn-sm-danger" onclick={confirmClearRecords} disabled={engine.records.length === 0}>🗑</button>
+      <button class="dbtn dbtn-ghost" onclick={handleDownloadJson} disabled={engine.records.length === 0} title="Download discovered numbers as JSON">
+        📥 JSON
+      </button>
+      <button class="dbtn dbtn-ghost" onclick={handleDownloadZip} disabled={engine.records.length === 0} title="Download discovered numbers as ZIP archive">
+        📦 ZIP
+      </button>
+      <button class="dbtn dbtn-import" onclick={() => { showImportModal = true; importSummary = null; }} title="Import numbers from JSON or ZIP">
+        ➕ Import
+      </button>
+      {#if engine.records.filter(r => r.status === 'discovered').length > 0}
+        <button class="dbtn dbtn-cloud" onclick={handlePostAll} disabled={isBatchPosting} title="Post all discovered numbers to their matching Firebase RTDB">
+          {#if isBatchPosting}
+            <span class="dspin dspin-sm"></span> {batchPostingProgress.current}/{batchPostingProgress.total}
+          {:else}
+            ☁️ Post All to Firebase
+          {/if}
+        </button>
+        <button class="dbtn dbtn-ghost" onclick={handleMatchConnections} title="Scan and match any unlinked devices across all Firebase connections">
+          🔗 Match Firebase
+        </button>
+      {/if}
+      <button class="dbtn dbtn-ghost dbtn-sm-danger" onclick={confirmClearRecords} disabled={engine.records.length === 0} title="Clear discovery records">🗑</button>
     </div>
 
     <!-- Workers + Progress Row -->
     <div class="dc-row2">
       <div class="dc-workers-ctl">
-        <label class="dc-wlabel">Workers</label>
-        <input type="range" min="1" max="10" step="1" value={engine.maxWorkers}
+        <label class="dc-wlabel" for="workers-slider">Workers</label>
+        <input id="workers-slider" type="range" min="1" max="10" step="1" value={engine.maxWorkers}
           oninput={(e) => setMaxWorkers(parseInt(e.target.value))}
           class="dc-wslider" />
         <span class="dc-wcount">{engine.maxWorkers}</span>
       </div>
       <div class="dc-dailylimit">
-        <label class="dc-wlabel">Daily Limit</label>
-        <input type="number" min="1" max="20" value={engine.config.maxDailyAttempts}
+        <label class="dc-wlabel" for="daily-limit-input">Daily Limit</label>
+        <input id="daily-limit-input" type="number" min="1" max="20" value={engine.config.maxDailyAttempts}
           onchange={(e) => { engine.config.maxDailyAttempts = Math.max(1, Math.min(20, parseInt(e.target.value) || 6)); }}
           class="dc-dlimit-input" />
       </div>
@@ -518,31 +651,95 @@
   {#if engine.records.length > 0}
     <div class="disco-records" id="sec-records">
       <div class="dr-hdr">
-        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></svg>
-        Discovery Records
-        <span class="dl-cnt">{engine.records.length}</span>
-        {#if engine.records.length > 4}
-          <button class="dl-expand-btn" onclick={() => toggleExpand('records')} title={expandedSections.records ? 'Collapse to scrollable' : 'Expand full list'}>
-            {expandedSections.records ? '↕ Collapse' : '↕ Expand'}
+        <div class="dr-hdr-left">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></svg>
+          <span>Discovery Records</span>
+          <span class="dl-cnt">{filteredRecords.length} / {engine.records.length}</span>
+        </div>
+
+        <div class="dr-hdr-right">
+          <input
+            type="search"
+            class="dr-search-input"
+            placeholder="Search records…"
+            bind:value={recordSearch}
+          />
+          <button class="dbtn dbtn-ghost dbtn-xs" onclick={handleDownloadJson} title="Download JSON">📥 JSON</button>
+          <button class="dbtn dbtn-ghost dbtn-xs" onclick={handleDownloadZip} title="Download ZIP">📦 ZIP</button>
+          <button class="dbtn dbtn-cloud dbtn-xs" onclick={handlePostAll} disabled={isBatchPosting} title="Post all to Firebase RTDB">
+            {#if isBatchPosting}
+              <span class="dspin dspin-sm"></span> {batchPostingProgress.current}/{batchPostingProgress.total}
+            {:else}
+              ☁️ Post All
+            {/if}
           </button>
-        {/if}
+          {#if filteredRecords.length > 4}
+            <button class="dl-expand-btn" onclick={() => toggleExpand('records')} title={expandedSections.records ? 'Collapse to scrollable' : 'Expand full list'}>
+              {expandedSections.records ? '↕ Collapse' : '↕ Expand'}
+            </button>
+          {/if}
+        </div>
       </div>
       <div class="dr-body {expandedSections.records ? 'is-expanded' : ''}" use:chainScroll>
-        {#each engine.records as rec (rec.deviceId + rec.discoveredAt)}
-          <div class="dr-row">
-            <div class="dr-main">
-              <code class="dr-devid">{rec.deviceId}</code>
-              <span class="dr-arrow">→</span>
-              <code class="dr-phone">{rec.phoneNumber}</code>
+        {#if filteredRecords.length === 0}
+          <div class="dl-empty">No records match "{recordSearch}"</div>
+        {:else}
+          {#each filteredRecords as rec (rec.deviceId + (rec.discoveredAt || ''))}
+            <div class="dr-row">
+              <div class="dr-main">
+                <button class="dr-devid" onclick={() => { copyText(rec.deviceId); toast(`${rec.deviceId} copied`, 'success'); }} title="Click to copy Device ID">
+                  {rec.deviceId}
+                </button>
+                <span class="dr-arrow">→</span>
+                <button class="dr-phone" onclick={() => { copyText(rec.phoneNumber); toast(`${rec.phoneNumber} copied`, 'success'); }} title="Click to copy Phone">
+                  {rec.phoneNumber}
+                </button>
+
+                {#if rec.syncedToFirebase}
+                  <span class="dr-synced-badge" title="Synced to Firebase RTDB{rec.syncedConn ? ` (${rec.syncedConn})` : ''}{rec.syncedAt ? ` on ${new Date(rec.syncedAt).toLocaleTimeString()}` : ''}">
+                    ✓ In Firebase
+                  </span>
+                {/if}
+
+                <div class="dr-row-actions">
+                  <button
+                    class="dr-post-btn {rec.syncedToFirebase ? 'dr-post-btn-synced' : ''}"
+                    onclick={() => handlePostSingle(rec)}
+                    disabled={postingDeviceId === rec.deviceId}
+                    title="Write this phone number into Firebase RTDB under clients/{rec.deviceId}"
+                  >
+                    {#if postingDeviceId === rec.deviceId}
+                      <span class="dspin dspin-sm"></span> Posting…
+                    {:else if rec.syncedToFirebase}
+                      ↻ Re-Post
+                    {:else}
+                      ☁️ Post to Firebase
+                    {/if}
+                  </button>
+                </div>
+              </div>
+              <div class="dr-meta">
+                {#if rec.connectionName}
+                  <span class="dr-conn">{rec.connectionName}</span>
+                {:else}
+                  <span class="dr-conn dr-unmatched">Unlinked DB</span>
+                {/if}
+                <span class="dr-method {rec.discoveryMethod === 'import' ? 'dr-method-import' : ''}">
+                  {rec.discoveryMethod === 'import' ? '📥 import' : (rec.discoveryMethod === 'manual' ? '✏️ manual' : '📡 sms')}
+                </span>
+                {#if rec.receiverDeviceId && rec.receiverDeviceId !== 'imported' && rec.receiverDeviceId !== 'manual-entry'}
+                  <span class="dr-via">via {rec.receiverDeviceId.slice(0, 10)}…</span>
+                {/if}
+                {#if rec.discoveredAt}
+                  <span class="dr-at">{new Date(rec.discoveredAt).toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })}</span>
+                {/if}
+                {#if rec.attemptCount > 0}
+                  <span class="dr-attempts">{rec.attemptCount}×</span>
+                {/if}
+              </div>
             </div>
-            <div class="dr-meta">
-              <span class="dr-conn">{rec.connectionName}</span>
-              <span class="dr-via">via {rec.receiverDeviceId?.slice(0, 10)}…</span>
-              <span class="dr-at">{new Date(rec.discoveredAt).toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })}</span>
-              <span class="dr-attempts">{rec.attemptCount}×</span>
-            </div>
-          </div>
-        {/each}
+          {/each}
+        {/if}
       </div>
     </div>
   {/if}
@@ -642,6 +839,127 @@
     </div>
   </div>
 </div>
+
+<!-- Import Modal (JSON or ZIP) -->
+{#if showImportModal}
+  <div class="im-backdrop" onclick={(e) => { if (e.target === e.currentTarget && !importLoading) showImportModal = false; }} role="presentation">
+    <div class="im-dialog" role="dialog" aria-modal="true">
+      <div class="im-head">
+        <div class="im-title-group">
+          <span class="im-icon">📥</span>
+          <div>
+            <h3 class="im-title">Import Discovered Numbers</h3>
+            <p class="im-sub">Upload a JSON or ZIP file, or paste device data. If an ID matches any Firebase, it's auto-linked!</p>
+          </div>
+        </div>
+        <button class="im-close" onclick={() => showImportModal = false} disabled={importLoading} aria-label="Close dialog">✕</button>
+      </div>
+
+      <!-- Tabs -->
+      <div class="im-tabs">
+        <button class="im-tab {importTab === 'file' ? 'active' : ''}" onclick={() => { importTab = 'file'; importSummary = null; }}>
+          📁 Upload File (.json / .zip)
+        </button>
+        <button class="im-tab {importTab === 'paste' ? 'active' : ''}" onclick={() => { importTab = 'paste'; importSummary = null; }}>
+          📝 Paste JSON / Text
+        </button>
+      </div>
+
+      <div class="im-body">
+        {#if importTab === 'file'}
+          <div class="im-dropzone">
+            <input
+              type="file"
+              id="im-file-input"
+              class="im-file-input"
+              accept=".json,.zip,.csv,.txt"
+              onchange={(e) => {
+                importFile = e.target.files?.[0] || null;
+                importSummary = null;
+              }}
+            />
+            <label for="im-file-input" class="im-drop-label">
+              <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" class="im-drop-icon">
+                <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+                <polyline points="17 8 12 3 7 8"/>
+                <line x1="12" y1="3" x2="12" y2="15"/>
+              </svg>
+              {#if importFile}
+                <span class="im-file-name">{importFile.name}</span>
+                <span class="im-file-size">({(importFile.size / 1024).toFixed(1)} KB)</span>
+              {:else}
+                <span class="im-drop-text">Click to choose or drag & drop <strong>.json</strong> or <strong>.zip</strong> archive</span>
+                <span class="im-drop-hint">Supports full exports, Python worker processed_numbers.json, and key-value maps</span>
+              {/if}
+            </label>
+          </div>
+        {:else}
+          <div class="im-paste-group">
+            <textarea
+              class="im-textarea"
+              placeholder={'{\n  "records": [\n    { "deviceId": "7550c5973bb02b7e", "phoneNumber": "917610254258" }\n  ]\n}\n-- OR --\n{\n  "7550c5973bb02b7e": "917610254258"\n}\n-- OR lines of --\n7550c5973bb02b7e, 917610254258'}
+              bind:value={importPasteText}
+              rows="8"
+            ></textarea>
+          </div>
+        {/if}
+
+        <!-- Auto-Post Checkbox -->
+        <label class="im-checkbox-row">
+          <input type="checkbox" bind:checked={importAutoPost} class="im-checkbox" />
+          <span class="im-check-text">
+            <strong>☁️ Auto-Post matched numbers to Firebase RTDB</strong>
+            <small>If device ID is found in Firebase, immediately writes/patches the phone number to RTDB clients path</small>
+          </span>
+        </label>
+
+        <!-- Summary card when import completes -->
+        {#if importSummary}
+          <div class="im-summary-box">
+            <div class="im-sum-row">
+              <span class="im-sum-badge im-sb-blue">Total: {importSummary.validCount}</span>
+              <span class="im-sum-badge im-sb-green">New: {importSummary.newCount}</span>
+              <span class="im-sum-badge im-sb-amber">Updated: {importSummary.updatedCount}</span>
+              <span class="im-sum-badge im-sb-purple">Matched in Firebase: {importSummary.matchedCount}</span>
+              {#if importSummary.postedCount > 0}
+                <span class="im-sum-badge im-sb-cloud">Posted to RTDB: {importSummary.postedCount}</span>
+              {/if}
+            </div>
+            {#if importSummary.matchedList && importSummary.matchedList.length > 0}
+              <div class="im-matches-list">
+                <span class="im-matches-title">Firebase Database Matches:</span>
+                <div class="im-match-tags">
+                  {#each importSummary.matchedList.slice(0, 10) as m}
+                    <span class="im-match-tag">
+                      <code>{m.deviceId.slice(0, 10)}…</code> ➔ <strong>{m.phoneNumber}</strong> ({m.connName})
+                    </span>
+                  {/each}
+                  {#if importSummary.matchedList.length > 10}
+                    <span class="im-match-tag im-more">+{importSummary.matchedList.length - 10} more</span>
+                  {/if}
+                </div>
+              </div>
+            {/if}
+          </div>
+        {/if}
+      </div>
+
+      <!-- Actions -->
+      <div class="im-foot">
+        <button class="dbtn dbtn-ghost" onclick={() => showImportModal = false} disabled={importLoading}>
+          {importSummary ? 'Done' : 'Cancel'}
+        </button>
+        <button class="dbtn dbtn-primary" onclick={handleExecuteImport} disabled={importLoading || (importTab === 'file' && !importFile) || (importTab === 'paste' && !importPasteText.trim())}>
+          {#if importLoading}
+            <span class="dspin dspin-sm"></span> Processing…
+          {:else}
+            🚀 Import & Match Firebase
+          {/if}
+        </button>
+      </div>
+    </div>
+  </div>
+{/if}
 
 <!-- Toasts -->
 <div class="disco-toasts">
@@ -1081,4 +1399,82 @@
     .dh-title span { font-size: 11px; }
     .dl-id { max-width: 90px; font-size: 9px; }
   }
+
+  /* ── Extra buttons & Records styling ── */
+  .dbtn-import { background: rgba(168, 85, 247, 0.14); color: #c084fc; border: 1px solid rgba(168, 85, 247, 0.28); }
+  .dbtn-import:hover:not(:disabled) { background: rgba(168, 85, 247, 0.22); color: #d8b4fe; border-color: rgba(168, 85, 247, 0.4); }
+  .dbtn-cloud { background: linear-gradient(135deg, #0284c7, #0369a1); color: #ffffff; border: 1px solid rgba(56, 189, 248, 0.35); box-shadow: 0 0 10px rgba(14, 165, 233, 0.2); }
+  .dbtn-cloud:hover:not(:disabled) { box-shadow: 0 0 16px rgba(14, 165, 233, 0.4); transform: translateY(-1px); }
+  .dbtn-xs { padding: 2px 7px; font-size: 10px; border-radius: 5px; }
+
+  .dr-hdr { display: flex; align-items: center; justify-content: space-between; gap: 8px; flex-wrap: wrap; padding: 10px 14px; }
+  .dr-hdr-left { display: flex; align-items: center; gap: 8px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.06em; color: #22c55e; }
+  .dr-hdr-right { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+  .dr-search-input { background: #111d35; color: #e2e8f0; border: 1px solid rgba(255,255,255,0.08); border-radius: 5px; padding: 3px 8px; font-size: 10.5px; width: 130px; font-family: inherit; }
+  .dr-search-input:focus { border-color: rgba(56,189,248,0.3); outline: none; }
+
+  .dr-row-actions { margin-left: auto; display: flex; align-items: center; gap: 6px; }
+  .dr-post-btn { background: rgba(14, 165, 233, 0.12); color: #38bdf8; border: 1px solid rgba(14, 165, 233, 0.25); border-radius: 4px; padding: 2px 8px; font-size: 9.5px; font-weight: 600; cursor: pointer; transition: all 0.15s; white-space: nowrap; font-family: inherit; }
+  .dr-post-btn:hover:not(:disabled) { background: rgba(14, 165, 233, 0.25); color: #7dd3fc; }
+  .dr-post-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+  .dr-post-btn-synced { background: rgba(34, 197, 94, 0.08); color: #86efac; border-color: rgba(34, 197, 94, 0.2); }
+  .dr-synced-badge { background: rgba(34, 197, 94, 0.15); color: #4ade80; border: 1px solid rgba(34, 197, 94, 0.3); border-radius: 4px; padding: 1px 6px; font-size: 8.5px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.03em; white-space: nowrap; }
+  .dr-unmatched { color: #fb7185 !important; }
+  .dr-method-import { color: #c084fc !important; }
+
+  /* ── Import Modal ── */
+  .im-backdrop { position: fixed; inset: 0; background: rgba(0, 0, 0, 0.75); backdrop-filter: blur(8px); z-index: 9999; display: flex; align-items: center; justify-content: center; padding: 16px; animation: dt-in 0.2s ease; }
+  .im-dialog { background: #0e1420; border: 1px solid rgba(255, 255, 255, 0.1); border-radius: 12px; width: 100%; max-width: 580px; max-height: 90vh; overflow-y: auto; display: flex; flex-direction: column; box-shadow: 0 20px 50px rgba(0, 0, 0, 0.6); }
+  .im-head { display: flex; align-items: flex-start; justify-content: space-between; padding: 16px 20px 12px; border-bottom: 1px solid rgba(255, 255, 255, 0.06); }
+  .im-title-group { display: flex; gap: 12px; align-items: flex-start; }
+  .im-icon { font-size: 22px; line-height: 1; }
+  .im-title { margin: 0; font-size: 15px; font-weight: 700; color: #f1f5f9; }
+  .im-sub { margin: 3px 0 0; font-size: 11px; color: #94a3b8; line-height: 1.4; }
+  .im-close { background: none; border: none; font-size: 16px; color: #64748b; cursor: pointer; padding: 4px 8px; border-radius: 4px; transition: all 0.15s; }
+  .im-close:hover { color: #f1f5f9; background: rgba(255, 255, 255, 0.06); }
+  .im-tabs { display: flex; border-bottom: 1px solid rgba(255, 255, 255, 0.06); background: rgba(0, 0, 0, 0.2); padding: 0 16px; }
+  .im-tab { background: none; border: none; border-bottom: 2px solid transparent; color: #94a3b8; font-size: 12px; font-weight: 600; padding: 10px 14px; cursor: pointer; transition: all 0.15s; font-family: inherit; }
+  .im-tab.active { color: #38bdf8; border-bottom-color: #38bdf8; }
+  .im-body { padding: 16px 20px; display: flex; flex-direction: column; gap: 14px; }
+
+  /* Dropzone */
+  .im-dropzone { border: 2px dashed rgba(56, 189, 248, 0.25); border-radius: 10px; background: rgba(56, 189, 248, 0.02); transition: all 0.2s; position: relative; }
+  .im-dropzone:hover { border-color: rgba(56, 189, 248, 0.45); background: rgba(56, 189, 248, 0.05); }
+  .im-file-input { position: absolute; inset: 0; opacity: 0; cursor: pointer; width: 100%; height: 100%; }
+  .im-drop-label { display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 28px 16px; text-align: center; cursor: pointer; pointer-events: none; }
+  .im-drop-icon { color: #38bdf8; margin-bottom: 8px; opacity: 0.8; }
+  .im-file-name { font-size: 13px; font-weight: 700; color: #38bdf8; word-break: break-all; font-family: 'JetBrains Mono', monospace; }
+  .im-file-size { font-size: 11px; color: #94a3b8; margin-top: 2px; }
+  .im-drop-text { font-size: 12px; color: #e2e8f0; line-height: 1.4; }
+  .im-drop-hint { font-size: 10.5px; color: #64748b; margin-top: 5px; }
+
+  .im-paste-group { display: flex; flex-direction: column; }
+  .im-textarea { width: 100%; background: #090d16; color: #e2e8f0; border: 1px solid rgba(255, 255, 255, 0.08); border-radius: 8px; padding: 10px; font-size: 11px; font-family: 'JetBrains Mono', monospace; line-height: 1.5; resize: vertical; box-sizing: border-box; }
+  .im-textarea:focus { border-color: rgba(56, 189, 248, 0.4); outline: none; }
+
+  .im-checkbox-row { display: flex; align-items: flex-start; gap: 10px; padding: 10px 12px; background: rgba(2, 132, 199, 0.08); border: 1px solid rgba(2, 132, 199, 0.2); border-radius: 8px; cursor: pointer; }
+  .im-checkbox { margin-top: 2px; accent-color: #0284c7; width: 15px; height: 15px; cursor: pointer; }
+  .im-check-text { display: flex; flex-direction: column; gap: 2px; font-size: 11.5px; color: #e2e8f0; }
+  .im-check-text strong { color: #7dd3fc; }
+  .im-check-text small { color: #94a3b8; font-size: 10px; line-height: 1.3; }
+
+  .im-summary-box { background: rgba(0, 0, 0, 0.3); border: 1px solid rgba(255, 255, 255, 0.07); border-radius: 8px; padding: 12px; display: flex; flex-direction: column; gap: 10px; }
+  .im-sum-row { display: flex; flex-wrap: wrap; gap: 6px; }
+  .im-sum-badge { font-size: 10.5px; font-weight: 700; padding: 3px 8px; border-radius: 5px; }
+  .im-sb-blue { background: rgba(56, 189, 248, 0.15); color: #38bdf8; }
+  .im-sb-green { background: rgba(34, 197, 94, 0.15); color: #4ade80; }
+  .im-sb-amber { background: rgba(251, 191, 36, 0.15); color: #fbbf24; }
+  .im-sb-purple { background: rgba(168, 85, 247, 0.15); color: #c084fc; }
+  .im-sb-cloud { background: rgba(14, 165, 233, 0.25); color: #7dd3fc; border: 1px solid rgba(56, 189, 248, 0.3); }
+
+  .im-matches-list { display: flex; flex-direction: column; gap: 6px; margin-top: 4px; }
+  .im-matches-title { font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.04em; color: #94a3b8; }
+  .im-match-tags { display: flex; flex-wrap: wrap; gap: 5px; max-height: 110px; overflow-y: auto; }
+  .im-match-tag { font-size: 10px; background: rgba(255, 255, 255, 0.05); padding: 2px 7px; border-radius: 4px; border: 1px solid rgba(255, 255, 255, 0.05); color: #cbd5e1; }
+  .im-match-tag code { color: #7dd3fc; }
+  .im-match-tag strong { color: #22c55e; }
+  .im-more { color: #94a3b8; font-style: italic; }
+
+  .im-foot { display: flex; align-items: center; justify-content: flex-end; gap: 8px; padding: 12px 20px 16px; border-top: 1px solid rgba(255, 255, 255, 0.06); }
 </style>
+
