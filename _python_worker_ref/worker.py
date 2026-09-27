@@ -17,6 +17,42 @@ try:
 except Exception:
     pass
 
+# Auto-switch to virtual environment if dependencies are not found in current environment
+try:
+    import telethon  # noqa: F401
+    import rich      # noqa: F401
+    import requests  # noqa: F401
+    import dotenv    # noqa: F401
+except ImportError:
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    candidate_venvs = [
+        os.path.join(script_dir, "..", ".venv"),
+        os.path.join(script_dir, ".venv"),
+        os.path.join(script_dir, "..", "venv"),
+        os.path.join(script_dir, "venv"),
+    ]
+    venv_python = None
+    for candidate in candidate_venvs:
+        py_bin = (
+            os.path.join(candidate, "Scripts", "python.exe")
+            if sys.platform == "win32"
+            else os.path.join(candidate, "bin", "python")
+        )
+        if os.path.isfile(py_bin) and os.path.abspath(py_bin) != os.path.abspath(sys.executable):
+            venv_python = py_bin
+            break
+
+    if venv_python:
+        os.execv(venv_python, [venv_python] + sys.argv)
+    else:
+        print(
+            "\n[ERROR] Required Python packages (telethon, rich, requests, python-dotenv) are missing.",
+            file=sys.stderr,
+        )
+        print("Please activate the virtual environment or run with:", file=sys.stderr)
+        print("  source ../.venv/bin/activate && python worker.py\n", file=sys.stderr)
+        raise
+
 from telethon import TelegramClient, events
 
 from rich.console import Group

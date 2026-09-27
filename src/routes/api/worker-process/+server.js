@@ -23,6 +23,21 @@ function addWorkerLog(text) {
   }
 }
 
+function getPythonBinary() {
+  const rootDir = process.cwd();
+  const venvPaths = [
+    path.resolve(rootDir, '.venv', process.platform === 'win32' ? 'Scripts/python.exe' : 'bin/python'),
+    path.resolve(rootDir, '_python_worker_ref', '.venv', process.platform === 'win32' ? 'Scripts/python.exe' : 'bin/python'),
+    path.resolve(rootDir, 'venv', process.platform === 'win32' ? 'Scripts/python.exe' : 'bin/python')
+  ];
+  for (const venvPy of venvPaths) {
+    if (fs.existsSync(venvPy)) {
+      return venvPy;
+    }
+  }
+  return process.platform === 'win32' ? 'python' : 'python3';
+}
+
 function getWorkerCwd() {
   return path.resolve(process.cwd(), '_python_worker_ref');
 }
@@ -87,10 +102,11 @@ async function startWorkerProcess() {
   await new Promise(r => setTimeout(r, 400));
 
   const cwd = getWorkerCwd();
-  addWorkerLog('🚀 Starting Python Telegram Worker (worker.py)...');
+  const pythonBin = getPythonBinary();
+  addWorkerLog(`🚀 Starting Python Telegram Worker (worker.py)...`);
 
   try {
-    workerProcess = spawn('python', ['-u', 'worker.py'], {
+    workerProcess = spawn(pythonBin, ['-u', 'worker.py'], {
       cwd,
       shell: process.platform === 'win32',
       stdio: ['pipe', 'pipe', 'pipe']

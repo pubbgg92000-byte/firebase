@@ -952,7 +952,7 @@ export async function downloadZip() {
   zip.file('discovered_numbers.csv', csvRows.join('\r\n'));
   zip.file('discovered_numbers.txt', txtLines.join('\r\n'));
 
-  const blob = await zip.generateAsync({ type: 'blob' });
+  const blob = await zip.generateAsync({ type: 'blob', compression: 'DEFLATE', compressionOptions: { level: 6 } });
   const url = URL.createObjectURL(blob);
   const a = document.createElement('a');
   a.href = url;
@@ -964,7 +964,7 @@ export async function downloadZip() {
 
 /**
  * Locate a device ID across all active Firebase connections in memory.
- * Checks both keys and info dictionaries.
+ * Checks both keys and info dictionaries with O(1) hash lookups.
  */
 export function findDeviceInAllFirebase(deviceId) {
   if (!deviceId) return null;
@@ -982,12 +982,13 @@ export function findDeviceInAllFirebase(deviceId) {
     }
   }
 
-  // 2. Also check if localPhones already has it
-  for (const [k, ph] of Object.entries(engine.localPhones)) {
-    const [connId, dKey] = k.split('::');
-    if (dKey === devKey) {
-      const conn = engine.connections.find(c => c.id === connId);
-      if (conn) return { connId: conn.id, conn, inLocal: true };
+  // 2. Also check if localPhones already has it (O(1) property lookup per connection, avoids Object.entries)
+  if (engine.localPhones) {
+    for (const conn of engine.connections) {
+      const phoneKey = `${conn.id}::${devKey}`;
+      if (engine.localPhones[phoneKey] !== undefined) {
+        return { connId: conn.id, conn, inLocal: true };
+      }
     }
   }
 
@@ -1124,7 +1125,7 @@ export function parseNumbersFromTextOrJson(raw) {
  * Import a list of device-phone items into the discovery engine.
  * Automatically checks all Firebase connections for device IDs and assigns numbers to devices.
  */
-export async function importNumbersList(itemList, { autoPostToFirebase = false } = {}) {
+export async function importNumbersList(itemList, { autoPostToFirebase = false, onProgress = null } = {}) {
   if (!Array.isArray(itemList) || itemList.length === 0) {
     return { total: 0, validCount: 0, newCount: 0, updatedCount: 0, matchedCount: 0, postedCount: 0, matchedList: [] };
   }
@@ -1144,7 +1145,54 @@ export async function importNumbersList(itemList, { autoPostToFirebase = false }
   const updatedPhones = { ...engine.localPhones };
   let phonesModified = false;
 
-  for (const item of itemList) {
+  // Pre-index device -> connection mapping for O(1) instantaneous lookup
+  const deviceToConnMap = new Map();
+  const connUrlMap = new Map();
+  for (const conn of engine.connections) {
+    if (conn.url) connUrlMap.set(conn.url, conn);
+    if (!conn.enabled) continue;
+    const dbEntry = engine.db[conn.id];
+    if (dbEntry?.keys) {
+      for (const devKey of Object.keys(dbEntry.keys)) {
+        if (!deviceToConnMap.has(devKey)) {
+          deviceToConnMap.set(devKey, { connId: conn.id, conn, inKeys: true, inInfo: !!dbEntry?.info?.[devKey] });
+        }
+      }
+    }
+    if (dbEntry?.info) {
+      for (const devKey of Object.keys(dbEntry.info)) {
+        if (!deviceToConnMap.has(devKey)) {
+          deviceToConnMap.set(devKey, { connId: conn.id, conn, inKeys: false, inInfo: true });
+        }
+      }
+    }
+  }
+
+  // Pre-index localPhones
+  const connById = new Map(engine.connections.map(c => [c.id, c]));
+  if (engine.localPhones) {
+    for (const k in engine.localPhones) {
+      const idx = k.indexOf('::');
+      if (idx !== -1) {
+        const connId = k.slice(0, idx);
+        const dKey = k.slice(idx + 2);
+        if (dKey && !deviceToConnMap.has(dKey)) {
+          const conn = connById.get(connId);
+          if (conn) {
+            deviceToConnMap.set(dKey, { connId: conn.id, conn, inLocal: true });
+          }
+        }
+      }
+    }
+  }
+
+  const newRecords = [];
+  const discoveredDevIds = new Set();
+  const toPost = [];
+  const nowIso = new Date().toISOString();
+
+  for (let i = 0; i < itemList.length; i++) {
+    const item = itemList[i];
     const rawDevId = String(item.deviceId || item.device_id || '').trim();
     const rawPhone = String(item.phoneNumber || item.phone || '').trim();
     const cleanNum = extractNumber(rawPhone) || rawPhone.replace(/\D/g, '');
@@ -1155,8 +1203,8 @@ export async function importNumbersList(itemList, { autoPostToFirebase = false }
 
     validCount++;
 
-    // 1. Look for device across all Firebase connections
-    const fbMatch = findDeviceInAllFirebase(rawDevId);
+    // 1. Fast O(1) check across all Firebase connections
+    const fbMatch = deviceToConnMap.get(rawDevId);
     let connId = item.connectionId || '';
     let connName = item.connectionName || '';
 
@@ -1164,52 +1212,46 @@ export async function importNumbersList(itemList, { autoPostToFirebase = false }
       matchedCount++;
       connId = fbMatch.connId;
       connName = fbMatch.conn.name;
-      matchedList.push({ deviceId: rawDevId, phoneNumber: cleanNum, connName, connId });
+      if (matchedList.length < 200) {
+        matchedList.push({ deviceId: rawDevId, phoneNumber: cleanNum, connName, connId });
+      }
 
       // Automatically add that number to that device in localPhones
       const phoneKey = `${connId}::${rawDevId}`;
-      updatedPhones[phoneKey] = cleanNum;
-      phonesModified = true;
+      if (updatedPhones[phoneKey] !== cleanNum) {
+        updatedPhones[phoneKey] = cleanNum;
+        phonesModified = true;
+      }
 
       // Update in-memory db info if present
       if (engine.db[connId]?.info?.[rawDevId]) {
-        engine.db[connId].info[rawDevId] = {
-          ...engine.db[connId].info[rawDevId],
-          mobNo: cleanNum,
-          phone: cleanNum,
-          phoneNumber: cleanNum
-        };
+        const infoObj = engine.db[connId].info[rawDevId];
+        infoObj.mobNo = cleanNum;
+        infoObj.phone = cleanNum;
+        infoObj.phoneNumber = cleanNum;
       }
     } else if (item.database) {
-      const c = engine.connections.find(cn => cn.url.includes(item.database) || item.database.includes(cn.url));
+      let c = connUrlMap.get(item.database);
+      if (!c) {
+        c = engine.connections.find(cn => cn.url.includes(item.database) || item.database.includes(cn.url));
+      }
       if (c) {
         connId = c.id;
         connName = c.name;
         const phoneKey = `${connId}::${rawDevId}`;
-        updatedPhones[phoneKey] = cleanNum;
-        phonesModified = true;
+        if (updatedPhones[phoneKey] !== cleanNum) {
+          updatedPhones[phoneKey] = cleanNum;
+          phonesModified = true;
+        }
       }
     }
 
-    // 2. If autoPostToFirebase requested and we have a connection
+    // 2. Queue for autoPostToFirebase if requested
     let syncedToFirebase = !!item.syncedToFirebase;
     let syncedAt = item.syncedAt || null;
     let syncedConn = item.syncedConn || null;
 
-    if (autoPostToFirebase && connId) {
-      const conn = engine.connections.find(c => c.id === connId);
-      if (conn) {
-        try {
-          await patchDevicePhone(conn, rawDevId, cleanNum);
-          syncedToFirebase = true;
-          syncedAt = new Date().toISOString();
-          syncedConn = conn.name;
-          postedCount++;
-        } catch {}
-      }
-    }
-
-    // 3. Add or update record in engine.records
+    // 3. Add or update record in existingMap / newRecords
     const existing = existingMap.get(rawDevId);
     if (existing) {
       updatedCount++;
@@ -1220,6 +1262,9 @@ export async function importNumbersList(itemList, { autoPostToFirebase = false }
         existing.syncedToFirebase = true;
         existing.syncedAt = syncedAt;
         existing.syncedConn = syncedConn;
+      }
+      if (autoPostToFirebase && connId) {
+        toPost.push({ conn: fbMatch?.conn || connById.get(connId), devId: rawDevId, cleanNum, rec: existing });
       }
     } else {
       newCount++;
@@ -1233,21 +1278,64 @@ export async function importNumbersList(itemList, { autoPostToFirebase = false }
         receiverDeviceId: 'imported',
         receiverPhoneNumber: '',
         attemptCount: item.attemptCount || 0,
-        discoveredAt: item.discoveredAt || new Date().toISOString(),
+        discoveredAt: item.discoveredAt || nowIso,
         connectionId: connId,
         connectionName: connName,
         syncedToFirebase,
         syncedAt,
         syncedConn
       };
-      engine.records = [...engine.records, newRec];
+      newRecords.push(newRec);
       existingMap.set(rawDevId, newRec);
+      if (autoPostToFirebase && connId) {
+        toPost.push({ conn: fbMatch?.conn || connById.get(connId), devId: rawDevId, cleanNum, rec: newRec });
+      }
     }
 
-    // Clear from failed or tomorrow queues since number is now discovered
-    engine.failedTargets = engine.failedTargets.filter(k => k !== rawDevId);
-    engine.tryTomorrow = engine.tryTomorrow.filter(k => k !== rawDevId);
-    engine.skippedTargets = engine.skippedTargets.filter(k => k !== rawDevId);
+    discoveredDevIds.add(rawDevId);
+
+    if (onProgress && i % 500 === 0) {
+      onProgress({ current: i, total: itemList.length, stage: 'parsing' });
+    }
+  }
+
+  // Batch-apply new records to engine.records at once (avoids quadratic array copying and reactive thrashing)
+  if (newRecords.length > 0) {
+    engine.records = [...engine.records, ...newRecords];
+  }
+
+  // Clear queues in a single filter pass using O(1) Set lookup
+  if (discoveredDevIds.size > 0) {
+    if (engine.failedTargets?.length > 0) {
+      engine.failedTargets = engine.failedTargets.filter(k => !discoveredDevIds.has(k));
+    }
+    if (engine.tryTomorrow?.length > 0) {
+      engine.tryTomorrow = engine.tryTomorrow.filter(k => !discoveredDevIds.has(k));
+    }
+    if (engine.skippedTargets?.length > 0) {
+      engine.skippedTargets = engine.skippedTargets.filter(k => !discoveredDevIds.has(k));
+    }
+  }
+
+  // Execute auto-post in parallel batches if requested
+  if (autoPostToFirebase && toPost.length > 0) {
+    const CONCURRENCY = 8;
+    for (let i = 0; i < toPost.length; i += CONCURRENCY) {
+      const slice = toPost.slice(i, i + CONCURRENCY);
+      await Promise.all(slice.map(async ({ conn, devId, cleanNum, rec }) => {
+        if (!conn) return;
+        try {
+          await patchDevicePhone(conn, devId, cleanNum);
+          rec.syncedToFirebase = true;
+          rec.syncedAt = new Date().toISOString();
+          rec.syncedConn = conn.name;
+          postedCount++;
+        } catch {}
+      }));
+      if (onProgress) {
+        onProgress({ current: Math.min(i + slice.length, toPost.length), total: toPost.length, stage: 'posting' });
+      }
+    }
   }
 
   if (phonesModified) {
@@ -1286,14 +1374,44 @@ export async function importNumbersFromFile(file, options = {}) {
 
   if (fileName.endsWith('.zip')) {
     const zip = await JSZip.loadAsync(file);
-    for (const [relPath, zipEntry] of Object.entries(zip.files)) {
-      if (zipEntry.dir) continue;
-      const lower = relPath.toLowerCase();
-      if (lower.endsWith('.json') || lower.endsWith('.csv') || lower.endsWith('.txt')) {
-        const text = await zipEntry.async('string');
-        const parsed = parseNumbersFromTextOrJson(text);
-        items = [...items, ...parsed];
+    const entries = Object.entries(zip.files).filter(([_, entry]) => !entry.dir);
+
+    // 1. If this ZIP is an export package, discovered_numbers.json (or records.json) contains the complete authoritative records.
+    // Processing device_phone_mapping.json, discovered_numbers.csv, and discovered_numbers.txt in addition
+    // would redundantly duplicate every single record 4 times and cause extreme lag.
+    const canonicalEntry = entries.find(([p]) => {
+      const base = p.split('/').pop().toLowerCase();
+      return base === 'discovered_numbers.json' || base === 'records.json';
+    });
+
+    if (canonicalEntry) {
+      const text = await canonicalEntry[1].async('string');
+      items = parseNumbersFromTextOrJson(text);
+    } else {
+      // 2. Generic ZIP: sort so that richer structured files (JSON) are parsed first, then CSV, then TXT.
+      // Deduplicate by deviceId across files to eliminate duplicate entries.
+      const sortedEntries = [...entries].sort(([a], [b]) => {
+        const extA = a.split('.').pop().toLowerCase();
+        const extB = b.split('.').pop().toLowerCase();
+        const rank = (ext) => ext === 'json' ? 1 : ext === 'csv' ? 2 : 3;
+        return rank(extA) - rank(extB);
+      });
+
+      const itemsByDevId = new Map();
+      for (const [relPath, zipEntry] of sortedEntries) {
+        const lower = relPath.toLowerCase();
+        if (lower.endsWith('.json') || lower.endsWith('.csv') || lower.endsWith('.txt')) {
+          const text = await zipEntry.async('string');
+          const parsed = parseNumbersFromTextOrJson(text);
+          for (const it of parsed) {
+            const devId = String(it.deviceId || it.device_id || '').trim();
+            if (devId && !itemsByDevId.has(devId)) {
+              itemsByDevId.set(devId, it);
+            }
+          }
+        }
       }
+      items = Array.from(itemsByDevId.values());
     }
   } else if (fileName.endsWith('.json')) {
     const text = await file.text();
