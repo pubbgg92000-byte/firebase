@@ -7,6 +7,7 @@ import {
   isSuccessful,
   getRecord,
   removeSuccess,
+  removeBatch,
   getAllArray,
   getSuccessCount,
   clearRegistry,
@@ -61,6 +62,20 @@ describe('Automation Success Registry', () => {
     assert.equal(getSuccessCount(), 0);
   });
 
+  test('removes multiple numbers in batch for explicit manual reuse', () => {
+    markSuccess('9876543210', { deviceId: 'dev-1' });
+    markSuccess('9876543211', { deviceId: 'dev-2' });
+    markSuccess('9876543212', { deviceId: 'dev-3' });
+    assert.equal(getSuccessCount(), 3);
+
+    const count = removeBatch(['9876543210', '9876543212', '9999999999']);
+    assert.equal(count, 2);
+    assert.equal(isSuccessful('9876543210'), false);
+    assert.equal(isSuccessful('9876543211'), true);
+    assert.equal(isSuccessful('9876543212'), false);
+    assert.equal(getSuccessCount(), 1);
+  });
+
   test('exports and imports JSON format correctly', () => {
     markSuccess('9876543210', { deviceId: 'dev-1' });
     markSuccess('9876543211', { deviceId: 'dev-2' });
@@ -75,4 +90,28 @@ describe('Automation Success Registry', () => {
     assert.equal(isSuccessful('9876543210'), true);
     assert.equal(isSuccessful('9876543211'), true);
   });
+
+  test('records various failure statuses and aggregates stats correctly', () => {
+    registry.markNumber('9876543201', 'successful', { deviceId: 'dev-1', reason: 'Verified' });
+    registry.markNumber('9876543202', 'failed', { deviceId: 'dev-2', reason: 'Network timeout' });
+    registry.markNumber('9876543203', 'expired', { deviceId: 'dev-3', reason: 'OTP timeout' });
+    registry.markNumber('9876543204', 'suspended', { deviceId: 'dev-4', reason: 'Banned account' });
+    registry.markNumber('9876543205', 'rate_limited', { deviceId: 'dev-5', reason: 'Too many attempts' });
+
+    const stats = registry.getStats();
+    assert.equal(stats.total, 5);
+    assert.equal(stats.successful, 1);
+    assert.equal(stats.failed, 1);
+    assert.equal(stats.expired, 1);
+    assert.equal(stats.suspended, 1);
+    assert.equal(stats.rateLimited, 1);
+
+    // Verify trashing/removal of failed items in bulk
+    const removedCount = registry.removeBatch(['9876543202', '9876543203', '9876543204']);
+    assert.equal(removedCount, 3);
+    assert.equal(registry.isAlreadyProcessed('9876543202'), false);
+    assert.equal(registry.isAlreadyProcessed('9876543201'), true);
+    assert.equal(registry.getStats().total, 2);
+  });
 });
+

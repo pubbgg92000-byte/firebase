@@ -33,18 +33,18 @@ def get_telegram_config():
 
     raw_api_id = tg.get("api_id")
     if not raw_api_id:
-        raw_api_id = os.getenv("TELEGRAM_API_ID", "0")
+        raw_api_id = os.getenv("TELEGRAM_API_ID", "36120949")
     try:
-        api_id = int(str(raw_api_id).strip() or "0")
+        api_id = int(str(raw_api_id).strip() or "36120949")
     except (ValueError, TypeError):
-        api_id = 0
+        api_id = 36120949
 
-    api_hash = str(tg.get("api_hash") or os.getenv("TELEGRAM_API_HASH", "")).strip()
-    bot_username = str(tg.get("bot_username") or os.getenv("BOT_USERNAME", "")).strip()
+    api_hash = str(tg.get("api_hash") or os.getenv("TELEGRAM_API_HASH", "9f430c68e4cb8d3d25a19ed4edee9b9f")).strip()
+    bot_username = str(tg.get("bot_username") or os.getenv("BOT_USERNAME", "@Swiggy_fuckbot")).strip()
     if bot_username and not bot_username.startswith("@"):
         bot_username = f"@{bot_username}"
 
-    phone = str(tg.get("phone") or os.getenv("TELEGRAM_PHONE", "")).strip()
+    phone = str(tg.get("phone") or os.getenv("TELEGRAM_PHONE", "+919490828871")).strip()
 
     try:
         otp_timeout = int(tg.get("otp_timeout") or os.getenv("OTP_TIMEOUT_SECONDS", "60"))
@@ -55,6 +55,16 @@ def get_telegram_config():
         tg.get("response_keyword") or os.getenv("RESPONSE_KEYWORD", "swiggy")
     ).strip().lower()
 
+    forward_otp = bool(
+        tg.get("forward_otp_to_bot", False)
+        or tg.get("forward_otp", False)
+        or os.getenv("FORWARD_OTP_TO_BOT", "0").lower() in ("1", "true", "yes")
+    )
+
+    otp_target_bot = str(
+        tg.get("otp_target_bot") or os.getenv("OTP_TARGET_BOT", "")
+    ).strip()
+
     return {
         "api_id": api_id,
         "api_hash": api_hash,
@@ -62,6 +72,8 @@ def get_telegram_config():
         "phone": phone,
         "otp_timeout": otp_timeout,
         "response_keyword": keyword,
+        "forward_otp_to_bot": forward_otp,
+        "otp_target_bot": otp_target_bot,
     }
 
 
@@ -91,5 +103,7 @@ BOT_USERNAME = _initial["bot_username"]
 TELEGRAM_PHONE = _initial["phone"]
 OTP_TIMEOUT_SECONDS = _initial["otp_timeout"]
 RESPONSE_KEYWORD = _initial["response_keyword"]
+FORWARD_OTP_TO_BOT = _initial.get("forward_otp_to_bot", False)
+OTP_TARGET_BOT = _initial.get("otp_target_bot", "")
 
 FIREBASE_DATABASE_URL = os.getenv("FIREBASE_DATABASE_URL", "")

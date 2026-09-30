@@ -17,6 +17,11 @@
     stopAutomation,
     stepAutomation,
     manualReusePhone,
+    manualReuseMultiplePhones,
+    trashPhone,
+    trashMultiplePhones,
+    getDbPresenceSets,
+    isRecordInDb,
     clearUsedSessionDevices,
     resetStats,
     formatElapsed,
@@ -35,6 +40,7 @@
     withNumber as _withNumber,
     onlineDevices as _onlineDevices,
     allDevices as _allDevices,
+    todayDiscoveredCount as _todayDiscoveredCount,
     getDisplayPhone,
     getDiscoveredPhone,
     fetchAllDevices
@@ -42,6 +48,33 @@
   import { extractNumber } from '$lib/device-helpers.js';
   import { registry } from '$lib/automation-registry.js';
   import { onMount, onDestroy } from 'svelte';
+  import { goto } from '$app/navigation';
+
+  function goToDashboard(e) {
+    if (e) e.preventDefault();
+    let navigated = false;
+    goto('/').then(() => { navigated = true; }).catch(() => {
+      window.location.href = '/';
+    });
+    setTimeout(() => {
+      if (!navigated && window.location.pathname !== '/') {
+        window.location.href = '/';
+      }
+    }, 250);
+  }
+
+  function goToDiscovery(e) {
+    if (e) e.preventDefault();
+    let navigated = false;
+    goto('/discovery').then(() => { navigated = true; }).catch(() => {
+      window.location.href = '/discovery';
+    });
+    setTimeout(() => {
+      if (!navigated && window.location.pathname !== '/discovery') {
+        window.location.href = '/discovery';
+      }
+    }, 250);
+  }
   import OrchestrationControls from '$lib/components/automation/OrchestrationControls.svelte';
   import WorkerBridgeCard from '$lib/components/automation/WorkerBridgeCard.svelte';
   import PreflightDiagnostics from '$lib/components/automation/PreflightDiagnostics.svelte';
@@ -51,12 +84,15 @@
   import RegistryManagerTab from '$lib/components/automation/RegistryManagerTab.svelte';
   import ConfigPanelTab from '$lib/components/automation/ConfigPanelTab.svelte';
   import LogsViewerTab from '$lib/components/automation/LogsViewerTab.svelte';
+  import BrowserWorkerTab from '$lib/components/automation/BrowserWorkerTab.svelte';
+  import { worker as browserWorker } from '$lib/browser-worker.svelte.js';
 
   // Derived state from discovery engine
   let allDevicesList = $derived(_allDevices());
   let onlineDevicesList = $derived(_onlineDevices());
   let withNumberList = $derived(_withNumber());
   let allCandidatesList = $derived(getAllEligibleDevices());
+  let todayCount = $derived(_todayDiscoveredCount());
 
   // Local UI state
   let searchQuery = $state('');
@@ -145,6 +181,9 @@
     });
   });
 
+  // Database presence sets for quick checking
+  let dbPresenceSets = $derived(getDbPresenceSets());
+
   // Filtered registry list
   let filteredRegistry = $derived.by(() => {
     const q = registrySearch.toLowerCase().trim();
@@ -170,6 +209,10 @@
           if (st !== 'rate_limited') return false;
         } else if (registryStatusFilter === 'failed') {
           if (['successful', 'success', 'expired', 'suspended', 'rate_limited'].includes(st)) return false;
+        } else if (registryStatusFilter === 'not_in_db') {
+          if (isRecordInDb(r, dbPresenceSets)) return false;
+        } else if (registryStatusFilter === 'in_db') {
+          if (!isRecordInDb(r, dbPresenceSets)) return false;
         }
       }
 
@@ -379,13 +422,20 @@
     if (ok) {
       toast('Pre-flight checks passed! Start is unlocked.', 'success');
     } else {
-      toast('Pre-flight checks failed. Review diagnostics.', 'error');
+      const fails = (autoEngine.preflightResults || []).filter(r => r.status === 'fail');
+      const failMsg = fails.map(f => f.name + ': ' + f.message).join(' | ');
+      toast(failMsg || 'Pre-flight checks failed. Review diagnostics below.', 'error');
     }
   }
 
   async function handleStart() {
     const ok = await startAutomation();
-    if (ok) toast('Automation orchestrator started', 'success');
+    if (ok) {
+      toast('Automation orchestrator started', 'success');
+    } else {
+      const err = autoEngine.lastError || 'Cannot start automation. Check pre-flight diagnostics.';
+      toast(err, 'error');
+    }
   }
 
   function handlePause() {
@@ -424,11 +474,107 @@
     refreshRegistryView();
   }
 
-  function handleManualReuse(phone) {
-    if (confirm(`Allow manual reuse of phone number ${phone}?\n\nThis will remove it from the persistent protection registry so it can be tested again.`)) {
-      manualReusePhone(phone);
+  async function handleManualReuse(target) {
+    const presence = getDbPresenceSets();
+    const phonesList = (Array.isArray(target) ? target : [target]).filter(Boolean);
+    if (phonesList.length === 0) {
+      toast('No numbers selected for reuse', 'warn');
+      return;
+    }
+
+    const inDb = [];
+    const notInDb = [];
+
+    for (const phone of phonesList) {
+      const rec = registryRecords.find(r => r.phone === phone) || { phone };
+      if (isRecordInDb(rec, presence)) {
+        inDb.push(phone);
+      } else {
+        notInDb.push(phone);
+      }
+    }
+
+    if (phonesList.length === 1) {
+      const singlePhone = phonesList[0];
+      const isInDb = inDb.length > 0;
+      const desc = isInDb
+        ? 'Device or number exists in active database. It will return to Candidate Pool & Queue to retry.'
+        : 'Device and number NOT found in database. It will be permanently trashed and purged from registry, Firebase, and worker.';
+
+      if (confirm(`Allow manual reuse for ${singlePhone}?\n\n${desc}`)) {
+        if (isInDb) {
+          manualReusePhone(singlePhone);
+          toast(`Number ${singlePhone} returned to Candidate Pool to retry!`, 'success');
+        } else {
+          await trashPhone(singlePhone);
+          toast(`Number ${singlePhone} trashed & purged (not in database)`, 'info');
+        }
+        refreshRegistryView();
+      }
+      return;
+    }
+
+    let msg = `Process ${phonesList.length} selected numbers?\n\n`;
+    if (inDb.length > 0) {
+      msg += `• ${inDb.length} in database → returned to Candidate Pool & Queue to retry.\n`;
+    }
+    if (notInDb.length > 0) {
+      msg += `• ${notInDb.length} not in database → permanently trashed & purged.\n`;
+    }
+
+    if (confirm(msg)) {
+      let reusedCount = 0;
+      let trashedCount = 0;
+
+      if (inDb.length > 0) {
+        reusedCount = manualReuseMultiplePhones(inDb);
+      }
+      if (notInDb.length > 0) {
+        trashedCount = await trashMultiplePhones(notInDb);
+      }
+
       refreshRegistryView();
-      toast(`Number ${phone} unlocked for reuse`, 'success');
+
+      if (reusedCount > 0 && trashedCount > 0) {
+        toast(`${reusedCount} returned to retry pool (${trashedCount} trashed because not in DB)`, 'success');
+      } else if (reusedCount > 0) {
+        toast(`${reusedCount} number(s) returned to Candidate Pool to retry!`, 'success');
+      } else if (trashedCount > 0) {
+        toast(`${trashedCount} number(s) trashed & purged (not in database)`, 'info');
+      }
+    }
+  }
+
+  async function handleTrashSelected(target) {
+    const phonesList = (Array.isArray(target) ? target : [target]).filter(Boolean);
+    if (phonesList.length === 0) {
+      toast('No numbers selected to trash', 'warn');
+      return;
+    }
+
+    const msg = phonesList.length === 1
+      ? `Permanently trash and purge ${phonesList[0]} from registry, Firebase, and worker?`
+      : `Permanently trash and purge ${phonesList.length} selected numbers from registry, Firebase, and worker?`;
+
+    if (confirm(msg)) {
+      const count = await trashMultiplePhones(phonesList);
+      refreshRegistryView();
+      toast(`Trashed & purged ${count} number(s) from registry`, 'info');
+    }
+  }
+
+  async function handleTrashNotInDb() {
+    const presence = getDbPresenceSets();
+    const orphaned = registryRecords.filter(r => !isRecordInDb(r, presence)).map(r => r.phone).filter(Boolean);
+    if (orphaned.length === 0) {
+      toast('No orphaned numbers found! All recorded numbers exist in the database.', 'success');
+      return;
+    }
+
+    if (confirm(`Permanently trash all ${orphaned.length} number(s) not in any active database?\n\nThis will purge them from local registry, Firebase RTDB, and worker memory.`)) {
+      const count = await trashMultiplePhones(orphaned);
+      refreshRegistryView();
+      toast(`Trashed & purged ${count} orphaned number(s)`, 'info');
     }
   }
 
@@ -440,9 +586,42 @@
     tgCode = '';
     tgPassword = '';
     try {
+      // Ensure worker_config.json has the latest credentials and phone
+      try {
+        await fetch('/api/worker-config', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            phone,
+            api_id: autoEngine.config.apiId,
+            api_hash: autoEngine.config.apiHash,
+            bot_username: autoEngine.config.botUsername
+          })
+        });
+      } catch {}
+
+      // Ensure worker process is started
+      try {
+        const wpRes = await fetch('/api/worker-process');
+        if (wpRes.ok) {
+          const wpData = await wpRes.json();
+          if (!wpData.running) {
+            await fetch('/api/worker-process', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ action: 'start' })
+            });
+          }
+        }
+      } catch {}
+
       const ok = await connectTelegram(phone);
-      if (ok) toast('Auth request sent to worker. Waiting for code...', 'info');
-      else toast('Failed to send auth request — check Firebase connectivity', 'error');
+      if (ok) {
+        toast('Auth request sent to worker. Checking connection...', 'info');
+        setTimeout(syncWorkerStatus, 500);
+      } else {
+        toast('Failed to send auth request — check Firebase connectivity', 'error');
+      }
     } finally {
       tgSubmitting = false;
     }
@@ -591,7 +770,10 @@
   let customBotCommand = $state('');
   let activeLogSubTab = $state('worker'); // 'worker' | 'orchestrator'
 
+  let _checkingWorker = false;
   async function checkWorkerStatus() {
+    if (_checkingWorker) return;
+    _checkingWorker = true;
     try {
       const res = await fetch('/api/worker-process');
       if (res.ok) {
@@ -602,7 +784,9 @@
           workerLogs = d.logs;
         }
       }
-    } catch {}
+    } catch {} finally {
+      _checkingWorker = false;
+    }
   }
 
   async function toggleWorker() {
@@ -619,7 +803,17 @@
       if (d.ok) {
         workerRunning = !!d.running;
         workerPid = d.pid;
-        toast(d.running ? `Python Telegram worker launched (PID: ${d.pid})` : 'Python worker stopped', 'success');
+        if (d.running) {
+          const apiId = String(autoEngine.config.apiId || '').trim();
+          const apiHash = String(autoEngine.config.apiHash || '').trim();
+          if (!apiId || !apiHash) {
+            toast(`Worker started (PID: ${d.pid || 'active'}) in standby mode. Set Telegram API ID & Hash in Config.`, 'info');
+          } else {
+            toast(`Python Telegram worker launched (PID: ${d.pid || 'active'})`, 'success');
+          }
+        } else {
+          toast('Python worker stopped', 'info');
+        }
         checkWorkerStatus();
       } else {
         toast(`Worker error: ${d.error || 'failed to execute'}`, 'error');
@@ -718,6 +912,11 @@
 
     if (typeof window !== 'undefined') {
       window.addEventListener('storage', handleStorageEvent);
+      const urlParams = new URLSearchParams(window.location.search);
+      const tabParam = urlParams.get('tab');
+      if (tabParam && ['overview', 'browser_worker', 'sms_feed', 'queue', 'registry', 'config', 'logs'].includes(tabParam)) {
+        activeTab = tabParam;
+      }
     }
 
     let pollTick = 0;
@@ -749,9 +948,14 @@
   <!-- Top Navigation & Header -->
   <header class="auto-header">
     <div class="header-left">
-      <a href="/" data-sveltekit-reload class="nav-back-link" title="Back to Main Panel">← Dashboard</a>
+      <a href="/" class="nav-back-link" onclick={goToDashboard} title="Back to Main Dashboard">← Dashboard</a>
       <span class="nav-sep">/</span>
-      <a href="/discovery" data-sveltekit-reload class="nav-sub-link">Discovery 📡</a>
+      <a href="/discovery" class="nav-sub-link discovery-nav-btn" onclick={goToDiscovery} title="Device Number Discovery">
+        <span>Discovery 📡</span>
+        {#if todayCount > 0}
+          <span class="nav-today-badge">+{todayCount} today</span>
+        {/if}
+      </a>
       <span class="nav-sep">/</span>
       <h1 class="page-title">
         <span class="title-icon">🤖</span>
@@ -763,6 +967,15 @@
     </div>
 
     <div class="header-right">
+      <button
+        class="browser-worker-pill {browserWorker.status === 'RUNNING' ? 'running' : ''}"
+        onclick={() => activeTab = 'browser_worker'}
+        title="Open Browser Worker (Runs directly inside tab on any device)"
+      >
+        <span class="pulse-dot {browserWorker.status === 'RUNNING' ? 'dot-online' : 'dot-offline'}"></span>
+        🌐 Browser Worker: {browserWorker.status}
+      </button>
+
       <button
         class="worker-pill {workerRunning ? 'running' : 'stopped'}"
         onclick={toggleWorker}
@@ -798,6 +1011,12 @@
   <nav class="auto-tabs">
     <button class="tab-btn {activeTab === 'overview' ? 'active' : ''}" onclick={() => activeTab = 'overview'}>
       Overview & Controls
+    </button>
+    <button class="tab-btn {activeTab === 'browser_worker' ? 'active' : ''}" onclick={() => activeTab = 'browser_worker'}>
+      🌐 Browser Worker (In-Tab)
+      {#if browserWorker.status === 'RUNNING'}
+        <span class="tab-running-dot"></span>
+      {/if}
     </button>
     <button class="tab-btn {activeTab === 'sms_feed' ? 'active' : ''}" onclick={() => activeTab = 'sms_feed'}>
       Live SMS & OTP Feed ({dashboardNotifs.length})
@@ -866,6 +1085,9 @@
         />
       </section>
 
+    {:else if activeTab === 'browser_worker'}
+      <BrowserWorkerTab />
+
     {:else if activeTab === 'sms_feed'}
       <DedicatedSmsTab
         {filteredSmsNotifications}
@@ -897,12 +1119,15 @@
         {registryStats}
         {filteredRegistry}
         {isSyncingRegistry}
+        {dbPresenceSets}
         onsyncregistry={() => handleSyncRegistry(false)}
         ondownloadcsv={handleDownloadCsv}
         ondownloadregistry={handleDownloadRegistry}
         onopenimport={() => (importModalOpen = true)}
         onclearregistry={handleClearRegistry}
         onmanualreuse={handleManualReuse}
+        ontrashselected={handleTrashSelected}
+        ontrashnotindb={handleTrashNotInDb}
       />
 
     {:else if activeTab === 'config'}

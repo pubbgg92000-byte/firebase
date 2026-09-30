@@ -111,7 +111,25 @@ let _withoutNumber = $derived(_onlineDevices.filter(d => {
   return !phone || phone.length < 5;
 }));
 
+function isToday(dateVal) {
+  if (!dateVal) return false;
+  try {
+    const d = new Date(dateVal);
+    if (isNaN(d.getTime())) return false;
+    const now = new Date();
+    return d.getFullYear() === now.getFullYear() &&
+           d.getMonth() === now.getMonth() &&
+           d.getDate() === now.getDate();
+  } catch {
+    return false;
+  }
+}
+
 let _discoveredCount = $derived(engine.records.filter(r => r.status === 'discovered').length);
+let _todayDiscoveredRecords = $derived(
+  engine.records.filter(r => r.status === 'discovered' && isToday(r.discoveredAt || r.timestamp || r.date))
+);
+let _todayDiscoveredCount = $derived(_todayDiscoveredRecords.length);
 let _failedCount = $derived(engine.failedTargets.length);
 let _tomorrowCount = $derived(engine.tryTomorrow.length);
 let _processingCount = $derived(engine.lockedTargets.length);
@@ -127,6 +145,8 @@ export function onlineDevices() { return _onlineDevices; }
 export function withNumber() { return _withNumber; }
 export function withoutNumber() { return _withoutNumber; }
 export function discoveredCount() { return _discoveredCount; }
+export function todayDiscoveredCount() { return _todayDiscoveredCount; }
+export function todayDiscoveredRecords() { return _todayDiscoveredRecords; }
 export function failedCount() { return _failedCount; }
 export function tomorrowCount() { return _tomorrowCount; }
 export function processingCount() { return _processingCount; }
@@ -254,7 +274,13 @@ async function fetchConn(conn) {
 
 export async function fetchAllDevices() {
   engine.devicesLoading = true;
-  await Promise.allSettled(engine.connections.filter(c => c.enabled).map(c => fetchConn(c)));
+  const enabled = engine.connections.filter(c => c.enabled);
+  const BATCH_SIZE = 16;
+  for (let i = 0; i < enabled.length; i += BATCH_SIZE) {
+    const chunk = enabled.slice(i, i + BATCH_SIZE);
+    await Promise.allSettled(chunk.map(c => fetchConn(c)));
+    await sleep(0); // yield to browser event loop so clicks/navigation process immediately!
+  }
   engine.devicesLoading = false;
   persistState();
 }
@@ -614,10 +640,10 @@ let _elapsedTimer = null;
 
 function startTimers() {
   stopTimers();
-  // Refresh devices every 10s while running
+  // Refresh devices every 30s while running
   _refreshTimer = setInterval(() => {
     if (engine.status === 'RUNNING') fetchAllDevices();
-  }, 10000);
+  }, 30000);
   // Elapsed seconds counter
   _elapsedTimer = setInterval(() => {
     if (engine.status === 'RUNNING' && engine.startedAt) {

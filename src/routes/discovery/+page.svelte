@@ -7,6 +7,7 @@
     discoveredCount as _discoveredCount, failedCount as _failedCount,
     tomorrowCount as _tomorrowCount, processingCount as _processingCount,
     progressPct as _progressPct, skippedCount as _skippedCount,
+    todayDiscoveredCount as _todayDiscoveredCount, todayDiscoveredRecords as _todayDiscoveredRecords,
     getDisplayPhone, getDiscoveredPhone,
     initEngine, startDiscovery, pauseDiscovery, stopDiscovery,
     retryFailed, retryTomorrow, refreshDevices, setMaxWorkers,
@@ -18,17 +19,48 @@
   } from '$lib/discovery-engine.svelte.js';
   import { extractNumber } from '$lib/device-helpers.js';
   import { onMount } from 'svelte';
+  import { goto } from '$app/navigation';
+
+  function goToDashboard(e) {
+    if (e) e.preventDefault();
+    let navigated = false;
+    goto('/').then(() => { navigated = true; }).catch(() => {
+      window.location.href = '/';
+    });
+    // Ultimate safety watchdog: if SPA router doesn't complete within 250ms, hard navigate to /
+    setTimeout(() => {
+      if (!navigated && window.location.pathname !== '/') {
+        window.location.href = '/';
+      }
+    }, 250);
+  }
+
+  function goToAutomation(e) {
+    if (e) e.preventDefault();
+    let navigated = false;
+    goto('/automation').then(() => { navigated = true; }).catch(() => {
+      window.location.href = '/automation';
+    });
+    setTimeout(() => {
+      if (!navigated && window.location.pathname !== '/automation') {
+        window.location.href = '/automation';
+      }
+    }, 250);
+  }
 
   // Local reactive bindings from engine getter functions
   let onlineDevices = $derived(_onlineDevices());
   let withNumber = $derived(_withNumber());
   let withoutNumber = $derived(_withoutNumber());
   let discoveredCount = $derived(_discoveredCount());
+  let todayDiscoveredCount = $derived(_todayDiscoveredCount());
+  let todayDiscoveredRecords = $derived(_todayDiscoveredRecords());
   let failedCount = $derived(_failedCount());
   let tomorrowCount = $derived(_tomorrowCount());
   let processingCount = $derived(_processingCount());
   let progressPct = $derived(_progressPct());
   let skippedCount = $derived(_skippedCount());
+  let recordsDateFilter = $state('all'); // 'all' | 'today'
 
   // ── Import modal & Firebase sync state ───────────────────────────────────
   let showImportModal = $state(false);
@@ -46,6 +78,19 @@
   let recordSearch = $state('');
   let filteredRecords = $derived.by(() => {
     let list = engine.records.filter(r => r.status === 'discovered');
+    if (recordsDateFilter === 'today') {
+      const now = new Date();
+      list = list.filter(r => {
+        const val = r.discoveredAt || r.timestamp || r.date;
+        if (!val) return false;
+        try {
+          const d = new Date(val);
+          return d.getFullYear() === now.getFullYear() &&
+                 d.getMonth() === now.getMonth() &&
+                 d.getDate() === now.getDate();
+        } catch { return false; }
+      });
+    }
     if (!recordSearch.trim()) return list;
     const q = recordSearch.trim().toLowerCase();
     return list.filter(r =>
@@ -333,9 +378,10 @@
   <!-- Header -->
   <header class="disco-header">
     <div class="dh-left">
-      <a href="/" data-sveltekit-reload class="dh-back" title="Back to Dashboard">
-        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M19 12H5M12 5l-7 7 7 7"/></svg>
+      <a href="/" class="dh-nav-btn" onclick={goToDashboard} title="Back to Main Dashboard">
+        ← Dashboard
       </a>
+      <span class="dh-sep">/</span>
       <div class="dh-title">
         <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" opacity="0.8">
           <path d="M2 16.1A5 5 0 0 1 5.9 20M2 12.05A9 9 0 0 1 9.95 20M2 8V6a2 2 0 0 1 2-2h16a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2h-6"/>
@@ -343,6 +389,15 @@
         </svg>
         <span>Device Discovery</span>
       </div>
+      {#if todayDiscoveredCount > 0}
+        <span class="dh-today-pill" title="{todayDiscoveredCount} devices discovered today">
+          +{todayDiscoveredCount} today
+        </span>
+      {/if}
+      <span class="dh-sep">/</span>
+      <a href="/automation" class="dh-nav-btn" onclick={goToAutomation} title="Open Automation Orchestrator">
+        🤖 Automation
+      </a>
       {#if engine.status === 'RUNNING'}
         <span class="dh-running-pill">
           <span class="dh-pulse"></span>
@@ -374,7 +429,11 @@
     </div>
     <div class="dc-card dc-c-green">
       <div class="dc-n">{discoveredCount}</div>
-      <div class="dc-l">Discovered</div>
+      <div class="dc-l">Total Discovered</div>
+    </div>
+    <div class="dc-card dc-c-emerald">
+      <div class="dc-n" style="color: #34d399;">+{todayDiscoveredCount}</div>
+      <div class="dc-l">Today's Discovered</div>
     </div>
     <div class="dc-card dc-c-red">
       <div class="dc-n">{failedCount}</div>
@@ -448,7 +507,7 @@
       <button class="dbtn dbtn-import" onclick={() => { showImportModal = true; importSummary = null; }} title="Import numbers from JSON or ZIP">
         ➕ Import
       </button>
-      <a href="/automation" data-sveltekit-reload class="dbtn dbtn-ghost" title="Open Automation Orchestrator" style="text-decoration:none">
+      <a href="/automation" class="dbtn dbtn-ghost" title="Open Automation Orchestrator" style="text-decoration:none">
         🤖 Automation
       </a>
       {#if engine.records.filter(r => r.status === 'discovered').length > 0}
@@ -660,7 +719,23 @@
         <div class="dr-hdr-left">
           <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></svg>
           <span>Discovery Records</span>
-          <span class="dl-cnt">{filteredRecords.length} / {engine.records.length}</span>
+          <div class="dr-filter-tabs">
+            <button
+              type="button"
+              class="dr-tab-btn {recordsDateFilter === 'all' ? 'active' : ''}"
+              onclick={() => recordsDateFilter = 'all'}
+            >
+              All ({engine.records.filter(r => r.status === 'discovered').length})
+            </button>
+            <button
+              type="button"
+              class="dr-tab-btn {recordsDateFilter === 'today' ? 'active' : ''}"
+              onclick={() => recordsDateFilter = 'today'}
+            >
+              📅 Today ({todayDiscoveredCount})
+            </button>
+          </div>
+          <span class="dl-cnt">{filteredRecords.length} shown</span>
         </div>
 
         <div class="dr-hdr-right">
@@ -990,7 +1065,21 @@
     border-bottom: 1px solid rgba(255,255,255,0.07);
     position: sticky; top: 0; z-index: 100; backdrop-filter: blur(12px);
   }
-  .dh-left { display: flex; align-items: center; gap: 10px; }
+  .dh-left { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+  .dh-nav-btn {
+    display: inline-flex; align-items: center; gap: 5px;
+    font-size: 12px; font-weight: 600; color: #94a3b8;
+    background: rgba(255,255,255,0.05); padding: 5px 10px;
+    border-radius: 8px; text-decoration: none; transition: all 0.18s;
+  }
+  .dh-nav-btn:hover { background: rgba(56,189,248,0.15); color: #38bdf8; }
+  .dh-sep { color: #475569; font-size: 13px; }
+  .dh-today-pill {
+    display: inline-flex; align-items: center;
+    background: rgba(34,197,94,0.15); border: 1px solid rgba(34,197,94,0.35);
+    color: #4ade80; font-size: 11px; font-weight: 700;
+    padding: 2px 8px; border-radius: 12px;
+  }
   .dh-back {
     display: flex; align-items: center; justify-content: center;
     width: 30px; height: 30px; border-radius: 8px;
@@ -1025,9 +1114,22 @@
   .dc-c-blue .dc-n { color: #38bdf8; }  .dc-c-blue { border-color: rgba(56,189,248,0.12); }
   .dc-c-amber .dc-n { color: #fbbf24; }  .dc-c-amber { border-color: rgba(251,191,36,0.12); }
   .dc-c-green .dc-n { color: #22c55e; }  .dc-c-green { border-color: rgba(34,197,94,0.12); }
+  .dc-c-emerald .dc-n { color: #34d399; } .dc-c-emerald { border-color: rgba(52,211,153,0.3); background: rgba(52,211,153,0.06); }
   .dc-c-red .dc-n { color: #ef4444; }  .dc-c-red { border-color: rgba(239,68,68,0.12); }
   .dc-c-orange .dc-n { color: #f97316; }  .dc-c-orange { border-color: rgba(249,115,22,0.12); }
   .dc-c-purple .dc-n { color: #a78bfa; }  .dc-c-purple { border-color: rgba(167,139,250,0.12); }
+
+  .dr-filter-tabs { display: flex; align-items: center; gap: 4px; margin-left: 10px; }
+  .dr-tab-btn {
+    background: rgba(255,255,255,0.05); border: 1px solid rgba(255,255,255,0.08);
+    color: #94a3b8; font-size: 11px; font-weight: 600;
+    padding: 3px 8px; border-radius: 6px; cursor: pointer; transition: all 0.15s;
+  }
+  .dr-tab-btn:hover { background: rgba(56,189,248,0.15); color: #e2e8f0; }
+  .dr-tab-btn.active {
+    background: rgba(56,189,248,0.2); border-color: rgba(56,189,248,0.4);
+    color: #38bdf8; font-weight: 700;
+  }
 
   /* Controls */
   .disco-controls { padding: 0 20px 10px; display: flex; flex-direction: column; gap: 8px; }

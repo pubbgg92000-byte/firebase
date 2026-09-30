@@ -33,9 +33,12 @@ export function buildUrl(conn, path, params = {}) {
  * @param {Record<string, string>} [params]
  * @returns {Promise<{ status: number, data: any }>}
  */
-export async function apiFetch(conn, path, method = 'GET', body, params = {}) {
-  const opts = { method, headers: { 'Content-Type': 'application/json' } };
+export async function apiFetch(conn, path, method = 'GET', body, params = {}, options = {}) {
+  const opts = { method, headers: { 'Content-Type': 'application/json' }, ...options };
   if (body !== undefined) opts.body = JSON.stringify(body);
+  if (!opts.signal && typeof AbortSignal !== 'undefined' && typeof AbortSignal.timeout === 'function') {
+    opts.signal = AbortSignal.timeout(10000);
+  }
   const res = await fetch(buildUrl(conn, path, params), opts);
   const json = await res.json();
   if (!res.ok) throw new Error(json?.error ?? `${res.status}`);

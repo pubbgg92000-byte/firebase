@@ -20,9 +20,7 @@ except ImportError:
     raise
 
 from telethon import TelegramClient
-
-API_ID = 36120949
-API_HASH = "9f430c68e4cb8d3d25a19ed4edee9b9f"
+from config import TELEGRAM_API_ID as API_ID, TELEGRAM_API_HASH as API_HASH
 
 client = TelegramClient("my_telegram_session", API_ID, API_HASH)
 

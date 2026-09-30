@@ -53,6 +53,9 @@
       <p class="card-desc">Status synced from Firebase RTDB (<code>automation/worker</code>) & local process.</p>
     </div>
     <div class="flex items-center gap-2">
+      <a href="/automation?tab=browser_worker" class="btn btn-primary-ghost btn-xs" title="Run worker directly in browser on any device (No Python needed)">
+        🌐 Run in Browser (No Python)
+      </a>
       <button class="btn-link" onclick={onsync} title="Sync worker status">
         Sync ↺
       </button>
@@ -270,8 +273,11 @@
         </button>
       {:else}
         <button class="btn btn-success-ghost btn-xs" onclick={ontoggleworker} disabled={workerToggling} title="Launch local worker process">
-          ▶ Start Process
+          ▶ Start Local Process
         </button>
+        <a href="/automation?tab=browser_worker" class="btn btn-primary-ghost btn-xs" title="Run Telegram automation directly inside browser tab on any device">
+          🌐 Run In Browser Tab
+        </a>
       {/if}
     </div>
 

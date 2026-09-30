@@ -39,7 +39,7 @@
         type="text"
         class="form-input"
         bind:value={autoEngine.config.apiId}
-        placeholder="e.g. 36120949"
+        placeholder="e.g. 12345678"
       />
       <span class="form-help">Obtain from my.telegram.org (App api_id).</span>
     </div>
@@ -51,7 +51,7 @@
         type="text"
         class="form-input"
         bind:value={autoEngine.config.apiHash}
-        placeholder="e.g. 9f430c68e4cb8d3d25a19ed4edee9b9f"
+        placeholder="e.g. 0123456789abcdef0123456789abcdef"
       />
       <span class="form-help">Obtain from my.telegram.org (App api_hash).</span>
     </div>
@@ -142,6 +142,26 @@
         <span>Auto-stop when eligible number pool is exhausted</span>
       </label>
       <span class="form-help">Automatically stops the loop when all online and discovered numbers have been processed.</span>
+    </div>
+
+    <div class="form-group">
+      <label class="checkbox-label">
+        <input
+          type="checkbox"
+          bind:checked={autoEngine.config.forwardOtpToBot}
+          onchange={saveConfig}
+        />
+        <span>Forward OTPs to Telegram Bot</span>
+      </label>
+      <input
+        type="text"
+        class="form-input"
+        style="margin-top: 6px;"
+        placeholder="Target Bot (e.g. @bot_username)"
+        bind:value={autoEngine.config.otpTargetBot}
+        oninput={saveConfig}
+      />
+      <span class="form-help">When enabled, detected OTPs will be forwarded to the specified Telegram bot.</span>
     </div>
 
     <div class="form-group" style="grid-column: 1 / -1;">
@@ -276,11 +296,21 @@
   {:else}
     {#if autoEngine.telegramAuth.status === 'CONNECTING'}
       <div class="tg-auth-step">
-        <div class="tg-step-header">
-          <span class="step-badge">Step 1</span>
-          <span class="step-title">Connecting…</span>
+        <div class="tg-step-header" style="display:flex; justify-content:space-between; align-items:center;">
+          <div>
+            <span class="step-badge">Step 1</span>
+            <span class="step-title">Connecting…</span>
+          </div>
+          <button
+            class="btn btn-secondary btn-sm"
+            onclick={ondisconnecttelegram}
+            disabled={tgSubmitting}
+            title="Cancel connection attempt and reset"
+          >
+            Cancel / Reset
+          </button>
         </div>
-        <p class="form-help">Auth request sent to Firebase. Waiting for the Python worker to initiate Telegram authentication…</p>
+        <p class="form-help">Auth request sent to Firebase. Waiting for the Python worker to verify session or initiate Telegram login…</p>
         <div class="tg-connecting-spinner">⏳</div>
       </div>
     {/if}

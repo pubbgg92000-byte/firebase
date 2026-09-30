@@ -186,6 +186,23 @@ export function removeSuccess(phone) {
   return false;
 }
 
+export function removeBatch(phones) {
+  if (!Array.isArray(phones) || phones.length === 0) return 0;
+  loadRegistry();
+  let count = 0;
+  for (const phone of phones) {
+    const key = normalizeKey(phone);
+    if (key && key in inMemoryStore) {
+      delete inMemoryStore[key];
+      count++;
+    }
+  }
+  if (count > 0) {
+    saveRegistry();
+  }
+  return count;
+}
+
 export function getAllRecords() {
   loadRegistry();
   return { ...inMemoryStore };
@@ -355,6 +372,7 @@ export const registry = {
   markNumber,
   markSuccess,
   remove: removeSuccess,
+  removeBatch,
   getAll: getAllRecords,
   getAllArray,
   getStats,

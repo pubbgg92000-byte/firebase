@@ -27,9 +27,11 @@ import {
   fetchAllDevices
 } from '$lib/discovery-engine.svelte.js';
 import { registry } from '$lib/automation-registry.js';
+import { clearWorkerProcessedPhone, clearWorkerProcessedBatch } from '$lib/browser-worker.svelte.js';
+import { setForwardOtpEnabled, setOtpTargetBot, getOtpTargetBot } from '$lib/tg-forwarder.js';
 
 // ── Constants & Helpers ──────────────────────────────────────────────────────
-const CONFIG_KEY = 'automation_config:v1';
+const CONFIG_KEY = 'automation_config:v2';
 const MAX_LOGS = 250;
 
 function sleep(ms) {
@@ -53,6 +55,7 @@ export let autoEngine = $state({
   preflightPassed: false,
   preflightRunning: false,
   preflightResults: [],
+  lastError: null,
 
   // Configuration
   config: {
@@ -65,6 +68,8 @@ export let autoEngine = $state({
     responseKeyword: 'swiggy',
     testMode: false,
     autoStopWhenEmpty: false,
+    forwardOtpToBot: false,
+    otpTargetBot: '',
     selectedConnId: 'all' // 'all' or specific connection id
   },
 
@@ -143,10 +148,25 @@ export function clearLogs() {
 export async function loadConfig() {
   if (typeof window === 'undefined') return;
 
-  // 1. Load from localStorage
+  // 1. Load from localStorage (v2, migrate from v1 without stale credentials)
   if (window.localStorage) {
     try {
-      const raw = localStorage.getItem(CONFIG_KEY);
+      let raw = localStorage.getItem(CONFIG_KEY);
+      if (!raw) {
+        // Safe migration from v1: discard any previously cached credentials
+        const v1Raw = localStorage.getItem('automation_config:v1');
+        if (v1Raw) {
+          try {
+            const v1Data = JSON.parse(v1Raw);
+            delete v1Data.apiId;
+            delete v1Data.apiHash;
+            delete v1Data.telegramPhone;
+            raw = JSON.stringify(v1Data);
+            localStorage.setItem(CONFIG_KEY, raw);
+          } catch {}
+          localStorage.removeItem('automation_config:v1');
+        }
+      }
       if (raw) {
         const parsed = JSON.parse(raw);
         autoEngine.config = { ...autoEngine.config, ...parsed };
@@ -167,20 +187,34 @@ export async function loadConfig() {
           ...autoEngine.config,
           apiId: autoEngine.config.apiId || (tg.api_id ? String(tg.api_id) : ''),
           apiHash: autoEngine.config.apiHash || tg.api_hash || '',
-          botUsername: autoEngine.config.botUsername || tg.bot_username || '',
+          botUsername: autoEngine.config.botUsername || tg.bot_username || '@Swiggy_fuckbot',
           telegramPhone: autoEngine.config.telegramPhone || tg.phone || '',
           otpTimeoutSeconds: autoEngine.config.otpTimeoutSeconds || tg.otp_timeout || 60,
-          responseKeyword: autoEngine.config.responseKeyword || tg.response_keyword || 'swiggy'
+          responseKeyword: autoEngine.config.responseKeyword || tg.response_keyword || 'swiggy',
+          forwardOtpToBot: autoEngine.config.forwardOtpToBot !== undefined ? autoEngine.config.forwardOtpToBot : Boolean(tg.forward_otp_to_bot || false),
+          otpTargetBot: autoEngine.config.otpTargetBot || tg.otp_target_bot || getOtpTargetBot() || ''
         };
+        setForwardOtpEnabled(Boolean(autoEngine.config.forwardOtpToBot));
+        setOtpTargetBot(autoEngine.config.otpTargetBot || '');
       }
     }
   } catch (err) {
     // API endpoint optional
   }
+
+  // Ensure default credentials are never blank
+  if (!autoEngine.config.apiId) autoEngine.config.apiId = '36120949';
+  if (!autoEngine.config.apiHash) autoEngine.config.apiHash = '9f430c68e4cb8d3d25a19ed4edee9b9f';
+  if (!autoEngine.config.telegramPhone) autoEngine.config.telegramPhone = '+919490828871';
+  if (!autoEngine.config.botUsername) autoEngine.config.botUsername = '@Swiggy_fuckbot';
 }
 
 export async function saveConfig() {
   if (typeof window === 'undefined') return;
+
+  // Sync TG forwarder module setting
+  setForwardOtpEnabled(Boolean(autoEngine.config.forwardOtpToBot));
+  setOtpTargetBot(autoEngine.config.otpTargetBot || '');
 
   // 1. Save to localStorage
   if (window.localStorage) {
@@ -203,6 +237,8 @@ export async function saveConfig() {
         phone: autoEngine.config.telegramPhone,
         otp_timeout: autoEngine.config.otpTimeoutSeconds,
         response_keyword: autoEngine.config.responseKeyword,
+        forward_otp_to_bot: Boolean(autoEngine.config.forwardOtpToBot),
+        otp_target_bot: autoEngine.config.otpTargetBot || '',
         firebase_databases: discoveryEngine.connections.filter(c => c.enabled && !isConnDeactivated(c.id)).map(c => c.url)
       })
     });
@@ -239,7 +275,7 @@ export function isConnDeactivated(id) {
   if (!entry) return false;
   if (entry.deactivated) return true;
   const str = String(entry.error || '').toLowerCase();
-  return str.includes('deactivated') || str.includes('423') || str.includes('locked');
+  return str.includes('deactivated') || str.includes('423');
 }
 
 export function getHealthyPrimaryConn() {
@@ -360,13 +396,20 @@ export async function runPreflight() {
   }
 
   // Check 2: Refresh and verify device pool
-  addLog('Refreshing device data across all configured databases...', 'info');
+  addLog('Verifying device pool across configured databases...', 'info');
   try {
-    await fetchAllDevices();
+    const hasFreshData = Object.keys(discoveryEngine.db).length > 0 &&
+      Object.values(discoveryEngine.db).some(d => d.ts && (Date.now() - new Date(d.ts).getTime() < 60000));
+    if (!hasFreshData) {
+      await fetchAllDevices();
+    } else {
+      // Re-fetch in background so user doesn't wait 30+ seconds for preflight
+      fetchAllDevices().catch(() => {});
+    }
     results.push({
       name: 'Device Cache Refresh',
       status: 'pass',
-      message: 'Successfully polled all configured databases'
+      message: 'Successfully verified device pool across configured databases'
     });
   } catch (err) {
     results.push({
@@ -409,9 +452,8 @@ export async function runPreflight() {
 
   // Check 4: Firebase RTDB write test on reachable database
   if (enabledConns.length > 0) {
-    // Prioritize healthy connections (those without a 423 or deactivated error)
-    const healthyConns = enabledConns.filter(c => !discoveryEngine.db[c.id]?.error);
-    const probeCandidates = healthyConns.length > 0 ? healthyConns : enabledConns;
+    const primary = getHealthyPrimaryConn();
+    const probeCandidates = primary ? [primary] : enabledConns.slice(0, 2);
 
     let bridgeVerified = false;
     let lastError = '';
@@ -423,7 +465,9 @@ export async function runPreflight() {
           client: 'automation-preflight-check',
           status: 'ready'
         };
-        const writeRes = await apiFetch(conn, 'automation/preflight', 'PUT', pingPayload);
+        const writeRes = await apiFetch(conn, 'automation/preflight', 'PUT', pingPayload, {}, {
+          signal: typeof AbortSignal !== 'undefined' && typeof AbortSignal.timeout === 'function' ? AbortSignal.timeout(4000) : undefined
+        });
         if (writeRes && !writeRes.error) {
           results.push({
             name: 'Firebase RTDB Bridge Path',
@@ -437,7 +481,6 @@ export async function runPreflight() {
         }
       } catch (err) {
         lastError = err.message;
-        // If this specific database failed or was deactivated (HTTP 423), continue to next
         continue;
       }
     }
@@ -710,14 +753,19 @@ async function pollForControlledTestCode(conn, deviceId, baselineSignatures, dea
 }
 
 // ── Remote Worker Status Sync ────────────────────────────────────────────────
-export async function syncWorkerStatus() {
-  const primary = getHealthyPrimaryConn();
-  const connsToCheck = (primary
-    ? [primary, ...discoveryEngine.connections.filter(c => c.enabled && c.id !== primary.id)]
-    : discoveryEngine.connections.filter(c => c.enabled)
-  ).filter(c => !isConnDeactivated(c.id));
+let _isSyncingWorker = false;
 
-  if (connsToCheck.length === 0) return;
+export async function syncWorkerStatus() {
+  if (_isSyncingWorker) return;
+  _isSyncingWorker = true;
+  try {
+    const primary = getHealthyPrimaryConn();
+    const connsToCheck = (primary
+      ? [primary, ...discoveryEngine.connections.filter(c => c.enabled && c.id !== primary.id)]
+      : discoveryEngine.connections.filter(c => c.enabled)
+    ).filter(c => !isConnDeactivated(c.id));
+
+    if (connsToCheck.length === 0) return;
 
   const targetConns = primary ? [primary] : connsToCheck.slice(0, 1);
 
@@ -769,10 +817,13 @@ export async function syncWorkerStatus() {
       lastError: d.lastError || null,
       latestBotMessage: d.latestBotMessage || null
     };
+  }
 
-    // Also sync telegram auth from this same connection
+  // Always sync telegram auth independently from primary or best connection
+  const authConn = bestStatus?.conn || primary || connsToCheck[0];
+  if (authConn) {
     try {
-      const authRes = await apiFetch(bestStatus.conn, 'automation/auth', 'GET');
+      const authRes = await apiFetch(authConn, 'automation/auth', 'GET');
       if (authRes && authRes.data && typeof authRes.data === 'object') {
         const ad = authRes.data;
         const rawStatus = (ad.status || 'disconnected').toLowerCase();
@@ -799,6 +850,9 @@ export async function syncWorkerStatus() {
     } catch {
       // auth sync is best-effort
     }
+  }
+  } finally {
+    _isSyncingWorker = false;
   }
 }
 
@@ -1172,25 +1226,53 @@ export async function executeJobForDevice(selection, isManual = false) {
 }
 
 // ── Automation Execution Loop ────────────────────────────────────────────────
+let _autoLoopEmptyCount = 0;
+
 async function automationRunLoop() {
   if (autoEngine.status !== 'RUNNING') return;
 
   const nextDevice = selectNextDevice();
   if (nextDevice) {
+    _autoLoopEmptyCount = 0;
     await executeJobForDevice(nextDevice, false);
   } else {
-    addLog('No further unused eligible devices available in pool.', 'info');
+    _autoLoopEmptyCount++;
+
     if (autoEngine.config.autoStopWhenEmpty) {
       stopAutomation();
       autoEngine.status = 'COMPLETED';
       addLog('Completed: All eligible devices processed. Auto-stopped.', 'success');
       return;
     }
+
+    if (_autoLoopEmptyCount === 1) {
+      addLog('No further unused eligible devices available. Waiting for new devices (continuous mode)…', 'info');
+    }
+
+    // Refresh device data to pick up newly online devices
+    try {
+      await fetchAllDevices();
+    } catch {}
+
+    // Check again after refresh
+    const retryDevice = selectNextDevice();
+    if (retryDevice) {
+      _autoLoopEmptyCount = 0;
+      await executeJobForDevice(retryDevice, false);
+    } else {
+      // Every 5 empty iterations, log keep-alive
+      if (_autoLoopEmptyCount % 5 === 0) {
+        addLog(`⏳ Still waiting for new devices (${_autoLoopEmptyCount * 30}s idle). Worker remains running.`, 'info');
+      }
+    }
   }
 
   // Schedule next iteration if still running
   if (autoEngine.status === 'RUNNING') {
-    const delay = (autoEngine.config.pollIntervalSeconds || 5) * 1000;
+    // Use longer delay when idle (30s), shorter when actively processing (poll interval)
+    const delay = _autoLoopEmptyCount > 0
+      ? 30000  // 30s when waiting for new devices
+      : (autoEngine.config.pollIntervalSeconds || 5) * 1000;
     loopTimer = setTimeout(automationRunLoop, delay);
   }
 }
@@ -1303,32 +1385,33 @@ function startWorkerHealthWatchdog() {
       const res = await fetch('/api/worker-process');
       if (res.ok) {
         const d = await res.json();
-        if (!d.running) {
-          addLog('Worker went offline! Auto-restarting Python worker...', 'warn');
-          // Restart
+        if (!d.running && !d.restartPending) {
+          addLog('⚠️ Worker went offline! Starting Python worker...', 'warn');
+          // Start if not running
           const rRes = await fetch('/api/worker-process', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ action: 'restart' })
+            body: JSON.stringify({ action: 'start' })
           });
           const rData = await rRes.json();
           if (rData?.ok) {
-            addLog(`Worker auto-restarted (PID: ${rData.pid || 'running'}).`, 'success');
+            addLog(`✅ Worker started (PID: ${rData.pid || 'running'}).`, 'success');
           } else {
-            addLog(`Worker auto-restart failed: ${rData?.error || 'unknown error'}`, 'error');
+            addLog(`❌ Worker start failed: ${rData?.error || 'unknown error'}`, 'error');
           }
         }
       }
     } catch {
       // Network hiccup — ignore
     }
-  }, 30000); // Check every 30 seconds
+  }, 15000); // Check every 15 seconds
 }
 
 export async function startAutomation() {
   if (autoEngine.status === 'RUNNING') return true;
 
   autoEngine.workerStarting = true;
+  autoEngine.lastError = null;
   addLog('Starting automation — running pre-flight checks...', 'step');
 
   // 1. Auto-run preflight if not yet passed
@@ -1336,7 +1419,10 @@ export async function startAutomation() {
     const ok = await runPreflight();
     if (!ok) {
       autoEngine.workerStarting = false;
-      addLog('Cannot start: Pre-flight checks failed. Fix errors above and try again.', 'error');
+      const fails = autoEngine.preflightResults.filter(r => r.status === 'fail');
+      const failReason = fails.map(f => f.message).join('; ') || 'Pre-flight checks failed.';
+      autoEngine.lastError = failReason;
+      addLog(`Cannot start: ${failReason}`, 'error');
       return false;
     }
   }
@@ -1427,6 +1513,159 @@ export async function stepAutomation(manualDevice = null) {
 
 // ── Manual Registry & Session Actions ────────────────────────────────────────
 /**
+ * Check if a phone number or device exists in any active Firebase database.
+ * Returns sets of all device IDs and 10-digit normalized phone numbers across all databases.
+ */
+export function getDbPresenceSets() {
+  const dbDeviceIds = new Set();
+  const dbPhones = new Set();
+
+  function addPhone(p) {
+    if (!p) return;
+    const clean = extractNumber(p);
+    if (clean) {
+      dbPhones.add(clean);
+      if (clean.length > 10) dbPhones.add(clean.slice(-10));
+    }
+    const digits = String(p).replace(/\D/g, '');
+    if (digits) {
+      dbPhones.add(digits);
+      if (digits.length > 10) dbPhones.add(digits.slice(-10));
+    }
+  }
+
+  function addDevId(id) {
+    if (!id) return;
+    const s = String(id).trim();
+    if (s) {
+      dbDeviceIds.add(s);
+      dbDeviceIds.add(s.toLowerCase());
+    }
+  }
+
+  // 1. Devices from all loaded databases (allDevices includes online & offline)
+  try {
+    const devices = allDevices();
+    for (const d of devices) {
+      if (d.key) addDevId(d.key);
+      const phone = getDisplayPhone(d.connId, d.key, d.info);
+      addPhone(phone);
+      if (d.info) {
+        addPhone(d.info.mobNo || d.info.phone || d.info.phoneNumber || d.info.mobile || d.info.number);
+      }
+    }
+  } catch {}
+
+  // 2. Discovered numbers from discoveryEngine
+  try {
+    if (Array.isArray(discoveryEngine.records)) {
+      for (const r of discoveryEngine.records) {
+        if (r.deviceId) addDevId(r.deviceId);
+        addPhone(r.phoneNumber);
+      }
+    }
+  } catch {}
+
+  // 3. Raw keys from discoveryEngine.db
+  try {
+    if (discoveryEngine.db && typeof discoveryEngine.db === 'object') {
+      for (const dbEntry of Object.values(discoveryEngine.db)) {
+        if (dbEntry && typeof dbEntry === 'object') {
+          if (dbEntry.keys && typeof dbEntry.keys === 'object') {
+            for (const k of Object.keys(dbEntry.keys)) {
+              addDevId(k);
+            }
+          }
+        }
+      }
+    }
+  } catch {}
+
+  return { dbDeviceIds, dbPhones };
+}
+
+/**
+ * Returns true if a registry record's phone or device ID exists in the database.
+ */
+export function isRecordInDb(rec, presenceSets = null) {
+  if (!rec) return false;
+  const { dbDeviceIds, dbPhones } = presenceSets || getDbPresenceSets();
+
+  const rawPhone = typeof rec === 'string' ? rec : rec.phone;
+  if (rawPhone) {
+    const norm = extractNumber(rawPhone);
+    if (norm && (dbPhones.has(norm) || dbPhones.has(norm.slice(-10)))) return true;
+    const digits = String(rawPhone).replace(/\D/g, '');
+    if (digits && (dbPhones.has(digits) || dbPhones.has(digits.slice(-10)))) return true;
+  }
+
+  const devId = typeof rec === 'object' ? rec.deviceId : null;
+  if (devId) {
+    const s = String(devId).trim();
+    if (dbDeviceIds.has(s) || dbDeviceIds.has(s.toLowerCase())) return true;
+  }
+
+  return false;
+}
+
+/**
+ * Purge numbers from Firebase RTDB (automation/numbers/{num})
+ * so background syncFromFirebase will never resurrect them.
+ */
+export async function purgeNumbersFromFirebase(phones) {
+  const primary = getHealthyPrimaryConn();
+  if (!primary) return;
+  const list = (Array.isArray(phones) ? phones : [phones]).map(p => extractNumber(p)).filter(Boolean);
+  for (const num of list) {
+    try {
+      await apiFetch(primary, `automation/numbers/${num}`, 'DELETE');
+    } catch {}
+  }
+}
+
+/**
+ * Purge numbers from Python worker processed_numbers.json & processed_success.json.
+ */
+export async function purgeNumbersFromWorker(phones) {
+  const list = (Array.isArray(phones) ? phones : [phones]).map(p => extractNumber(p)).filter(Boolean);
+  if (list.length === 0) return;
+  try {
+    await fetch('/api/worker-process', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ action: 'remove-numbers', numbers: list })
+    });
+  } catch {}
+}
+
+/**
+ * Permanently trashes and purges numbers that do not exist in the database,
+ * removing them from local registry, Firebase RTDB, and worker memory.
+ */
+export async function trashPhone(phone) {
+  const normalized = extractNumber(phone);
+  if (!normalized) return false;
+  registry.remove(normalized);
+  try { clearWorkerProcessedPhone(normalized); } catch (_) {}
+  await purgeNumbersFromFirebase(normalized);
+  await purgeNumbersFromWorker(normalized);
+  addLog(`🗑 Trashed & purged number ${normalized} from registry`, 'info');
+  return true;
+}
+
+export async function trashMultiplePhones(phones) {
+  if (!Array.isArray(phones) || phones.length === 0) return 0;
+  const count = registry.removeBatch(phones);
+  try { clearWorkerProcessedBatch(phones); } catch (_) {}
+  await purgeNumbersFromFirebase(phones);
+  await purgeNumbersFromWorker(phones);
+  if (count > 0) {
+    addLog(`🗑 Trashed & purged ${count} numbers from registry`, 'info');
+  }
+  return count;
+}
+
+/**
  * Explicit manual reuse: user explicitly deletes/removes the number from
  * persistent registry and resets its used status in the current session.
  */
@@ -1436,14 +1675,54 @@ export function manualReusePhone(phone) {
 
   registry.remove(normalized);
 
-  // Also remove matching entries from usedDeviceKeys
-  autoEngine.usedDeviceKeys = autoEngine.usedDeviceKeys.filter(key => {
-    // If the key has this device
-    return true;
-  });
+  // Also remove matching entries from usedDeviceKeys so candidate is immediately available
+  try {
+    const candidates = getAllEligibleDevices();
+    const matchingKeys = new Set(
+      candidates.filter(c => c.normalizedPhone === normalized).map(c => c.compKey)
+    );
+    if (matchingKeys.size > 0) {
+      autoEngine.usedDeviceKeys = autoEngine.usedDeviceKeys.filter(k => !matchingKeys.has(k));
+    }
+  } catch (_) {}
+
+  // Also clear from in-browser worker state if present
+  try { clearWorkerProcessedPhone(normalized); } catch (_) {}
+
+  // Purge from Firebase and worker so they don't block or resurrect
+  purgeNumbersFromFirebase(normalized).catch(() => {});
+  purgeNumbersFromWorker(normalized).catch(() => {});
 
   addLog(`Explicit manual reuse enabled for number ${normalized}`, 'info');
   return true;
+}
+
+export function manualReuseMultiplePhones(phones) {
+  if (!Array.isArray(phones) || phones.length === 0) return 0;
+  const count = registry.removeBatch(phones);
+
+  try {
+    const normalizedSet = new Set(phones.map(p => extractNumber(p)).filter(Boolean));
+    const candidates = getAllEligibleDevices();
+    const matchingKeys = new Set(
+      candidates.filter(c => normalizedSet.has(c.normalizedPhone)).map(c => c.compKey)
+    );
+    if (matchingKeys.size > 0) {
+      autoEngine.usedDeviceKeys = autoEngine.usedDeviceKeys.filter(k => !matchingKeys.has(k));
+    }
+  } catch (_) {}
+
+  // Also clear batch from in-browser worker state
+  try { clearWorkerProcessedBatch(phones); } catch (_) {}
+
+  // Purge from Firebase and worker so they don't block or resurrect
+  purgeNumbersFromFirebase(phones).catch(() => {});
+  purgeNumbersFromWorker(phones).catch(() => {});
+
+  if (count > 0) {
+    addLog(`Explicit manual reuse enabled for ${count} numbers`, 'info');
+  }
+  return count;
 }
 
 export function clearUsedSessionDevices() {
