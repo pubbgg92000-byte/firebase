@@ -398,6 +398,10 @@
       <a href="/automation" class="dh-nav-btn" onclick={goToAutomation} title="Open Automation Orchestrator">
         🤖 Automation
       </a>
+      <span class="dh-sep">/</span>
+      <a href="/json-extractor" class="dh-nav-btn" title="Open JSON & RTDB Extractor">
+        🔍 Extractor
+      </a>
       {#if engine.status === 'RUNNING'}
         <span class="dh-running-pill">
           <span class="dh-pulse"></span>

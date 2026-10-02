@@ -25,6 +25,7 @@ import {
 } from '$lib/discovery-engine.svelte.js';
 import { extractNumber } from '$lib/device-helpers.js';
 import { registry } from '$lib/automation-registry.js';
+import { automationState } from '$lib/automation-engine.svelte.js';
 
 // ── Constants ────────────────────────────────────────────────────────────────
 const MAX_LOG = 200;
@@ -847,6 +848,10 @@ export function initWorker() {
 
 export async function startWorker() {
   if (worker.status === 'RUNNING') return;
+  if (!automationState.enabled) {
+    addLog('❌ Automation is currently DISABLED. Enable it in Settings first.', 'error');
+    return;
+  }
   if (!worker.telegramConnected) {
     addLog('❌ Connect to Telegram first', 'error');
     return;
@@ -871,6 +876,10 @@ export async function startWorker() {
   // ── Continuous main loop — NEVER exits unless user stops ──
   let consecutiveEmptyPolls = 0;
   while (_running) {
+    if (!automationState.enabled) {
+      stopWorker();
+      break;
+    }
     const device = selectNextDevice();
     
     if (!device) {

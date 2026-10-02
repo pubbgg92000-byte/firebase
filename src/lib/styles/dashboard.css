@@ -779,6 +779,89 @@
     border-color: rgba(168, 85, 247, 0.45);
     color: #e9d5ff;
   }
+  .chip-extractor {
+    background: rgba(6, 182, 212, 0.08);
+    border: 1px solid rgba(6, 182, 212, 0.25);
+    color: #22d3ee;
+  }
+  .chip-extractor:hover {
+    background: rgba(6, 182, 212, 0.16);
+    border-color: rgba(6, 182, 212, 0.45);
+    color: #67e8f9;
+  }
+  .chip-automation-off {
+    opacity: 0.45;
+    filter: grayscale(0.6);
+  }
+  .chip-off-dot {
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: #f87171;
+    box-shadow: 0 0 5px rgba(239,68,68,0.7);
+    flex-shrink: 0;
+  }
+
+  /* ── Dashboard Automation Toggle ──────────────────────────────────── */
+  .dash-auto-toggle {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    padding: 0;
+    width: 32px;
+    height: 18px;
+    border-radius: 9px;
+    border: 1.5px solid;
+    cursor: pointer;
+    background: transparent;
+    flex-shrink: 0;
+    transition: all 0.2s cubic-bezier(0.16, 1, 0.3, 1);
+  }
+  .dash-auto-toggle.dat-on {
+    border-color: rgba(34, 197, 94, 0.55);
+    background: rgba(34, 197, 94, 0.12);
+    box-shadow: 0 0 8px rgba(34, 197, 94, 0.2);
+  }
+  .dash-auto-toggle.dat-on:hover {
+    border-color: rgba(34, 197, 94, 0.8);
+    background: rgba(34, 197, 94, 0.22);
+    box-shadow: 0 0 12px rgba(34, 197, 94, 0.3);
+  }
+  .dash-auto-toggle.dat-off {
+    border-color: rgba(239, 68, 68, 0.5);
+    background: rgba(239, 68, 68, 0.1);
+    box-shadow: 0 0 6px rgba(239, 68, 68, 0.15);
+  }
+  .dash-auto-toggle.dat-off:hover {
+    border-color: rgba(239, 68, 68, 0.75);
+    background: rgba(239, 68, 68, 0.2);
+  }
+  .dat-track {
+    position: relative;
+    width: 22px;
+    height: 12px;
+    border-radius: 6px;
+    pointer-events: none;
+  }
+  .dat-thumb {
+    position: absolute;
+    top: 2px;
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    transition: left 0.2s cubic-bezier(0.16, 1, 0.3, 1), background 0.2s, box-shadow 0.2s;
+  }
+  .dat-on .dat-thumb {
+    left: 12px;
+    background: #4ade80;
+    box-shadow: 0 0 6px rgba(34, 197, 94, 0.9);
+  }
+  .dat-off .dat-thumb {
+    left: 2px;
+    background: #f87171;
+    box-shadow: 0 0 5px rgba(239, 68, 68, 0.7);
+  }
+
   .chip-icon {
     font-size: 13px;
     line-height: 1;

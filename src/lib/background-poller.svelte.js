@@ -4,10 +4,12 @@
  * Responsibilities:
  * 1. Maintains reactive `pollerState.db` so dashboard renders instantly without blank-page delays.
  * 2. Continuously polls all enabled Firebase connections in the background (every 30s) across all routes.
- * 3. Uses bounded concurrency (5 connections at a time) and yields to the browser event loop
+ * 3. Uses bounded concurrency (16 connections at a time) and yields to the browser event loop
  *    between batches (`setTimeout(0)`) so user navigation clicks are never frozen or delayed.
- * 4. Catches incoming SMS / OTPs in real-time, adds to persistent notifications, and notifies subscribers.
+ * 4. Catches incoming SMS / OTPs in real-time via a SEPARATE 10s notification-only poll loop.
  * 5. Respects OTP forwarding toggle and target bot settings.
+ * 6. Zero-duplicate guarantee: all seen message keys are persisted to localStorage and checked
+ *    before any notification is fired, even across page refreshes.
  */
 
 import { apiFetch } from '$lib/firebase.js';
@@ -15,6 +17,7 @@ import { extractOTP, isVerificationMsg, extractAbout } from '$lib/utils/sms.js';
 import { isForwardOtpEnabled, tgForwardOTP } from '$lib/tg-forwarder.js';
 
 const FULL_REFRESH_INTERVAL_SECS = 30;
+const NOTIF_POLL_INTERVAL_MS = 10000;  // Separate 10s notification-only poll
 const BATCH_SIZE = 16;
 const NOTIF_DURATION_MS = 90000;
 const isBrowser = typeof window !== 'undefined';
@@ -30,7 +33,9 @@ export const pollerState = $state({
 
 let _pollInterval = null;
 let _countdownTicker = null;
+let _notifPollInterval = null;  // Dedicated 10s notification-only interval
 let _isPolling = false;
+let _isNotifPolling = false;    // Guard for notification-only poll
 let _abortController = null;
 function initSeenMessageKeys() {
   const set = new Set();
@@ -90,6 +95,10 @@ function saveActiveNotification(notif) {
     const now = Date.now();
     // Keep notifications within duration
     const valid = list.filter((n) => n && (now - (Number(n.createdAt) || 0)) < NOTIF_DURATION_MS);
+    // Dedup: do not insert if same msgId already stored (race between poll cycles)
+    if (notif.msgId && valid.some((n) => n.connId === notif.connId && n.devKey === notif.devKey && n.msgId === notif.msgId)) {
+      return;
+    }
     valid.unshift(notif);
     localStorage.setItem('pd_active_notifs', JSON.stringify(valid.slice(0, 100)));
   } catch {}
@@ -112,7 +121,21 @@ async function inspectDeviceForOtp(conn, devKey, signal) {
     for (const [msgId, msg] of entries) {
       if (!msg || typeof msg !== 'object') continue;
       const seenKey = `${conn.id}::${devKey}::${msgId ?? ''}`;
+      // Double-check: in-memory set AND localStorage (survives across page navigations)
       if (_seenMessageKeys.has(seenKey)) continue;
+      // Re-read localStorage seen set to catch any keys added by page-level addNotif
+      if (isBrowser) {
+        try {
+          const raw = localStorage.getItem('pd_notif_seen');
+          if (raw) {
+            const arr = JSON.parse(raw);
+            if (Array.isArray(arr) && arr.includes(seenKey)) {
+              _seenMessageKeys.add(seenKey); // sync into memory
+              continue;
+            }
+          }
+        } catch {}
+      }
       markMessageKeySeen(seenKey);
 
       const text = msg.message ?? msg.body ?? msg.text ?? '';
@@ -121,9 +144,10 @@ async function inspectDeviceForOtp(conn, devKey, signal) {
 
       const sender = msg.sender ?? msg.from ?? '?';
       const msgTs = msg.dateTime || msg.timestamp || msg.date || msg.time || new Date().toISOString();
+      const now = Date.now();
       const notifObj = {
-        id: Date.now() + Math.random(),
-        createdAt: Date.now(),
+        id: now + Math.random(),
+        createdAt: now,
         ts: msgTs,
         connId: conn.id,
         conn: { id: conn.id, name: conn.name, color: conn.color },
@@ -149,6 +173,43 @@ async function inspectDeviceForOtp(conn, devKey, signal) {
       }
     }
   } catch {}
+}
+
+/** Dedicated notification-only poll: checks all active connections for new OTPs every 10s.
+ *  Runs independently of the 30s full data refresh so UI data and notifications are decoupled. */
+async function pollNotificationsOnly() {
+  if (!isBrowser || _isNotifPolling) return;
+  const connections = getStoredConnections();
+  const enabled = connections.filter((c) => c.enabled && !pollerState.db[c.id]?.deactivated);
+  if (!enabled.length) return;
+
+  _isNotifPolling = true;
+  try {
+    for (const conn of enabled) {
+      if (!conn.infoPath) continue;
+      try {
+        const { data: infoData } = await apiFetch(conn, conn.infoPath);
+        if (!infoData || typeof infoData !== 'object') continue;
+        const nowMs = Date.now();
+        const prevInfo = pollerState.db[conn.id]?.info ?? {};
+        for (const [devKey, devInfo] of Object.entries(infoData)) {
+          if (!devInfo || typeof devInfo !== 'object') continue;
+          const rawNewTs = devInfo.lastMessageTime ?? devInfo.lastSeen ?? 0;
+          const rawPrevTs = prevInfo[devKey]?.lastMessageTime ?? prevInfo[devKey]?.lastSeen ?? 0;
+          const newTs = Number(rawNewTs) < 1e11 ? Number(rawNewTs) * 1000 : Number(rawNewTs);
+          const prevTs = Number(rawPrevTs) < 1e11 ? Number(rawPrevTs) * 1000 : Number(rawPrevTs);
+          const isRecent = newTs && (nowMs - newTs) < NOTIF_DURATION_MS;
+          if (newTs && ((prevTs && newTs > prevTs) || (!prevTs && isRecent))) {
+            inspectDeviceForOtp(conn, devKey).catch(() => {});
+          }
+        }
+      } catch {}
+      // Yield between connections so we don't block UI
+      await new Promise((r) => setTimeout(r, 0));
+    }
+  } finally {
+    _isNotifPolling = false;
+  }
 }
 
 /** Fetch a single connection's shallow keys and info */
@@ -306,7 +367,7 @@ export function initBackgroundPoller() {
     pollAllConnections(true);
   }, 100);
 
-  // 2. Countdown ticker (1s)
+  // 2. Countdown ticker (1s) — drives the 30s full data refresh
   _countdownTicker = setInterval(() => {
     if (pollerState.nextRefreshSecs > 0) {
       pollerState.nextRefreshSecs -= 1;
@@ -316,12 +377,23 @@ export function initBackgroundPoller() {
     }
   }, 1000);
 
-  // 3. Tab visibility listener: when user returns to tab, refresh quietly
+  // 3. SEPARATE 10s notification-only poll — decoupled from main data refresh.
+  //    Checks for new OTPs/SMS without touching pollerState.db or isRefreshing.
+  setTimeout(() => {
+    pollNotificationsOnly(); // first check after 10s
+  }, 10000);
+  _notifPollInterval = setInterval(() => {
+    pollNotificationsOnly();
+  }, NOTIF_POLL_INTERVAL_MS);
+
+  // 4. Tab visibility listener: when user returns to tab, refresh quietly
   const onVisibility = () => {
     if (document.visibilityState === 'visible') {
       if (pollerState.nextRefreshSecs <= 5 || !pollerState.lastRefresh) {
         pollAllConnections(true);
       }
+      // Also kick off a quick notification check immediately on tab focus
+      pollNotificationsOnly();
     }
   };
   document.addEventListener('visibilitychange', onVisibility);

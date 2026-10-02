@@ -128,6 +128,79 @@ let workerSyncTimer = null;
 let workerHealthTimer = null;
 let isJobInProgress = false;
 
+// ── Master Kill Switch ────────────────────────────────────────────────────────
+// Persisted in localStorage. When false, ALL automation logic is completely off.
+// Uses an exported $state object so Svelte 5 tracks property reactivity across modules
+// without invalid export reassignment errors.
+const ENABLED_KEY = 'pd_automation_enabled';
+
+function _loadEnabledState() {
+  if (typeof window === 'undefined') return true;
+  try {
+    const raw = localStorage.getItem(ENABLED_KEY);
+    return raw === null ? true : raw !== 'false'; // default ON
+  } catch {
+    return true;
+  }
+}
+
+export const automationState = $state({
+  enabled: _loadEnabledState()
+});
+
+export function isAutomationEnabled() {
+  return automationState.enabled;
+}
+
+// Backward compatibility helper
+export function automationEnabled() {
+  return automationState.enabled;
+}
+
+export function toggleAutomationEnabled() {
+  automationState.enabled = !automationState.enabled;
+  if (typeof window !== 'undefined') {
+    try {
+      localStorage.setItem(ENABLED_KEY, String(automationState.enabled));
+    } catch {}
+  }
+  if (!automationState.enabled) {
+    // Hard-stop everything immediately
+    if (loopTimer) { clearTimeout(loopTimer); loopTimer = null; }
+    if (elapsedTimer) { clearInterval(elapsedTimer); elapsedTimer = null; }
+    if (workerSyncTimer) { clearInterval(workerSyncTimer); workerSyncTimer = null; }
+    if (workerHealthTimer) { clearInterval(workerHealthTimer); workerHealthTimer = null; }
+    if (autoEngine.status === 'RUNNING' || autoEngine.status === 'PAUSED') {
+      autoEngine.status = 'IDLE';
+      autoEngine.jobState = 'IDLE';
+      autoEngine.currentJob = null;
+      isJobInProgress = false;
+    }
+    // Hard stop Python worker process
+    if (typeof window !== 'undefined') {
+      fetch('/api/worker-process', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action: 'stop' })
+      }).catch(() => {});
+    }
+    addLog('🔴 Automation DISABLED — all TG automation logic is OFF. Toggle the switch to re-enable.', 'warn');
+  } else {
+    addLog('🟢 Automation ENABLED — TG automation logic is back on. Click Start to run.', 'success');
+  }
+}
+
+if (typeof window !== 'undefined') {
+  try {
+    window.addEventListener('storage', (e) => {
+      if (e.key === ENABLED_KEY && e.newValue !== null) {
+        automationState.enabled = e.newValue !== 'false';
+      }
+    });
+  } catch {}
+}
+
+
 // ── Logging ──────────────────────────────────────────────────────────────────
 export function addLog(message, type = 'info', meta = null) {
   const entry = {
@@ -756,6 +829,7 @@ async function pollForControlledTestCode(conn, deviceId, baselineSignatures, dea
 let _isSyncingWorker = false;
 
 export async function syncWorkerStatus() {
+  if (!automationState.enabled) return;
   if (_isSyncingWorker) return;
   _isSyncingWorker = true;
   try {
@@ -1179,25 +1253,27 @@ export async function executeJobForDevice(selection, isManual = false) {
       }
     }
 
-    // Worker warning if unclaimed after 12s
+    // Worker warning if unclaimed after 15s
     const elapsed = Date.now() - startTime;
-    if (!claimedByWorker && elapsed > 12000 && elapsed < 15000) {
-      addLog(`[${jobId}] Notice: Job still queued. Ensure Python worker is running: 'python worker.py'`, 'warn');
+    if (!claimedByWorker && elapsed > 15000 && elapsed < 18000) {
+      addLog(`[${jobId}] Notice: Job still queued after 15s. Ensure Python worker is running: 'python worker.py'`, 'warn');
     }
 
-    // Unclaimed worker timeout after 30s
-    if (!claimedByWorker && elapsed > 30000) {
+    // Unclaimed worker timeout after 60s (increased from 30s to give slower workers more time)
+    if (!claimedByWorker && elapsed > 60000) {
       autoEngine.jobState = 'TIMEOUT';
       job.status = 'timeout';
       autoEngine.stats.timeout += 1;
       autoEngine.stats.totalProcessed += 1;
-      addLog(`[${jobId}] Worker offline timeout: No Python worker claimed this job after 30s. Start worker via 'python worker.py'.`, 'error');
+      addLog(`[${jobId}] Worker offline timeout: No Python worker claimed this job after 60s. Start worker via 'python worker.py'.`, 'error');
       try {
         await apiFetch(conn, `automation/jobs/${jobId}`, 'PATCH', {
           status: 'timeout',
           error: 'Worker not running / job unclaimed'
         });
       } catch {}
+      // Note: do NOT add to registry — unclaimed job means worker offline, not a failed number
+      // The device will be available again on next attempt
       jobResolved = true;
       break;
     }
@@ -1206,13 +1282,16 @@ export async function executeJobForDevice(selection, isManual = false) {
     if (autoEngine.status !== 'RUNNING' && !isManual) {
       autoEngine.jobState = 'STOPPED';
       job.status = 'stopped';
-      addLog(`[${jobId}] Job aborted because automation was stopped.`, 'warn');
+      addLog(`[${jobId}] Job aborted because automation was stopped. Device remains available for next run.`, 'warn');
       try {
         await apiFetch(conn, `automation/jobs/${jobId}`, 'PATCH', {
           status: 'stopped',
           error: 'Stopped by user'
         });
       } catch {}
+      // IMPORTANT: Do NOT add to usedDeviceKeys or registry — stopped jobs are retryable.
+      // Remove the device from usedDeviceKeys so it's immediately available on next start.
+      autoEngine.usedDeviceKeys = autoEngine.usedDeviceKeys.filter(k => k !== compKey);
       jobResolved = true;
       break;
     }
@@ -1227,17 +1306,22 @@ export async function executeJobForDevice(selection, isManual = false) {
 
 // ── Automation Execution Loop ────────────────────────────────────────────────
 let _autoLoopEmptyCount = 0;
+let _lastEmptyRefreshAt = 0;
 
 async function automationRunLoop() {
+  // Master kill switch — do nothing if automation is disabled
+  if (!automationState.enabled) return;
   if (autoEngine.status !== 'RUNNING') return;
 
   const nextDevice = selectNextDevice();
   if (nextDevice) {
     _autoLoopEmptyCount = 0;
+    _lastEmptyRefreshAt = 0;
     await executeJobForDevice(nextDevice, false);
   } else {
     _autoLoopEmptyCount++;
 
+    // Auto-stop mode: only stop when explicitly configured AND pool is empty
     if (autoEngine.config.autoStopWhenEmpty) {
       stopAutomation();
       autoEngine.status = 'COMPLETED';
@@ -1245,37 +1329,51 @@ async function automationRunLoop() {
       return;
     }
 
+    // Continuous mode: refresh and wait for new devices
     if (_autoLoopEmptyCount === 1) {
-      addLog('No further unused eligible devices available. Waiting for new devices (continuous mode)…', 'info');
+      addLog('Pool empty — refreshing Firebase devices and waiting for new numbers to come online…', 'info');
     }
 
-    // Refresh device data to pick up newly online devices
-    try {
-      await fetchAllDevices();
-    } catch {}
+    // Refresh device data every ~30s while idle (not every single loop iteration)
+    const now = Date.now();
+    if (now - _lastEmptyRefreshAt > 30000) {
+      _lastEmptyRefreshAt = now;
+      try {
+        await fetchAllDevices();
+      } catch {}
 
-    // Check again after refresh
-    const retryDevice = selectNextDevice();
-    if (retryDevice) {
-      _autoLoopEmptyCount = 0;
-      await executeJobForDevice(retryDevice, false);
-    } else {
-      // Every 5 empty iterations, log keep-alive
-      if (_autoLoopEmptyCount % 5 === 0) {
-        addLog(`⏳ Still waiting for new devices (${_autoLoopEmptyCount * 30}s idle). Worker remains running.`, 'info');
+      // After refresh, try again immediately
+      const retryDevice = selectNextDevice();
+      if (retryDevice) {
+        _autoLoopEmptyCount = 0;
+        _lastEmptyRefreshAt = 0;
+        await executeJobForDevice(retryDevice, false);
+        // Schedule next iteration and return
+        if (autoEngine.status === 'RUNNING') {
+          loopTimer = setTimeout(automationRunLoop, (autoEngine.config.pollIntervalSeconds || 5) * 1000);
+        }
+        return;
       }
+    }
+
+    // Keep-alive logs every ~2 minutes of idle (every 8 iterations at 15s each)
+    if (_autoLoopEmptyCount % 8 === 0) {
+      const idleMins = Math.floor((_autoLoopEmptyCount * 15) / 60);
+      addLog(`⏳ Continuous mode — waiting for new devices (idle ${idleMins}m). Worker is running.`, 'info');
+      // Also sync worker status to keep UI panel fresh
+      syncWorkerStatus().catch(() => {});
     }
   }
 
-  // Schedule next iteration if still running
+  // Schedule next iteration — 15s when idle, poll interval when active
   if (autoEngine.status === 'RUNNING') {
-    // Use longer delay when idle (30s), shorter when actively processing (poll interval)
     const delay = _autoLoopEmptyCount > 0
-      ? 30000  // 30s when waiting for new devices
+      ? 15000  // 15s when waiting for new devices (fast enough to detect new DBs)
       : (autoEngine.config.pollIntervalSeconds || 5) * 1000;
     loopTimer = setTimeout(automationRunLoop, delay);
   }
 }
+
 
 // ── Public Controls ──────────────────────────────────────────────────────────
 
@@ -1376,7 +1474,7 @@ async function ensureWorkerAlive(maxWaitSec = 18) {
 function startWorkerHealthWatchdog() {
   if (workerHealthTimer) clearInterval(workerHealthTimer);
   workerHealthTimer = setInterval(async () => {
-    if (autoEngine.status !== 'RUNNING') {
+    if (autoEngine.status !== 'RUNNING' || !automationState.enabled) {
       clearInterval(workerHealthTimer);
       workerHealthTimer = null;
       return;
@@ -1408,6 +1506,10 @@ function startWorkerHealthWatchdog() {
 }
 
 export async function startAutomation() {
+  if (!automationState.enabled) {
+    addLog('Cannot start: TG Automation is disabled. Toggle the switch at the top to enable it.', 'error');
+    return false;
+  }
   if (autoEngine.status === 'RUNNING') return true;
 
   autoEngine.workerStarting = true;
@@ -1434,7 +1536,15 @@ export async function startAutomation() {
   autoEngine.workerStarting = false;
   autoEngine.status = 'RUNNING';
   autoEngine.startedAt = Date.now();
-  addLog('✅ Automation started. Dispatching jobs to worker...', 'step');
+
+  // Reset loop state so it starts fresh even after a stop/restart
+  _autoLoopEmptyCount = 0;
+  _lastEmptyRefreshAt = 0;
+
+  addLog('✅ Automation started in CONTINUOUS mode. Runs until manually stopped. Dispatching jobs...', 'step');
+
+  // Pre-fetch latest devices so the first dispatch cycle has fresh data
+  fetchAllDevices().catch(() => {});
 
   // Start elapsed timer
   if (elapsedTimer) clearInterval(elapsedTimer);
@@ -1497,6 +1607,10 @@ export async function stopAutomation() {
  * Allowed even if full loop is idle.
  */
 export async function stepAutomation(manualDevice = null) {
+  if (!automationState.enabled) {
+    addLog('Cannot step: TG Automation is disabled. Enable it first.', 'warn');
+    return false;
+  }
   let target = manualDevice;
   if (!target) {
     target = selectNextDevice();

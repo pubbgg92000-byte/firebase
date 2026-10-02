@@ -33,7 +33,9 @@
     forceBotStart,
     forceBotCancel,
     skipCurrentJob,
-    sendBotCommand
+    sendBotCommand,
+    automationState,
+    toggleAutomationEnabled
   } from '$lib/automation-engine.svelte.js';
   import {
     engine as discoveryEngine,
@@ -52,28 +54,12 @@
 
   function goToDashboard(e) {
     if (e) e.preventDefault();
-    let navigated = false;
-    goto('/').then(() => { navigated = true; }).catch(() => {
-      window.location.href = '/';
-    });
-    setTimeout(() => {
-      if (!navigated && window.location.pathname !== '/') {
-        window.location.href = '/';
-      }
-    }, 250);
+    goto('/').catch(() => { window.location.href = '/'; });
   }
 
   function goToDiscovery(e) {
     if (e) e.preventDefault();
-    let navigated = false;
-    goto('/discovery').then(() => { navigated = true; }).catch(() => {
-      window.location.href = '/discovery';
-    });
-    setTimeout(() => {
-      if (!navigated && window.location.pathname !== '/discovery') {
-        window.location.href = '/discovery';
-      }
-    }, 250);
+    goto('/discovery').catch(() => { window.location.href = '/discovery'; });
   }
   import OrchestrationControls from '$lib/components/automation/OrchestrationControls.svelte';
   import WorkerBridgeCard from '$lib/components/automation/WorkerBridgeCard.svelte';
@@ -772,6 +758,7 @@
 
   let _checkingWorker = false;
   async function checkWorkerStatus() {
+    if (!automationState.enabled) return;
     if (_checkingWorker) return;
     _checkingWorker = true;
     try {
@@ -888,28 +875,7 @@
   }
 
   onMount(async () => {
-    // Ensure worker config is updated with all active panels from localStorage
-    try {
-      const saved = JSON.parse(localStorage.getItem('pd_connections') || '[]');
-      const activeUrls = (Array.isArray(saved) ? saved : [])
-        .filter(c => c && c.enabled !== false && c.url && !c.deactivated && !c.url.includes('newpanel-4412c'))
-        .map(c => c.url.replace(/\/+$/, ''));
-      if (activeUrls.length > 0) {
-        fetch('/api/worker-config', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ firebase_databases: activeUrls })
-        }).catch(() => {});
-      }
-    } catch {}
-
-    await loadConfig();
-    refreshRegistryView();
-    syncWorkerStatus();
-    checkWorkerStatus();
-    handleSyncRegistry(true);
-    syncDashboardNotifs();
-
+    // Read URL tab param immediately (sync, no cost)
     if (typeof window !== 'undefined') {
       window.addEventListener('storage', handleStorageEvent);
       const urlParams = new URLSearchParams(window.location.search);
@@ -919,17 +885,56 @@
       }
     }
 
+    // Render the page first, then load config and kick off background work
+    await Promise.resolve(); // yield to browser paint
+    await loadConfig();
+    refreshRegistryView();
+    syncDashboardNotifs();
+
+    // Defer network calls so they don't block the page appearing
+    if (automationState.enabled) {
+      setTimeout(() => {
+        syncWorkerStatus();
+        checkWorkerStatus();
+      }, 100);
+
+      // Defer Firebase registry sync further — it's a heavy multi-connection fetch
+      setTimeout(() => {
+        handleSyncRegistry(true);
+      }, 600);
+    }
+
+    // Defer writing to worker-config to avoid blocking mount
+    setTimeout(() => {
+      try {
+        const saved = JSON.parse(localStorage.getItem('pd_connections') || '[]');
+        const activeUrls = (Array.isArray(saved) ? saved : [])
+          .filter(c => c && c.enabled !== false && c.url && !c.deactivated && !c.url.includes('newpanel-4412c'))
+          .map(c => c.url.replace(/\/+$/, ''));
+        if (activeUrls.length > 0) {
+          fetch('/api/worker-config', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ firebase_databases: activeUrls })
+          }).catch(() => {});
+        }
+      } catch {}
+    }, 1000);
+
+    // Poll at 5s — enough for live feedback without hammering the main thread
     let pollTick = 0;
     pollInterval = setInterval(() => {
       pollTick++;
       refreshRegistryView();
-      syncWorkerStatus();
-      checkWorkerStatus();
+      if (automationState.enabled) {
+        syncWorkerStatus();
+        checkWorkerStatus();
+      }
       syncDashboardNotifs();
-      if (pollTick % 4 === 0) {
+      if (pollTick % 4 === 0 && automationState.enabled) {
         handleSyncRegistry(true);
       }
-    }, 2000);
+    }, 5000);
   });
 
   onDestroy(() => {
@@ -955,6 +960,10 @@
         {#if todayCount > 0}
           <span class="nav-today-badge">+{todayCount} today</span>
         {/if}
+      </a>
+      <span class="nav-sep">/</span>
+      <a href="/json-extractor" class="nav-sub-link" title="JSON & RTDB Extractor">
+        <span>Extractor 🔍</span>
       </a>
       <span class="nav-sep">/</span>
       <h1 class="page-title">
@@ -1004,8 +1013,34 @@
       <button class="btn-ghost" onclick={() => activeTab = 'config'} title="Settings">
         ⚙ Settings
       </button>
+
+      <!-- Master Automation Kill Switch -->
+      <button
+        class="auto-master-toggle {automationState.enabled ? 'toggle-on' : 'toggle-off'}"
+        onclick={toggleAutomationEnabled}
+        title={automationState.enabled ? 'TG Automation is ENABLED — click to disable all automation logic completely' : 'TG Automation is DISABLED — click to enable'}
+      >
+        <span class="toggle-track">
+          <span class="toggle-thumb"></span>
+        </span>
+        <span class="toggle-label">{automationState.enabled ? 'TG AUTO: ON' : 'TG AUTO: OFF'}</span>
+      </button>
     </div>
   </header>
+
+  <!-- ── Automation Disabled Banner ─────────────────────────────────────── -->
+  {#if !automationState.enabled}
+    <div class="auto-disabled-banner">
+      <span class="disabled-icon">🔴</span>
+      <div class="disabled-text">
+        <strong>TG Automation is OFF</strong>
+        <span>All Telegram automation logic is completely disabled. No jobs will be dispatched, no worker polls, no OTP handling. Other features (Discovery, SMS feed, Registry) still work normally.</span>
+      </div>
+      <button class="disabled-enable-btn" onclick={toggleAutomationEnabled}>
+        Enable Automation
+      </button>
+    </div>
+  {/if}
 
   <!-- Navigation Tabs -->
   <nav class="auto-tabs">

@@ -86,11 +86,22 @@ let _allDevices = $derived.by(() => {
   for (const conn of engine.connections) {
     if (!conn.enabled) continue;
     const entry = engine.db[conn.id];
-    if (!entry?.keys || typeof entry.keys !== 'object') continue;
-    for (const key of Object.keys(entry.keys)) {
-      if (typeof key !== 'string' || key.length < 4) continue;
-      const info = entry.info?.[key] ?? null;
-      list.push({ connId: conn.id, conn, key, info });
+    if (!entry) continue;
+    const seenKeys = new Set();
+    if (entry.keys && typeof entry.keys === 'object') {
+      for (const key of Object.keys(entry.keys)) {
+        if (typeof key !== 'string' || key.length < 4) continue;
+        seenKeys.add(key);
+        const info = entry.info?.[key] ?? null;
+        list.push({ connId: conn.id, conn, key, info });
+      }
+    }
+    if (entry.info && typeof entry.info === 'object') {
+      for (const [key, info] of Object.entries(entry.info)) {
+        if (typeof key !== 'string' || key.length < 4 || seenKeys.has(key)) continue;
+        seenKeys.add(key);
+        list.push({ connId: conn.id, conn, key, info });
+      }
     }
   }
   return list;
@@ -253,9 +264,10 @@ async function fetchConn(conn) {
     const { data: keysData } = await apiFetch(conn, conn.path, 'GET', undefined, { shallow: 'true' });
     const keys = keysData && typeof keysData === 'object' ? keysData : {};
     let info = {};
-    if (conn.infoPath) {
+    const infoPathToFetch = conn.infoPath || 'clients';
+    if (infoPathToFetch) {
       try {
-        const { data: infoData } = await apiFetch(conn, conn.infoPath);
+        const { data: infoData } = await apiFetch(conn, infoPathToFetch);
         if (infoData && typeof infoData === 'object') info = infoData;
       } catch {}
     }

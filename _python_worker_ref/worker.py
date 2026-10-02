@@ -499,9 +499,10 @@ device_registry = {}
 firebase_registry = {}
 registry_lock = asyncio.Lock()
 registry_refresh_task = None
-REGISTRY_REFRESH_SECONDS = 120  # 2 minutes: light background device check across all Firebase DBs
+REGISTRY_REFRESH_SECONDS = 60  # 1 minute: fast enough to catch newly added databases
 last_registry_refresh = 0.0
 registry_refresh_in_progress = False
+_last_known_db_count = 0  # tracks new Firebase databases added via UI
 
 # Terminal dashboard state.
 dashboard_live = None
@@ -808,9 +809,29 @@ def refresh_device_registry_sync():
 
 
 async def refresh_device_registry(force=False):
-    """Refresh Firebase discovery without blocking the Telegram event loop."""
+    """Refresh Firebase discovery without blocking the Telegram event loop.
+
+    Also detects newly added Firebase databases (from the web UI via worker_config.json)
+    and forces a full refresh + clears the used-device pool so new devices are picked up
+    immediately without restarting the worker.
+    """
     global device_pool
     global device_pool_loaded
+    global _last_known_db_count
+    global used_device_ids
+
+    # Hot-reload detection: if new databases were added via the UI, force a full refresh
+    # and clear used_device_ids so devices on new databases become eligible immediately.
+    current_db_count = len(get_firebase_databases())
+    if current_db_count != _last_known_db_count and _last_known_db_count > 0:
+        dashboard_log(
+            f"[hot-reload] Detected {current_db_count - _last_known_db_count:+d} Firebase DB change(s) "
+            f"({_last_known_db_count} -> {current_db_count}). Forcing full refresh."
+        )
+        force = True
+        # Reset used set so devices from newly-added databases are eligible
+        used_device_ids = set()
+    _last_known_db_count = current_db_count
 
     if (
         not force
@@ -1905,38 +1926,58 @@ def _mark_device_state(device, new_state):
 
 
 def select_next_device():
-    """Select the next available device from the combined registry."""
+    """Select the next available device from the combined registry.
+
+    If the current in-memory pool is exhausted, performs a synchronous
+    refresh from Firebase to pick up any newly online / newly added devices
+    before giving up. This ensures continuous operation without restarting.
+    """
     global used_device_ids
 
-    devices = [
-        d for d in device_pool
-        if d.get("online")
-        and normalize_phone(d.get("phone"))
-    ]
+    def _pick(pool):
+        candidates = [
+            d for d in pool
+            if d.get("online") and normalize_phone(d.get("phone"))
+        ]
+        for device in candidates:
+            device_key = f"{device.get('database')}|{device.get('device_id')}"
+            phone = device.get("phone")
+            if device_key in used_device_ids:
+                continue
+            if is_number_already_processed(phone):
+                norm = normalize_phone(phone)
+                rec = processed_numbers.get(norm, {})
+                st = rec.get("status", "COMPLETED")
+                _mark_device_state(device, st.upper())
+                continue
+            used_device_ids.add(device_key)
+            _mark_device_state(device, "PROCESSING")
+            dashboard_log(
+                f"Selected {device.get('device_id')} ({phone}) from "
+                f"{device.get('database')}"
+            )
+            return device
+        return None
 
-    for device in devices:
-        # Database + device ID prevents collisions between Firebase projects.
-        device_key = f"{device.get('database')}|{device.get('device_id')}"
-        phone = device.get("phone")
+    # First pass: try existing in-memory pool
+    result = _pick(device_pool)
+    if result is not None:
+        return result
 
-        if device_key in used_device_ids:
-            continue
-
-        if is_number_already_processed(phone):
-            norm = normalize_phone(phone)
-            rec = processed_numbers.get(norm, {})
-            st = rec.get("status", "COMPLETED")
-            _mark_device_state(device, st.upper())
-            continue
-
-        used_device_ids.add(device_key)
-        _mark_device_state(device, "PROCESSING")
-
-        dashboard_log(
-            f"Selected {device.get('device_id')} ({phone}) from "
-            f"{device.get('database')}"
-        )
-        return device
+    # Pool exhausted — do a synchronous refresh to catch newly online / newly added devices
+    dashboard_log("Device pool exhausted. Performing live Firebase refresh to find new devices...")
+    try:
+        fresh_devices = refresh_device_registry_sync()
+        # Update in-memory pool with fresh data (no async context here)
+        fresh_pool = [
+            d for d in fresh_devices
+            if d.get("online") and normalize_phone(d.get("phone"))
+        ]
+        result = _pick(fresh_pool)
+        if result is not None:
+            return result
+    except Exception as refresh_err:
+        dashboard_log(f"Live refresh error (ignored): {refresh_err}")
 
     dashboard_log("No unused online device with a number is available.")
     return None
