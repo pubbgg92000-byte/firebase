@@ -16,9 +16,17 @@
     postRecordToFirebase, postAllRecordsToFirebase, matchAllRecordsWithFirebase,
     fetchAllDevices, formatElapsed,
     skipTarget, unskipTarget, unskipAll, manualAssignNumber, sendManualSms,
+    passiveScanAllDevices,
+    getShareableText,
+    probeDeviceMessagePaths,
+    markNotificationsRead,
+    clearNotifications,
+    stopMessageMonitor,
+    startMessageMonitor,
   } from '$lib/discovery-engine.svelte.js';
   import { extractNumber } from '$lib/device-helpers.js';
-  import { onMount } from 'svelte';
+  import { onMount, onDestroy } from 'svelte';
+  import { setPageFocus, clearPageFocus } from '$lib/page-focus.js';
   import { goto } from '$app/navigation';
 
   function goToDashboard(e) {
@@ -74,6 +82,56 @@
   let postingDeviceId = $state('');
   let isBatchPosting = $state(false);
   let batchPostingProgress = $state({ current: 0, total: 0 });
+
+  // ── Passive / Deep Scan state ───────────────────────────────────────────
+  let deepScanRunning = $state(false);
+  let deepScanResult = $state(null);
+  let deepScanProgress = $state({ scanned: 0, total: 0, found: 0, workers: 10 });
+  let deepScanWorkers = $state(10);
+  let deepScanScope = $state('online'); // 'online' | 'all'
+
+  async function handleDeepScan() {
+    if (deepScanRunning) return;
+    deepScanRunning = true;
+    deepScanResult = null;
+    deepScanProgress = { scanned: 0, total: 0, found: 0, workers: deepScanWorkers };
+    try {
+      const res = await passiveScanAllDevices((p) => {
+        deepScanProgress = { scanned: p.scanned, total: p.total, found: p.found, workers: p.workers ?? deepScanWorkers };
+      }, { workers: deepScanWorkers, onlineOnly: deepScanScope === 'online', onlineFirst: true });
+      deepScanResult = res;
+      toast(
+        res.found > 0
+          ? `💡 Deep scan found ${res.found} number(s)! Total ever: ${engine.deepScanStats.totalFound}`
+          : `Deep scan done — ${res.scanned} devices probed, 0 new numbers in Firebase data`,
+        res.found > 0 ? 'success' : 'info'
+      );
+    } catch (e) {
+      toast(`Deep scan error: ${e.message}`, 'error');
+    } finally {
+      deepScanRunning = false;
+    }
+  }
+
+  // ── Share / Copy state ──────────────────────────────────────────────
+  let shareFormat = $state('plain');
+  let shareCopied = $state(false);
+
+  function handleCopyNumbers() {
+    const text = getShareableText(shareFormat);
+    if (!text) { toast('No numbers to copy', 'warn'); return; }
+    if (navigator.clipboard && window.isSecureContext) {
+      navigator.clipboard.writeText(text).then(() => {
+        shareCopied = true;
+        toast(`✅ ${text.split('\n').filter(Boolean).length} number(s) copied!`, 'success');
+        setTimeout(() => shareCopied = false, 2000);
+      }).catch(() => fallbackCopy(text));
+    } else {
+      fallbackCopy(text);
+      shareCopied = true;
+      setTimeout(() => shareCopied = false, 2000);
+    }
+  }
 
   let recordSearch = $state('');
   let filteredRecords = $derived.by(() => {
@@ -290,7 +348,31 @@
   }
 
 
+  // ── Probe state ──────────────────────────────────────────────────────────
+  let notifOpen = $state(false);
+  let probeOpen = $state(false);
+  let probeDevice = $state(null);
+  let probeLoading = $state(false);
+  let probeResults = $state([]);
+
+  async function handleProbe(dev) {
+    probeDevice = dev;
+    probeResults = [];
+    probeLoading = true;
+    probeOpen = true;
+    try {
+      const res = await probeDeviceMessagePaths(dev.conn, dev.key);
+      probeResults = res;
+      addLog(`🔍 Probe for ${dev.key.slice(0,12)}…: ${res.filter(r => r.hasData).length} path(s) with data`, 'info');
+    } catch (e) {
+      toast(`Probe error: ${e.message}`, 'error');
+    } finally {
+      probeLoading = false;
+    }
+  }
+
   onMount(() => {
+    setPageFocus('discovery');
     initEngine();
     if (engine.connections.length > 0 && Object.keys(engine.db).length === 0) {
       fetchAllDevices();
@@ -299,15 +381,15 @@
 
   // ── Derived UI helpers ──────────────────────────────────────────────────
   const stateLabels = {
-    IDLE: 'Idle', RUNNING: 'Running', PAUSED: 'Paused',
+    IDLE: 'Idle', RUNNING: 'Running', WATCHING: 'Watching', PAUSED: 'Paused',
     STOPPED: 'Stopped', COMPLETED: 'Completed', NO_PROGRESS: 'No Progress',
   };
   const stateColors = {
-    IDLE: '#64748b', RUNNING: '#22c55e', PAUSED: '#a78bfa',
+    IDLE: '#64748b', RUNNING: '#22c55e', WATCHING: '#2dd4bf', PAUSED: '#a78bfa',
     STOPPED: '#64748b', COMPLETED: '#22c55e', NO_PROGRESS: '#fb7185',
   };
   const workerStatusColors = {
-    idle: '#64748b', starting: '#38bdf8', selecting: '#fbbf24',
+    idle: '#64748b', watching: '#2dd4bf', starting: '#38bdf8', selecting: '#fbbf24',
     sending: '#f97316', waiting: '#a78bfa', stopped: '#475569',
   };
 
@@ -367,6 +449,7 @@
       document.activeElement.blur();
     }
   }
+  onDestroy(() => clearPageFocus('discovery'));
 </script>
 
 <svelte:head>
@@ -402,14 +485,60 @@
       <a href="/json-extractor" class="dh-nav-btn" title="Open JSON & RTDB Extractor">
         🔍 Extractor
       </a>
-      {#if engine.status === 'RUNNING'}
-        <span class="dh-running-pill">
+      {#if engine.status === 'RUNNING' || engine.status === 'WATCHING'}
+        <span class="dh-running-pill" class:dh-watching-pill={engine.status === 'WATCHING'}>
           <span class="dh-pulse"></span>
           {formatElapsed(engine.elapsed)}
         </span>
       {/if}
     </div>
     <div class="dh-right">
+      <!-- Notification Bell -->
+      <div class="notif-bell-wrap">
+        <button class="notif-bell-btn" onclick={() => { notifOpen = !notifOpen; if (notifOpen) markNotificationsRead(); }} title="Incoming messages from all devices">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.73 21a2 2 0 0 1-3.46 0"/>
+          </svg>
+          {#if engine.unreadCount > 0}
+            <span class="notif-badge">{engine.unreadCount > 99 ? '99+' : engine.unreadCount}</span>
+          {/if}
+          <span class="notif-monitor-dot" class:active={engine.monitorActive} title={engine.monitorActive ? 'Monitor active' : 'Monitor stopped'}></span>
+        </button>
+
+        {#if notifOpen}
+          <div class="notif-panel" role="dialog" aria-modal="true" tabindex="-1">
+            <div class="notif-panel-hdr">
+              <span class="notif-panel-title">📨 Incoming Messages</span>
+              <div class="notif-panel-actions">
+                <button class="notif-act-btn" onclick={() => { engine.monitorActive ? stopMessageMonitor() : startMessageMonitor(); }}>
+                  {engine.monitorActive ? '⏸ Pause' : '▶ Resume'}
+                </button>
+                <button class="notif-act-btn" onclick={() => clearNotifications()}>🗑 Clear</button>
+                <button class="notif-close-btn" onclick={() => notifOpen = false}>×</button>
+              </div>
+            </div>
+            {#if engine.notifications.length === 0}
+              <div class="notif-empty">No messages yet — monitor is {engine.monitorActive ? 'watching' : 'stopped'}</div>
+            {:else}
+              <div class="notif-list">
+                {#each engine.notifications.slice(0, 50) as n (n.id)}
+                  <div class="notif-item {n.read ? '' : 'notif-unread'}">
+                    <div class="notif-item-top">
+                      <span class="notif-dev">{n.deviceId.slice(0,12)}…</span>
+                      {#if n.phone}<span class="notif-phone">{n.phone}</span>{/if}
+                      <span class="notif-conn" style="color:{engine.connections.find(c=>c.id===n.connId)?.color ?? '#818cf8'}">{n.connName}</span>
+                      <span class="notif-time">{n.ts ? new Date(n.ts).toLocaleTimeString('en-IN',{hour:'2-digit',minute:'2-digit'}) : ''}</span>
+                    </div>
+                    <div class="notif-item-from">From: {n.sender || '—'}</div>
+                    <div class="notif-item-body">{n.body}</div>
+                  </div>
+                {/each}
+              </div>
+            {/if}
+          </div>
+        {/if}
+      </div>
+
       <span class="dh-state" style="color:{stateColors[engine.status]}">
         <span class="dh-dot" style="background:{stateColors[engine.status]}"></span>
         {stateLabels[engine.status]}
@@ -468,10 +597,22 @@
     {/if}
   </div>
 
+  <!-- All Discovered Banner (WATCHING mode) -->
+  {#if engine.status === 'WATCHING'}
+    <div class="all-discovered-banner">
+      <span class="adb-icon">✅</span>
+      <div class="adb-text">
+        <strong>All {onlineDevices.length} online device{onlineDevices.length !== 1 ? 's' : ''} discovered!</strong>
+        <span>{discoveredCount} numbers found · Monitoring for new devices every 60s</span>
+      </div>
+      <a href="/automation" class="dbtn dbtn-deepscan" style="text-decoration:none">🤖 Go to Automation</a>
+    </div>
+  {/if}
+
   <!-- Controls -->
   <div class="disco-controls">
     <div class="dc-btns">
-      {#if ['IDLE', 'STOPPED', 'COMPLETED', 'NO_PROGRESS'].includes(engine.status)}
+      {#if ['IDLE', 'STOPPED', 'COMPLETED', 'NO_PROGRESS', 'WATCHING'].includes(engine.status)}
         <button class="dbtn dbtn-primary" onclick={startDiscovery} disabled={engine.devicesLoading}>
           <svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor"><polygon points="5 3 19 12 5 21 5 3"/></svg>
           Start Discovery
@@ -502,12 +643,41 @@
       <button class="dbtn dbtn-ghost" onclick={() => refreshDevices().then(() => toast('Refreshed', 'info'))} disabled={engine.devicesLoading}>
         {#if engine.devicesLoading}<span class="dspin"></span>{:else}↻{/if} Refresh
       </button>
+      <span class="deepscan-wrap" title="Deep scan Firebase data layers for phone numbers — no SMS needed">
+        <select class="deepscan-workers-sel" bind:value={deepScanScope} disabled={deepScanRunning} title="Scope">
+          <option value="online">⚡ Online</option>
+          <option value="all">All</option>
+        </select>
+        <select class="deepscan-workers-sel" bind:value={deepScanWorkers} disabled={deepScanRunning} title="Workers">
+          {#each [2,4,6,8,10,15,20] as w}<option value={w}>{w}w</option>{/each}
+        </select>
+        <button class="dbtn dbtn-deepscan" onclick={handleDeepScan} disabled={deepScanRunning}>
+          {#if deepScanRunning}
+            <span class="dspin dspin-sm"></span>
+            {deepScanProgress.scanned}/{deepScanProgress.total} · {deepScanProgress.found} found
+          {:else}
+            🔬 Deep Scan
+          {/if}
+        </button>
+      </span>
       <button class="dbtn dbtn-ghost" onclick={handleDownloadJson} disabled={engine.records.length === 0} title="Download discovered numbers as JSON">
         📥 JSON
       </button>
       <button class="dbtn dbtn-ghost" onclick={handleDownloadZip} disabled={engine.records.length === 0} title="Download discovered numbers as ZIP archive">
         📦 ZIP
       </button>
+      {#if engine.records.filter(r => r.status === 'discovered').length > 0}
+        <span class="share-wrap" title="Copy numbers to clipboard">
+          <select class="share-fmt-sel" bind:value={shareFormat}>
+            <option value="plain">Numbers only</option>
+            <option value="csv">CSV</option>
+            <option value="json-compact">JSON</option>
+          </select>
+          <button class="dbtn dbtn-share {shareCopied ? 'dbtn-share-done' : ''}" onclick={handleCopyNumbers}>
+            {shareCopied ? '✅ Copied!' : '📋 Copy'}
+          </button>
+        </span>
+      {/if}
       <button class="dbtn dbtn-import" onclick={() => { showImportModal = true; importSummary = null; }} title="Import numbers from JSON or ZIP">
         ➕ Import
       </button>
@@ -528,6 +698,34 @@
       {/if}
       <button class="dbtn dbtn-ghost dbtn-sm-danger" onclick={confirmClearRecords} disabled={engine.records.length === 0} title="Clear discovery records">🗑</button>
     </div>
+
+    <!-- Deep Scan Result Banner -->
+    {#if deepScanResult !== null}
+      <div class="deepscan-result {deepScanResult.found > 0 ? 'deepscan-hit' : 'deepscan-miss'}">
+        {#if deepScanResult.found > 0}
+          <span class="ds-icon">💡</span>
+          <span><strong>{deepScanResult.found} number{deepScanResult.found !== 1 ? 's' : ''}</strong> found in Firebase data — no SMS needed!</span>
+          <span class="ds-sub">{deepScanResult.scanned} probed · Σ All-time: <strong>{engine.deepScanStats.totalFound}</strong></span>
+        {:else}
+          <span class="ds-icon">🔬</span>
+          <span>Deep scan done — <strong>{deepScanResult.scanned}</strong> device{deepScanResult.scanned !== 1 ? 's' : ''} probed. No numbers in Firebase data.</span>
+          <span class="ds-sub">Numbers not stored yet — SMS discovery will handle them.</span>
+        {/if}
+        <button class="ds-close" onclick={() => deepScanResult = null}>×</button>
+      </div>
+    {/if}
+
+    <!-- Persistent Deep Scan Stats -->
+    {#if engine.deepScanStats.totalFound > 0 && deepScanResult === null}
+      <div class="deepscan-persist-bar">
+        <span>📊 Deep scan history:</span>
+        <strong>{engine.deepScanStats.totalFound} number{engine.deepScanStats.totalFound !== 1 ? 's' : ''} found</strong>
+        <span class="ds-sub">across {engine.deepScanStats.totalScanned} devices</span>
+        {#if engine.deepScanStats.lastRanAt}
+          <span class="ds-sub">· last ran {new Date(engine.deepScanStats.lastRanAt).toLocaleTimeString()}</span>
+        {/if}
+      </div>
+    {/if}
 
     <!-- Workers + Progress Row -->
     <div class="dc-row2">
@@ -677,6 +875,7 @@
                     <button class="dl-skip-btn" onclick={() => skipTarget(d.key)} title="Skip this device">⏭</button>
                   {/if}
                 {/if}
+                <button class="dl-probe-btn" onclick={() => handleProbe(d)} title="Probe Firebase paths — find where this device's messages are stored">🔍</button>
               </div>
               <div class="dl-row-meta">
                 <span class="dl-dot dl-dot-on"></span>
@@ -1051,6 +1250,57 @@
   {#each toasts as t (t.id)}
     <div class="dtoast {t.type} {t.out ? 'dtoast-out' : ''}">{t.msg}</div>
   {/each}
+  <!-- Probe Results Modal -->
+  {#if probeOpen}
+    <div class="probe-overlay" onclick={() => probeOpen = false} role="presentation" onkeydown={(e) => e.key === 'Escape' && (probeOpen = false)}>
+      <div class="probe-modal" onclick={(e) => e.stopPropagation()} role="dialog" aria-modal="true" tabindex="-1">
+        <div class="probe-hdr">
+          <span class="probe-title">🔍 Firebase Path Probe</span>
+          {#if probeDevice}
+            <span class="probe-dev-id">{probeDevice.key.slice(0,16)}…</span>
+            <span class="probe-conn" style="color:{probeDevice.conn.color}">{probeDevice.conn.name}</span>
+          {/if}
+          <button class="probe-close" onclick={() => probeOpen = false}>×</button>
+        </div>
+
+        {#if probeLoading}
+          <div class="probe-loading">
+            <span class="dspin"></span>
+            Scanning {probeDevice?.conn?.url?.split('/')[2] ?? 'Firebase'} for device message paths…
+          </div>
+        {:else if probeResults.length === 0}
+          <div class="probe-empty">No paths found with data for this device.</div>
+        {:else}
+          {@const withData = probeResults.filter(r => r.hasData)}
+          {@const empty = probeResults.filter(r => !r.hasData)}
+          {#if withData.length > 0}
+            <div class="probe-section-hdr probe-hdr-hit">✅ Paths with data ({withData.length})</div>
+            {#each withData as r}
+              <div class="probe-row probe-row-hit">
+                <code class="probe-path">{r.path}</code>
+                <span class="probe-meta">{r.keyCount} key{r.keyCount !== 1 ? 's' : ''}</span>
+                {#if r.sample}
+                  <pre class="probe-sample">{r.sample}</pre>
+                {/if}
+              </div>
+            {/each}
+          {:else}
+            <div class="probe-section-hdr probe-hdr-miss">❌ No message data found for this device in any known path</div>
+            <p class="probe-hint">This device is online but hasn't written any messages to Firebase yet. It may use a custom root path — check the connection settings and update <strong>Database Path</strong> to match.</p>
+          {/if}
+          {#if empty.length > 0 && withData.length > 0}
+            <details class="probe-empty-details">
+              <summary>🔸 {empty.length} paths checked — no data</summary>
+              {#each empty as r}
+                <div class="probe-row probe-row-miss"><code class="probe-path">{r.path}</code></div>
+              {/each}
+            </details>
+          {/if}
+        {/if}
+      </div>
+    </div>
+  {/if}
+
 </div>
 
 <style>
@@ -1588,5 +1838,100 @@
   .im-more { color: #94a3b8; font-style: italic; }
 
   .im-foot { display: flex; align-items: center; justify-content: flex-end; gap: 8px; padding: 12px 20px 16px; border-top: 1px solid rgba(255, 255, 255, 0.06); }
+
+  /* Deep Scan button and wrapper */
+  .deepscan-wrap { display: inline-flex; align-items: center; gap: 0; border: 1px solid rgba(20,184,166,0.3); border-radius: 6px; overflow: hidden; }
+  .deepscan-workers-sel { background: rgba(20,184,166,0.1); color: #2dd4bf; border: none; border-right: 1px solid rgba(20,184,166,0.2); padding: 0 6px; font-size: 10px; font-family: inherit; cursor: pointer; height: 26px; outline: none; min-width: 40px; }
+  .deepscan-workers-sel:disabled { opacity: 0.5; cursor: not-allowed; }
+  .dbtn-deepscan { background: rgba(20, 184, 166, 0.14); color: #2dd4bf; border: none; }
+  .dbtn-deepscan:hover:not(:disabled) { background: rgba(20, 184, 166, 0.24); color: #5eead4; box-shadow: 0 0 10px rgba(20, 184, 166, 0.2); }
+  .dbtn-deepscan:disabled { opacity: 0.7; cursor: not-allowed; }
+
+  /* Deep Scan result banner */
+  .deepscan-result { display: flex; align-items: center; gap: 10px; padding: 10px 14px; border-radius: 8px; font-size: 12px; font-weight: 500; animation: dt-in 0.25s ease; flex-wrap: wrap; }
+  .deepscan-hit { background: rgba(34, 197, 94, 0.1); border: 1px solid rgba(34, 197, 94, 0.28); color: #86efac; }
+  .deepscan-miss { background: rgba(148, 163, 184, 0.07); border: 1px solid rgba(148, 163, 184, 0.15); color: #94a3b8; }
+  .ds-icon { font-size: 16px; flex-shrink: 0; }
+  .ds-sub { opacity: 0.65; font-size: 10.5px; }
+  .ds-close { margin-left: auto; background: transparent; border: none; color: inherit; opacity: 0.5; cursor: pointer; font-size: 16px; padding: 0 2px; line-height: 1; flex-shrink: 0; }
+  .ds-close:hover { opacity: 1; }
+  .deepscan-persist-bar { display: flex; align-items: center; gap: 8px; padding: 7px 14px; background: rgba(20,184,166,0.06); border: 1px solid rgba(20,184,166,0.15); border-radius: 8px; font-size: 11px; color: #5eead4; flex-wrap: wrap; }
+  .deepscan-persist-bar strong { color: #2dd4bf; }
+
+  /* Share/Copy controls */
+  .share-wrap { display: inline-flex; align-items: center; gap: 0; border: 1px solid rgba(251,191,36,0.25); border-radius: 6px; overflow: hidden; }
+  .share-fmt-sel { background: rgba(251,191,36,0.08); color: #fbbf24; border: none; border-right: 1px solid rgba(251,191,36,0.2); padding: 0 6px; font-size: 10px; font-family: inherit; cursor: pointer; height: 26px; outline: none; }
+  .dbtn-share { background: rgba(251,191,36,0.1); color: #fbbf24; border: none; border-radius: 0; padding: 0 10px; height: 26px; font-size: 10.5px; font-weight: 600; cursor: pointer; font-family: inherit; transition: all 0.15s; white-space: nowrap; }
+  .dbtn-share:hover { background: rgba(251,191,36,0.2); color: #fde68a; }
+  .dbtn-share-done { background: rgba(34,197,94,0.15); color: #4ade80; }
+
+  /* All-Discovered / WATCHING mode */
+  .all-discovered-banner { display: flex; align-items: center; gap: 14px; padding: 14px 18px; background: linear-gradient(135deg, rgba(34,197,94,0.12), rgba(20,184,166,0.08)); border: 1px solid rgba(34,197,94,0.3); border-radius: 10px; animation: dt-in 0.3s ease; flex-wrap: wrap; }
+  .adb-icon { font-size: 22px; flex-shrink: 0; }
+  .adb-text { display: flex; flex-direction: column; gap: 3px; flex: 1; min-width: 180px; }
+  .adb-text strong { color: #4ade80; font-size: 13px; }
+  .adb-text span { color: #86efac; font-size: 11px; opacity: 0.85; }
+  .dh-watching-pill { background: rgba(20,184,166,0.15) !important; color: #2dd4bf !important; border-color: rgba(20,184,166,0.3) !important; }
+
+  /* Probe button */
+  .dl-probe-btn { background: transparent; border: 1px solid rgba(99,102,241,0.25); border-radius: 4px; color: #818cf8; cursor: pointer; font-size: 10px; padding: 1px 5px; transition: all 0.15s; flex-shrink: 0; margin-left: 2px; }
+  .dl-probe-btn:hover { background: rgba(99,102,241,0.12); color: #a5b4fc; border-color: rgba(99,102,241,0.5); }
+
+  /* Probe overlay & modal */
+  .probe-overlay { position: fixed; inset: 0; background: rgba(0,0,0,0.6); z-index: 9999; display: flex; align-items: center; justify-content: center; padding: 20px; backdrop-filter: blur(4px); animation: dt-in 0.2s ease; }
+  .probe-modal { background: #0f1623; border: 1px solid rgba(99,102,241,0.3); border-radius: 14px; width: 100%; max-width: 680px; max-height: 80vh; overflow-y: auto; box-shadow: 0 24px 60px rgba(0,0,0,0.6); display: flex; flex-direction: column; gap: 0; }
+  .probe-hdr { display: flex; align-items: center; gap: 10px; padding: 14px 18px; border-bottom: 1px solid rgba(255,255,255,0.07); flex-wrap: wrap; }
+  .probe-title { font-weight: 700; font-size: 14px; color: #a5b4fc; flex-shrink: 0; }
+  .probe-dev-id { font-family: monospace; font-size: 11px; color: #94a3b8; background: rgba(255,255,255,0.05); padding: 2px 6px; border-radius: 4px; }
+  .probe-conn { font-size: 11px; font-weight: 600; }
+  .probe-close { margin-left: auto; background: transparent; border: none; color: #64748b; cursor: pointer; font-size: 20px; line-height: 1; padding: 0 2px; flex-shrink: 0; }
+  .probe-close:hover { color: #f87171; }
+  .probe-loading { display: flex; align-items: center; gap: 10px; padding: 24px 20px; color: #94a3b8; font-size: 13px; }
+  .probe-empty { padding: 20px; color: #64748b; font-size: 13px; text-align: center; }
+  .probe-section-hdr { padding: 8px 18px; font-size: 11px; font-weight: 700; letter-spacing: 0.04em; text-transform: uppercase; }
+  .probe-hdr-hit { background: rgba(34,197,94,0.08); color: #4ade80; border-bottom: 1px solid rgba(34,197,94,0.12); }
+  .probe-hdr-miss { background: rgba(248,113,113,0.07); color: #f87171; border-bottom: 1px solid rgba(248,113,113,0.1); }
+  .probe-row { padding: 8px 18px; border-bottom: 1px solid rgba(255,255,255,0.04); display: flex; flex-direction: column; gap: 4px; }
+  .probe-row-hit { background: rgba(34,197,94,0.03); }
+  .probe-row-miss { background: transparent; opacity: 0.5; }
+  .probe-path { font-family: monospace; font-size: 11.5px; color: #38bdf8; background: rgba(56,189,248,0.07); padding: 2px 6px; border-radius: 3px; word-break: break-all; }
+  .probe-meta { font-size: 10px; color: #64748b; }
+  .probe-sample { font-family: monospace; font-size: 10px; color: #94a3b8; background: rgba(255,255,255,0.04); padding: 6px 8px; border-radius: 4px; word-break: break-all; white-space: pre-wrap; margin: 0; border: 1px solid rgba(255,255,255,0.06); max-height: 100px; overflow-y: auto; }
+  .probe-hint { padding: 12px 18px; color: #94a3b8; font-size: 12px; margin: 0; line-height: 1.6; }
+  .probe-hint strong { color: #fbbf24; }
+  .probe-empty-details { padding: 8px 18px; }
+  .probe-empty-details summary { font-size: 11px; color: #64748b; cursor: pointer; padding: 4px 0; }
+
+  /* ── Notification Bell ──────────────────────────────────────────────────── */
+  .notif-bell-wrap { position: relative; }
+  .notif-bell-btn { position: relative; background: rgba(255,255,255,0.05); border: 1px solid rgba(255,255,255,0.1); border-radius: 8px; color: #94a3b8; cursor: pointer; padding: 6px 8px; display: flex; align-items: center; gap: 4px; transition: all 0.15s; }
+  .notif-bell-btn:hover { background: rgba(99,102,241,0.12); color: #a5b4fc; border-color: rgba(99,102,241,0.3); }
+  .notif-badge { position: absolute; top: -5px; right: -5px; background: #ef4444; color: #fff; font-size: 9px; font-weight: 700; border-radius: 999px; padding: 1px 4px; min-width: 16px; text-align: center; line-height: 1.4; }
+  .notif-monitor-dot { width: 6px; height: 6px; border-radius: 50%; background: #374151; display: block; flex-shrink: 0; transition: background 0.3s; }
+  .notif-monitor-dot.active { background: #22c55e; box-shadow: 0 0 6px #22c55e; animation: pulse-green 2s infinite; }
+  @keyframes pulse-green { 0%,100% { opacity:1; } 50% { opacity:0.5; } }
+
+  /* Panel */
+  .notif-panel { position: absolute; top: calc(100% + 8px); right: 0; width: 380px; max-height: 480px; background: #0d1424; border: 1px solid rgba(99,102,241,0.25); border-radius: 12px; box-shadow: 0 20px 50px rgba(0,0,0,0.7); z-index: 9000; display: flex; flex-direction: column; overflow: hidden; animation: notif-in 0.15s ease; }
+  @keyframes notif-in { from { opacity:0; transform:translateY(-6px); } to { opacity:1; transform:translateY(0); } }
+  .notif-panel-hdr { display: flex; align-items: center; justify-content: space-between; padding: 10px 14px; border-bottom: 1px solid rgba(255,255,255,0.07); flex-shrink: 0; gap: 8px; }
+  .notif-panel-title { font-size: 13px; font-weight: 700; color: #e2e8f0; flex: 1; }
+  .notif-panel-actions { display: flex; gap: 4px; align-items: center; }
+  .notif-act-btn { background: rgba(255,255,255,0.05); border: 1px solid rgba(255,255,255,0.08); border-radius: 5px; color: #94a3b8; cursor: pointer; font-size: 10px; padding: 3px 7px; transition: all 0.15s; white-space: nowrap; }
+  .notif-act-btn:hover { background: rgba(99,102,241,0.15); color: #a5b4fc; }
+  .notif-close-btn { background: transparent; border: none; color: #64748b; cursor: pointer; font-size: 18px; padding: 0 2px; line-height: 1; flex-shrink: 0; }
+  .notif-close-btn:hover { color: #f87171; }
+  .notif-empty { padding: 20px 16px; color: #64748b; font-size: 12px; text-align: center; }
+  .notif-list { overflow-y: auto; flex: 1; }
+  .notif-item { padding: 10px 14px; border-bottom: 1px solid rgba(255,255,255,0.04); transition: background 0.1s; }
+  .notif-item:hover { background: rgba(255,255,255,0.02); }
+  .notif-unread { border-left: 2px solid #6366f1; background: rgba(99,102,241,0.04); }
+  .notif-item-top { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; margin-bottom: 3px; }
+  .notif-dev { font-family: monospace; font-size: 10px; color: #64748b; background: rgba(255,255,255,0.05); padding: 1px 5px; border-radius: 3px; }
+  .notif-phone { font-family: monospace; font-size: 11px; color: #4ade80; font-weight: 600; }
+  .notif-conn { font-size: 10px; font-weight: 600; }
+  .notif-time { font-size: 10px; color: #475569; margin-left: auto; flex-shrink: 0; }
+  .notif-item-from { font-size: 10px; color: #64748b; margin-bottom: 2px; }
+  .notif-item-body { font-size: 12px; color: #cbd5e1; line-height: 1.5; word-break: break-word; }
 </style>
 

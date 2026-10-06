@@ -21,7 +21,9 @@ import {
   onlineDevices,
   getDisplayPhone,
   getDiscoveredPhone,
-  fetchAllDevices
+  fetchAllDevices,
+  onDiscovery,
+  offDiscovery
 } from '$lib/discovery-engine.svelte.js';
 import { extractNumber } from '$lib/device-helpers.js';
 import { registry } from '$lib/automation-registry.js';
@@ -846,6 +848,19 @@ export function initWorker() {
   restoreState();
 }
 
+// ── Discovery → Browser-Worker Bridge ───────────────────────────────────────────
+// When discovery finds a new number, set a flag so the idle wait loop
+// exits early and picks up the new device without waiting 30 seconds.
+let _newDiscoverySignal = false;
+function _onDiscoveredForWorker(deviceId, phoneNumber, connId, connName) {
+  if (!_running) return;
+  const norm = normalizePhone(phoneNumber);
+  if (!norm || norm.length < 5) return;
+  if (isAlreadyProcessed(phoneNumber)) return;
+  _newDiscoverySignal = true;
+  addLog(`🆕 Discovery → Worker: ${deviceId.slice(0, 12)}… (${norm}) is now in the pool`, 'success');
+}
+
 export async function startWorker() {
   if (worker.status === 'RUNNING') return;
   if (!automationState.enabled) {
@@ -862,7 +877,10 @@ export async function startWorker() {
   worker.startedAt = new Date().toISOString();
   worker.usedDeviceKeys = new Set();
   addLog('🚀 Browser worker started — runs continuously until manually stopped', 'success');
-  
+
+  // Register discovery → worker bridge
+  onDiscovery(_onDiscoveredForWorker);
+
   // Elapsed timer
   _elapsedTimer = setInterval(() => {
     if (worker.startedAt) {
@@ -889,12 +907,17 @@ export async function startWorker() {
         addLog('📭 No new devices to process right now. Waiting for new devices...', 'info');
       }
       
-      // Wait and re-check: refresh devices every 30s while waiting
-      worker.currentMessage = `Waiting for new devices… (retry in 30s)`;
-      for (let i = 0; i < 30 && _running; i++) {
+      // Wait and re-check: break early if a new number is discovered
+      worker.currentMessage = `Waiting for new devices… (up to 30s)`;
+      _newDiscoverySignal = false;
+      for (let i = 0; i < 30 && _running && !_newDiscoverySignal; i++) {
         await sleep(1000);
       }
       if (!_running) break;
+      if (_newDiscoverySignal) {
+        addLog('⚡ New discovery woke worker — checking pool now…', 'info');
+        _newDiscoverySignal = false;
+      }
       
       // Re-fetch device list to discover newly available devices
       try {
@@ -951,6 +974,8 @@ export function pauseWorker() {
 
 export function stopWorker() {
   _running = false;
+  _newDiscoverySignal = false;
+  offDiscovery(_onDiscoveredForWorker);
   worker.status = 'STOPPED';
   worker.currentJob = null;
   worker.jobState = 'IDLE';

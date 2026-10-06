@@ -50,6 +50,7 @@
   import { extractNumber } from '$lib/device-helpers.js';
   import { registry } from '$lib/automation-registry.js';
   import { onMount, onDestroy } from 'svelte';
+  import { setPageFocus, clearPageFocus } from '$lib/page-focus.js';
   import { goto } from '$app/navigation';
 
   function goToDashboard(e) {
@@ -875,6 +876,7 @@
   }
 
   onMount(async () => {
+    setPageFocus('automation');
     // Read URL tab param immediately (sync, no cost)
     if (typeof window !== 'undefined') {
       window.addEventListener('storage', handleStorageEvent);
@@ -938,6 +940,7 @@
   });
 
   onDestroy(() => {
+    clearPageFocus('automation');
     if (pollInterval) clearInterval(pollInterval);
     if (typeof window !== 'undefined') {
       window.removeEventListener('storage', handleStorageEvent);
