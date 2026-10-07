@@ -23,6 +23,7 @@
     clearNotifications,
     stopMessageMonitor,
     startMessageMonitor,
+    setFocusedPhone,
   } from '$lib/discovery-engine.svelte.js';
   import { extractNumber } from '$lib/device-helpers.js';
   import { onMount, onDestroy } from 'svelte';
@@ -182,6 +183,12 @@
   function copyText(txt) {
     const s = String(txt ?? '');
     if (!s) return;
+    
+    // If it looks like a phone number, focus deep polling on it
+    if (s.replace(/\D/g, '').length >= 10) {
+      setFocusedPhone(s);
+    }
+    
     if (navigator.clipboard && window.isSecureContext) {
       navigator.clipboard.writeText(s).catch(() => fallbackCopy(s));
     } else {

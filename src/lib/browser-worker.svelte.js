@@ -365,6 +365,12 @@ function getDevicePool() {
       const normalized = normalizePhone(phone);
       if (!normalized || normalized.length < 5) continue;
       
+      // Skip passive-deep-scan numbers if user wants to focus on manual/normal
+      const record = discoveryEngine.records.find(r => r.deviceId === key);
+      if (record?.discoveryMethod === 'passive-deep-scan') {
+        continue;
+      }
+      
       devices.push({
         deviceId: key,
         phone: phone,
@@ -469,18 +475,33 @@ function isOtpSent(lower) {
 
 function getOtpPollPaths(job) {
   if (!job) return [];
-  const paths = [];
+  const pathSet = new Set();
   const conn = discoveryEngine.connections.find(c => c.id === job.connId);
   if (!conn) return [];
-  
-  paths.push({ conn, path: `${conn.path}/${job.deviceId}` });
-  
-  // Also check notifications paths
-  for (const prefix of ['notifications', 'notification', 'sms']) {
-    paths.push({ conn, path: `${prefix}/${job.deviceId}` });
+
+  // Use the discovered message path from the discovery engine (most reliable)
+  const discoveredMsgPath = discoveryEngine.db[conn.id]?.msgPath;
+  if (discoveredMsgPath) {
+    pathSet.add(`${discoveredMsgPath}/${job.deviceId}`);
   }
-  
-  return paths;
+
+  // Always try the configured path and common message paths
+  const basePath = conn.path || 'messages';
+  pathSet.add(`${basePath}/${job.deviceId}`);
+  pathSet.add(`messages/${job.deviceId}`);
+
+  // Check notification/sms paths
+  for (const prefix of ['notifications', 'sms', 'inbox']) {
+    pathSet.add(`${prefix}/${job.deviceId}`);
+  }
+
+  // Check client sub-paths (receivedSms, inbox, etc.) where OTP SMS might be stored
+  const infoPath = conn.infoPath || 'clients';
+  for (const sub of ['receivedSms', 'inbox', 'messages', 'sms']) {
+    pathSet.add(`${infoPath}/${job.deviceId}/${sub}`);
+  }
+
+  return [...pathSet].map(path => ({ conn, path }));
 }
 
 function swiggyMessagesFromResponse(data) {
@@ -518,15 +539,16 @@ async function captureBaseline(job) {
   
   for (const { conn, path } of paths) {
     try {
-      const { data } = await apiFetch(conn, path, 'GET', undefined, { orderBy: '"$key"', limitToLast: '50' });
-      if (!data) continue;
+      // Don't use orderBy — it requires Firebase index rules and silently returns null on many DBs
+      const { data } = await apiFetch(conn, path, 'GET', undefined, { limitToLast: '50' });
+      if (!data || typeof data !== 'object') continue;
       const msgs = swiggyMessagesFromResponse(data);
       for (const m of msgs) {
         _baselineSignatures.add(`${conn.id}:${path}:${m.messageId}`);
       }
     } catch {}
   }
-  addLog(`📋 Baseline: ${_baselineSignatures.size} existing messages`, 'info');
+  addLog(`📋 Baseline: ${_baselineSignatures.size} existing msgs across ${paths.length} paths`, 'info');
 }
 
 async function pollForOtp(job) {
@@ -534,18 +556,19 @@ async function pollForOtp(job) {
   
   for (const { conn, path } of paths) {
     try {
-      const { data } = await apiFetch(conn, path, 'GET', undefined, { orderBy: '"$key"', limitToLast: '50' });
-      if (!data) continue;
+      // Don't use orderBy — silently fails without Firebase index rules
+      const { data } = await apiFetch(conn, path, 'GET', undefined, { limitToLast: '50' });
+      if (!data || typeof data !== 'object') continue;
       
       const msgs = swiggyMessagesFromResponse(data);
       for (const m of msgs) {
         const sig = `${conn.id}:${path}:${m.messageId}`;
         if (_baselineSignatures.has(sig)) continue;
         
-        // Check timestamp freshness
+        // Check timestamp freshness — allow 30s tolerance for clock drift & forwarding delay
         if (m.messageId && /^\d{12,}$/.test(m.messageId)) {
           const msgTime = parseInt(m.messageId);
-          if (_numberSubmittedAt > 0 && msgTime < _numberSubmittedAt - 5000) continue;
+          if (_numberSubmittedAt > 0 && msgTime < _numberSubmittedAt - 30000) continue;
         }
         
         const code = extractOtpCode(m.message);
@@ -555,6 +578,7 @@ async function pollForOtp(job) {
         }
         if (_submittedOtps.has(code)) continue;
         
+        addLog(`🔍 Found OTP in ${path}: ${code}`, 'success');
         return { code, message: m.message, sender: m.sender, messageId: m.messageId };
       }
     } catch {}
